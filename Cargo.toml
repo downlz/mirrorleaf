@@ -1,0 +1,13 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "ledger"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Implementation plan §3.3: no debug info for dependencies keeps debug builds
+# smaller and lighter on the 8 GB Mac.
+[profile.dev.package."*"]
+debug = false

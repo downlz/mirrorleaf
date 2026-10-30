@@ -1,0 +1,10 @@
+packages:
+  - packages/*
+  - apps/*
+
+# Dependency guards (implementation plan, M0).
+# Only install releases that have been public for at least 7 days (in minutes).
+minimumReleaseAge: 10080
+
+# Dependencies may run install scripts only when listed here (true = allowed).
+allowBuilds: {}

@@ -1,0 +1,3 @@
+# Implementation plan §3.3: cap parallel jobs so builds don't swap on the 8 GB Mac.
+[build]
+jobs = 4

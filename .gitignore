@@ -1,0 +1,20 @@
+# Build output
+target/
+node_modules/
+dist/
+coverage/
+
+# OS and editor clutter
+.DS_Store
+*.log
+
+# Secrets: never commit these to the public repo
+.env
+.env.*
+*service-account*.json
+google-services.json
+*.jks
+*.keystore
+*.p12
+*.p8
+*.pem

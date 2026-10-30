@@ -1,0 +1,4 @@
+{
+  "rust-analyzer.numThreads": 2,
+  "rust-analyzer.cachePriming.numThreads": 2
+}

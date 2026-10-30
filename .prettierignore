@@ -1,0 +1,4 @@
+# Prose is hand-written: formatters stay out of docs and Markdown.
+docs/
+*.md
+pnpm-lock.yaml
