@@ -17,7 +17,6 @@ Mirrorleaf is a private notes app for rich text and photos. Notes live only on y
 | `crates/cli` | Headless peer for tests and measurements |
 | `ledger/` | Sync-status service (axum and Postgres) |
 | `packages/editor` | TipTap editor and its bridge to Rust |
-| `docs/` | Implementation plan and architecture decision records |
 
 The Tauri app (`apps/mirrorleaf`) arrives in milestone M4, and the measurement scripts (`tools/`) after it.
 
@@ -37,7 +36,7 @@ The Tauri app (`apps/mirrorleaf`) arrives in milestone M4, and the measurement s
 
 Optional: `cargo install cargo-deny --locked`, then `cargo deny check`, to run CI's dependency checks locally.
 
-Android, Java and Tauri come in M4 and M5; see `docs/implementation-plan.md` §3.2.
+Setup steps for Android, Java and Tauri will be added in milestones M4 and M5.
 
 ## Licence
 

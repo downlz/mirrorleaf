@@ -18,3 +18,5 @@ google-services.json
 *.p12
 *.p8
 *.pem
+docs/implementation-plan.md
+docs/adr/ADR-001-foundation-decisions.md
