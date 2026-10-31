@@ -1,5 +1,5 @@
-# Linux CI for Phase 0 (implementation plan, M0). The Android build joins in M4,
-# and the macOS build and the compile-only Windows check in M5.
+# CI for Phase 0 (implementation plan, M0 and M1). The Android build joins in
+# M4, and the macOS app build and the compile-only Windows check in M5.
 name: CI
 
 on:
@@ -27,6 +27,31 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+
+  # M1: release builds of the headless peer, so other machines (the Ubuntu
+  # helper) can run it without building. Download them from the run's page.
+  cli:
+    name: CLI binary (${{ matrix.target }})
+    needs: rust
+    strategy:
+      matrix:
+        include:
+          # 24.04 rather than ubuntu-latest: the binary then runs on Ubuntu 24.04 and newer.
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p mirrorleaf-cli
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mirrorleaf-cli-${{ matrix.target }}
+          path: target/release/mirrorleaf-cli
+          if-no-files-found: error
 
   rust-deps:
     name: Rust dependencies (licences, advisories, duplicates)

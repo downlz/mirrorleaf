@@ -3,3 +3,12 @@ name = "mirrorleaf-cli"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+mirrorleaf-core.workspace = true
+mirrorleaf-net.workspace = true
+mirrorleaf-proto.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true

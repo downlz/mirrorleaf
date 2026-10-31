@@ -38,6 +38,46 @@ Optional: `cargo install cargo-deny --locked`, then `cargo deny check`, to run C
 
 Setup steps for Android, Java and Tauri will be added in milestones M4 and M5.
 
+## Try the headless peer
+
+`mirrorleaf-cli` is a device without a screen, used for testing sync. Each data folder is one device (`--dir`, default `~/.mirrorleaf-dev`). Build it with `cargo build -p mirrorleaf-cli`, or download a release build from a CI run's **Artifacts** (macOS on Apple silicon, and Linux for Ubuntu 24.04 or newer).
+
+On the first device:
+
+```bash
+mirrorleaf-cli init --name laptop
+mirrorleaf-cli dev-account new
+mirrorleaf-cli note new "Groceries" --text "milk"
+mirrorleaf-cli dev-account ticket      # prints a join ticket
+mirrorleaf-cli sync --watch            # keep this running
+```
+
+On the second device, paste the ticket:
+
+```bash
+mirrorleaf-cli init --name ubuntu
+mirrorleaf-cli dev-account join <ticket>
+mirrorleaf-cli note list
+mirrorleaf-cli sync --watch
+```
+
+Edits made in another terminal (`note edit <id> --append "eggs"`) reach the other device within seconds. `sync --watch` reports each connection as **direct** or **relay**, with the time and bytes each sync took. `status` shows the devices and how many changes this device holds from each.
+
+> The join ticket contains the account key. Share it only with your own devices. Phase 0 developer accounts are for testing; real pairing comes later.
+
+### Cross-network test
+
+Run the two devices on different networks and note, for each case, whether the connection is direct or relay, and how long a text edit takes to arrive:
+
+| Case | Device A | Device B |
+|---|---|---|
+| 1 | Home Wi-Fi | Same Wi-Fi |
+| 2 | Home Wi-Fi | A laptop tethered to a phone on mobile data |
+| 3 | Home Wi-Fi | A different Wi-Fi (another home or an office) |
+| 4 | A network that blocks UDP, if available | Any |
+
+Case 4 should still sync, through a relay.
+
 ## Licence
 
 There's no licence yet. Mirrorleaf will be open source; until a licence is chosen, all rights are reserved.

@@ -1,0 +1,374 @@
+use std::path::Path;
+use std::time::Duration;
+
+use mirrorleaf_proto::{Change, DeviceId, VersionVector};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use yrs::updates::decoder::Decode;
+use yrs::{Doc, Transact, Update};
+
+use crate::{CoreError, Result};
+
+/// Schema version 1 (plan §5.1). `docs` holds snapshots, which compaction writes
+/// once it arrives (plan §5.2, E11); until then documents rebuild from the log.
+const SCHEMA_V1: &str = "
+    CREATE TABLE meta (
+        key   TEXT PRIMARY KEY,
+        value BLOB NOT NULL
+    );
+    -- rowid is the order this device received each change. Sending in that order
+    -- keeps every change after the changes it depends on.
+    CREATE TABLE changes (
+        rowid     INTEGER PRIMARY KEY,
+        origin    BLOB NOT NULL,
+        seq       INTEGER NOT NULL,
+        doc_id    TEXT NOT NULL,
+        update_v1 BLOB NOT NULL,
+        UNIQUE (origin, seq)
+    );
+    CREATE INDEX changes_by_doc ON changes (doc_id);
+    CREATE TABLE version_vector (
+        origin BLOB PRIMARY KEY,
+        seq    INTEGER NOT NULL
+    );
+    CREATE TABLE docs (
+        doc_id TEXT PRIMARY KEY,
+        state  BLOB NOT NULL
+    );
+";
+
+/// One device's copy of the account's notes.
+pub struct Replica {
+    conn: Connection,
+    device: DeviceId,
+}
+
+impl Replica {
+    /// Opens or creates the database at `path` for `device`. Refuses a database
+    /// created for another device, which would corrupt the sequence numbers.
+    pub fn open(path: impl AsRef<Path>, device: DeviceId) -> Result<Self> {
+        let conn = Connection::open(path)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        Self::init(conn, device)
+    }
+
+    pub fn open_in_memory(device: DeviceId) -> Result<Self> {
+        Self::init(Connection::open_in_memory()?, device)
+    }
+
+    fn init(conn: Connection, device: DeviceId) -> Result<Self> {
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version == 0 {
+            conn.execute_batch(SCHEMA_V1)?;
+            conn.pragma_update(None, "user_version", 1)?;
+        }
+        let mut replica = Self { conn, device };
+        match replica.meta("device_id")? {
+            None => replica.set_meta("device_id", &device.0)?,
+            Some(stored) if stored == device.0 => {}
+            Some(stored) => {
+                return Err(CoreError::WrongDevice {
+                    stored: data_hex(&stored),
+                    given: device.to_string(),
+                });
+            }
+        }
+        Ok(replica)
+    }
+
+    pub fn device(&self) -> DeviceId {
+        self.device
+    }
+
+    pub fn meta(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()?)
+    }
+
+    pub fn set_meta(&mut self, key: &str, value: &[u8]) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Appends a local edit to the change log under the next sequence number.
+    pub fn record_local(&mut self, doc_id: &str, update: Vec<u8>) -> Result<Change> {
+        decode_update(&update)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let held = held_seq(&tx, &self.device)?;
+        let change = Change {
+            origin: self.device,
+            seq: held + 1,
+            doc_id: doc_id.to_owned(),
+            update,
+        };
+        insert_change(&tx, &change)?;
+        tx.commit()?;
+        Ok(change)
+    }
+
+    pub fn version_vector(&self) -> Result<VersionVector> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT origin, seq FROM version_vector")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((device_id(row.get::<_, Vec<u8>>(0)?)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut vv = VersionVector::default();
+        for row in rows {
+            let (origin, seq) = row?;
+            vv.0.insert(origin, seq as u64);
+        }
+        Ok(vv)
+    }
+
+    /// The next batch of changes a peer holding `theirs` lacks, in log order,
+    /// starting after log row `after`. Returns the batch (about `max_bytes` of
+    /// updates, at least one change) and the row to continue from. An empty batch
+    /// means the peer is up to date.
+    pub fn changes_since(
+        &self,
+        theirs: &VersionVector,
+        after: i64,
+        max_bytes: usize,
+    ) -> Result<(Vec<Change>, i64)> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT rowid, origin, seq, doc_id, update_v1 FROM changes
+             WHERE rowid > ?1 ORDER BY rowid",
+        )?;
+        let mut rows = stmt.query([after])?;
+        let (mut batch, mut bytes, mut cursor) = (Vec::new(), 0, after);
+        while let Some(row) = rows.next()? {
+            cursor = row.get(0)?;
+            let change = Change {
+                origin: device_id(row.get(1)?)?,
+                seq: row.get::<_, i64>(2)? as u64,
+                doc_id: row.get(3)?,
+                update: row.get(4)?,
+            };
+            if theirs.contains(&change) {
+                continue;
+            }
+            bytes += change.update.len();
+            batch.push(change);
+            if bytes >= max_bytes {
+                break;
+            }
+        }
+        Ok((batch, cursor))
+    }
+
+    /// Stores changes received from a peer, in one transaction. Changes already
+    /// held are skipped. Returns how many were new.
+    pub fn apply_remote(&mut self, changes: &[Change]) -> Result<usize> {
+        for change in changes {
+            decode_update(&change.update)?;
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut added = 0;
+        for change in changes {
+            let held = held_seq(&tx, &change.origin)?;
+            if change.seq <= held {
+                continue;
+            }
+            if change.seq != held + 1 {
+                return Err(CoreError::Gap {
+                    origin: change.origin,
+                    seq: change.seq,
+                    held,
+                });
+            }
+            insert_change(&tx, change)?;
+            added += 1;
+        }
+        tx.commit()?;
+        Ok(added)
+    }
+
+    /// Rebuilds a document from its snapshot (if any) and its log rows. Yjs
+    /// updates are idempotent, so rows already in the snapshot are harmless.
+    pub fn load_doc(&self, doc_id: &str) -> Result<Doc> {
+        let doc = Doc::new();
+        {
+            let mut txn = doc.transact_mut();
+            let snapshot: Option<Vec<u8>> = self
+                .conn
+                .query_row(
+                    "SELECT state FROM docs WHERE doc_id = ?1",
+                    [doc_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(state) = snapshot {
+                apply(&mut txn, &state)?;
+            }
+            let mut stmt = self
+                .conn
+                .prepare_cached("SELECT update_v1 FROM changes WHERE doc_id = ?1 ORDER BY rowid")?;
+            let mut rows = stmt.query([doc_id])?;
+            while let Some(row) = rows.next()? {
+                apply(&mut txn, &row.get::<_, Vec<u8>>(0)?)?;
+            }
+        }
+        Ok(doc)
+    }
+
+    /// Number of rows in the change log.
+    pub fn change_count(&self) -> Result<u64> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM changes", [], |row| row.get(0))?;
+        Ok(n as u64)
+    }
+}
+
+fn held_seq(conn: &Connection, origin: &DeviceId) -> Result<u64> {
+    let seq: Option<i64> = conn
+        .query_row(
+            "SELECT seq FROM version_vector WHERE origin = ?1",
+            [&origin.0[..]],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(seq.unwrap_or(0) as u64)
+}
+
+fn insert_change(conn: &Connection, change: &Change) -> Result<()> {
+    conn.execute(
+        "INSERT INTO changes (origin, seq, doc_id, update_v1) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            &change.origin.0[..],
+            change.seq as i64,
+            change.doc_id,
+            change.update
+        ],
+    )?;
+    conn.execute(
+        "INSERT INTO version_vector (origin, seq) VALUES (?1, ?2)
+         ON CONFLICT (origin) DO UPDATE SET seq = excluded.seq",
+        params![&change.origin.0[..], change.seq as i64],
+    )?;
+    Ok(())
+}
+
+fn device_id(bytes: Vec<u8>) -> rusqlite::Result<DeviceId> {
+    let len = bytes.len();
+    bytes.try_into().map(DeviceId).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            len,
+            rusqlite::types::Type::Blob,
+            "device ID must be 32 bytes".into(),
+        )
+    })
+}
+
+pub(crate) fn decode_update(bytes: &[u8]) -> Result<Update> {
+    Update::decode_v1(bytes).map_err(|e| CoreError::Update(e.to_string()))
+}
+
+fn apply(txn: &mut yrs::TransactionMut, bytes: &[u8]) -> Result<()> {
+    txn.apply_update(decode_update(bytes)?)
+        .map_err(|e| CoreError::Update(e.to_string()))
+}
+
+fn data_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use yrs::{GetString, ReadTxn, Text, WriteTxn};
+
+    fn text_update(text: &str) -> Vec<u8> {
+        let doc = Doc::new();
+        let mut txn = doc.transact_mut();
+        txn.get_or_insert_text("t").push(&mut txn, text);
+        txn.encode_update_v1()
+    }
+
+    #[test]
+    fn local_changes_get_consecutive_sequence_numbers() {
+        let mut replica = Replica::open_in_memory(DeviceId([1; 32])).unwrap();
+        let a = replica.record_local("doc", text_update("a")).unwrap();
+        let b = replica.record_local("doc", text_update("b")).unwrap();
+        assert_eq!((a.seq, b.seq), (1, 2));
+        assert_eq!(replica.version_vector().unwrap().get(&DeviceId([1; 32])), 2);
+    }
+
+    #[test]
+    fn remote_changes_skip_duplicates_and_reject_gaps() {
+        let mut source = Replica::open_in_memory(DeviceId([1; 32])).unwrap();
+        let first = source.record_local("doc", text_update("a")).unwrap();
+        let second = source.record_local("doc", text_update("b")).unwrap();
+        let third = source.record_local("doc", text_update("c")).unwrap();
+
+        let mut sink = Replica::open_in_memory(DeviceId([2; 32])).unwrap();
+        assert_eq!(
+            sink.apply_remote(&[first.clone(), second.clone()]).unwrap(),
+            2
+        );
+        assert_eq!(sink.apply_remote(&[first, second]).unwrap(), 0);
+        let mut skipped = third.clone();
+        skipped.seq = 4;
+        assert!(matches!(
+            sink.apply_remote(&[skipped]),
+            Err(CoreError::Gap { .. })
+        ));
+        assert_eq!(sink.apply_remote(&[third]).unwrap(), 1);
+    }
+
+    #[test]
+    fn changes_since_pages_through_what_the_peer_lacks() {
+        let mut replica = Replica::open_in_memory(DeviceId([1; 32])).unwrap();
+        for word in ["one", "two", "three"] {
+            replica.record_local("doc", text_update(word)).unwrap();
+        }
+        let theirs = VersionVector([(DeviceId([1; 32]), 1)].into());
+        let (page, cursor) = replica.changes_since(&theirs, 0, 1).unwrap();
+        assert_eq!(page.iter().map(|c| c.seq).collect::<Vec<_>>(), [2]);
+        let (page, cursor) = replica.changes_since(&theirs, cursor, 1).unwrap();
+        assert_eq!(page.iter().map(|c| c.seq).collect::<Vec<_>>(), [3]);
+        assert!(
+            replica
+                .changes_since(&theirs, cursor, 1)
+                .unwrap()
+                .0
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn documents_rebuild_from_the_log() {
+        let mut replica = Replica::open_in_memory(DeviceId([1; 32])).unwrap();
+        replica.record_local("doc", text_update("hello")).unwrap();
+        let doc = replica.load_doc("doc").unwrap();
+        let txn = doc.transact();
+        assert_eq!(txn.get_text("t").unwrap().get_string(&txn), "hello");
+    }
+
+    #[test]
+    fn a_database_belongs_to_one_device() {
+        let dir = std::env::temp_dir().join(format!("mirrorleaf-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wrong-device.db");
+        let _ = std::fs::remove_file(&path);
+        Replica::open(&path, DeviceId([1; 32])).unwrap();
+        assert!(matches!(
+            Replica::open(&path, DeviceId([2; 32])),
+            Err(CoreError::WrongDevice { .. })
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

@@ -3,3 +3,11 @@ name = "mirrorleaf-proto"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+
+[dependencies]
+data-encoding.workspace = true
+ed25519-dalek.workspace = true
+postcard.workspace = true
+rand.workspace = true
+serde.workspace = true
+thiserror.workspace = true

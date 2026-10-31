@@ -3,3 +3,13 @@ name = "mirrorleaf-core"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+
+[dependencies]
+mirrorleaf-proto.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+yrs.workspace = true
+
+[dev-dependencies]
+rand.workspace = true

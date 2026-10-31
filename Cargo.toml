@@ -7,7 +7,37 @@ version = "0.0.0"
 edition = "2024"
 publish = false
 
+# Versions are taken only from releases at least 7 days old (ADR-001). Iroh and
+# yrs are pinned exactly: Iroh may still change during 1.x, and yrs must stay in
+# step with Yjs in the editor (plan §9).
+[workspace.dependencies]
+mirrorleaf-core = { path = "crates/core" }
+mirrorleaf-net = { path = "crates/net" }
+mirrorleaf-proto = { path = "crates/proto" }
+
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+data-encoding = "2.11.1"
+ed25519-dalek = "3.0.0"
+iroh = "=1.4.1"
+postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
+rand = "0.10.3"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = { version = "1.29.0", features = ["v7"] }
+yrs = "=0.28.0"
+
 # Implementation plan §3.3: no debug info for dependencies keeps debug builds
 # smaller and lighter on the 8 GB Mac.
 [profile.dev.package."*"]
 debug = false
+
+# Release builds run in CI (plan §3.3), so they can afford a slow, thorough optimise.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

@@ -3,3 +3,18 @@ name = "mirrorleaf-net"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+data-encoding.workspace = true
+iroh.workspace = true
+mirrorleaf-core.workspace = true
+mirrorleaf-proto.workspace = true
+postcard.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

@@ -16,7 +16,7 @@ Mirrorleaf keeps notes only on the user's own devices and syncs them device to d
 |---|---|
 | Rust format | `cargo fmt --all` |
 | Rust lint | `cargo clippy --workspace --all-targets -- -D warnings` |
-| Rust tests | `cargo test --workspace` |
+| Rust tests | `cargo test --workspace` (includes the convergence test and the Iroh loopback tests; no internet needed) |
 | Rust dependency check | `cargo deny check` |
 | Install JS dependencies | `pnpm install` |
 | Lint / format | `pnpm lint`, `pnpm format` (CI runs `pnpm format:check`) |
@@ -33,5 +33,7 @@ Mirrorleaf keeps notes only on the user's own devices and syncs them device to d
 - Node 24.22 (`.nvmrc`) and pnpm 12.16.1 (`packageManager`).
 - pnpm installs only releases at least 7 days old. A dependency that needs an install script must be added to `allowBuilds` in `pnpm-workspace.yaml`, and that needs the owner's approval.
 - TypeScript stays on 6.0.x until typescript-eslint supports 7. Yjs stays on 13 and Tauri on 2. iroh-blobs is pre-1.0: pin it exactly.
-- New Rust dependencies must pass `deny.toml`'s licence list (permissive plus MPL-2.0).
+- Rust has no automatic 7-day rule: pick versions at least 7 days old by hand, and check new `Cargo.lock` entries the same way. Iroh and yrs are pinned exactly (`=`).
+- New Rust dependencies must pass `deny.toml` (permissive licences plus MPL-2.0, checked only for the platforms we build). Any advisory exception needs a reason naming the crate that pulls it in.
+- The change log is the source of truth: sync moves log rows and never loads Yjs documents. Keep it that way, so the Android background job stays small.
 - Formatters stay out of `docs/` and Markdown files.

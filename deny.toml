@@ -1,9 +1,27 @@
 # cargo-deny: dependency guards for the Rust workspace (implementation plan, M0).
 # Run locally with `cargo deny check`; CI runs it on every push.
 
+[graph]
+# Only the platforms Mirrorleaf builds for, so crates used only elsewhere (such
+# as Iroh's in-browser WebSocket code) don't count.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-linux-android",
+    "armv7-linux-androideabi",
+    "i686-linux-android",
+    "x86_64-linux-android",
+    # The compile-only check that keeps the deferred Windows build working.
+    "x86_64-pc-windows-msvc",
+]
+
 [advisories]
-# Defaults: known vulnerabilities fail the check.
-ignore = []
+# Defaults: known vulnerabilities and unmaintained crates fail the check. Each
+# exception names the crate that pulls it in, so it can be revisited.
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained, not vulnerable: a compile-time macro used by netlink-packet-core through Iroh's netwatch" },
+    { id = "RUSTSEC-2026-0215", reason = "smallstr is unmaintained, not vulnerable: used inside yrs" },
+]
 
 [licenses]
 # Permissive licences plus MPL-2.0 (uniffi). Mirrorleaf's own licence isn't chosen
