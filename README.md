@@ -65,9 +65,34 @@ Edits made in another terminal (`note edit <id> --append "eggs"`) reach the othe
 
 > The join ticket contains the account key. Share it only with your own devices. Phase 0 developer accounts are for testing; real pairing comes later.
 
+### Photos
+
+Importing a photo resizes it to at most 2048 px and 600 KB (JPEG), and makes a 320 px thumbnail. Its EXIF data, including the location, is kept in the full image. HEIC photos can be imported on macOS only; the Linux build can't decode them, but it syncs them like any other photo.
+
+On the first device, while `sync --watch` runs in another terminal:
+
+```bash
+mirrorleaf-cli photo add <note> IMG_0001.HEIC IMG_0002.jpg
+```
+
+The other devices fetch the thumbnails within seconds. Full images move only when asked for:
+
+```bash
+mirrorleaf-cli photo list
+mirrorleaf-cli photo fetch <photo>
+```
+
+`photo fetch` needs `sync --watch` running on the same device. To see what arrived, start the watcher with an export folder:
+
+```bash
+mirrorleaf-cli sync --watch --export ~/mirrorleaf-photos
+```
+
+Every photo the device holds is saved there, and each new one as it arrives (thumbnails as `<photo>-thumbnail.jpg`). Photos are kept in the data folder's `blobs` folder, which one process can use at a time, so `photo export` works only while `sync --watch` isn't running.
+
 ### Cross-network test
 
-Run the two devices on different networks and note, for each case, whether the connection is direct or relay, and how long a text edit takes to arrive:
+Run the two devices on different networks and note, for each case, whether the connection is direct or relay, how long a text edit takes to arrive, and how long a photo's thumbnail and full image take:
 
 | Case | Device A | Device B |
 |---|---|---|

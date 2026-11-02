@@ -1,5 +1,5 @@
-# CI for Phase 0 (implementation plan, M0 and M1). The Android build joins in
-# M4, and the macOS app build and the compile-only Windows check in M5.
+# CI for Phase 0 (implementation plan, M0–M2). The Android build joins in M4,
+# and the macOS app build and the compile-only Windows check in M5.
 name: CI
 
 on:
@@ -27,6 +27,20 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+
+  # M2: HEIC photos are decoded with macOS ImageIO, which builds and runs only
+  # on macOS.
+  rust-macos:
+    name: Rust on macOS (core clippy and tests)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p mirrorleaf-core --all-targets --locked -- -D warnings
+      - run: cargo test -p mirrorleaf-core --locked
 
   # M1: release builds of the headless peer, so other machines (the Ubuntu
   # helper) can run it without building. Download them from the run's page.

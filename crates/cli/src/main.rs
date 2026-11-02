@@ -7,12 +7,16 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use mirrorleaf_core::Replica;
-use mirrorleaf_net::{Account, DevTicket, Event, Network, SecretKey, State, SyncNode, describe};
+use mirrorleaf_core::{BlobHash, BlobKind, Block, PhotoRef, Replica, photos};
+use mirrorleaf_net::{
+    Account, BlobStorage, DevTicket, Event, Network, SecretKey, State, SyncNode, describe,
+};
 use mirrorleaf_proto::{DeviceEntry, DeviceId};
 
 const KEY_FILE: &str = "device.key";
 const DB_FILE: &str = "mirrorleaf.db";
+/// The blob store's folder inside the data folder.
+const BLOB_DIR: &str = "blobs";
 const DEVICE_NAME: &str = "device_name";
 const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -39,11 +43,17 @@ enum Command {
     DevAccount(DevAccount),
     #[command(subcommand)]
     Note(Note),
+    #[command(subcommand)]
+    Photo(Photo),
     /// Sync with every device on the account that can be reached
     Sync {
         /// Stay connected and keep syncing until Ctrl-C
         #[arg(long)]
         watch: bool,
+        /// Save every photo this device holds into this folder, and each new one
+        /// as it arrives (thumbnails as <photo>-thumbnail.jpg)
+        #[arg(long, value_name = "FOLDER")]
+        export: Option<PathBuf>,
     },
     /// Show this device, its account and its change log
     Status,
@@ -93,6 +103,36 @@ enum Note {
     },
 }
 
+#[derive(Subcommand)]
+enum Photo {
+    /// Import photos into a note: resized to 2048 px and at most 600 KB, with
+    /// their EXIF kept, plus a 320 px thumbnail
+    Add {
+        /// The note (ID or a unique prefix of it)
+        note: String,
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+    },
+    /// List the photos in the notes and what this device holds of each
+    List,
+    /// Ask for a photo's full image; `sync --watch` fetches it from a device that has it
+    Fetch {
+        /// The photo (its hash or a unique prefix of it)
+        photo: String,
+        /// Seconds to wait for it to arrive
+        #[arg(long, default_value_t = 60)]
+        wait: u64,
+    },
+    /// Save a photo to a file (while `sync --watch` runs, use its --export instead)
+    Export {
+        photo: String,
+        path: PathBuf,
+        /// Save the thumbnail instead of the full image
+        #[arg(long)]
+        thumbnail: bool,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Iroh's NAT report warns on every start behind some routers; RUST_LOG=info shows it.
@@ -109,7 +149,8 @@ async fn main() -> Result<()> {
         Command::Init { name } => init(&dir, name),
         Command::DevAccount(cmd) => dev_account(&dir, cmd).await,
         Command::Note(cmd) => note(&dir, cmd),
-        Command::Sync { watch } => sync(&dir, watch).await,
+        Command::Photo(cmd) => photo(&dir, cmd).await,
+        Command::Sync { watch, export } => sync(&dir, watch, export).await,
         Command::Status => status(&dir),
     }
 }
@@ -159,8 +200,14 @@ async fn dev_account(dir: &Path, cmd: DevAccount) -> Result<()> {
                 .context("this device doesn't hold the account key")?;
             let account_secret = key.to_bytes();
             let devices = account.devices.clone();
-            let node =
-                SyncNode::bind(State { replica, account }, secret, Network::Internet).await?;
+            // No photos move here, so the store stays free for `sync --watch`.
+            let node = SyncNode::bind(
+                State { replica, account },
+                secret,
+                Network::Internet,
+                BlobStorage::Memory,
+            )
+            .await?;
             if tokio::time::timeout(Duration::from_secs(15), node.online())
                 .await
                 .is_err()
@@ -193,8 +240,14 @@ async fn dev_account(dir: &Path, cmd: DevAccount) -> Result<()> {
             )?;
             account.save(&mut replica)?;
             println!("Joined account {}", account.id());
-            let node =
-                SyncNode::bind(State { replica, account }, secret, Network::Internet).await?;
+            // Photos follow with the first `sync`.
+            let node = SyncNode::bind(
+                State { replica, account },
+                secret,
+                Network::Internet,
+                BlobStorage::Memory,
+            )
+            .await?;
             let started = Instant::now();
             match tokio::time::timeout(DIAL_TIMEOUT, node.sync_once(ticket.inviter)).await {
                 Ok(Ok((path, report))) => println!(
@@ -237,8 +290,28 @@ fn note(dir: &Path, cmd: Note) -> Result<()> {
                 note.title,
                 if note.trashed { "  [trash]" } else { "" }
             );
-            for (i, paragraph) in replica.note_paragraphs(&note.id)?.iter().enumerate() {
-                println!("{i}: {paragraph}");
+            for (i, block) in replica.note_blocks(&note.id)?.into_iter().enumerate() {
+                match block {
+                    Block::Paragraph(text) => println!("{i}: {text}"),
+                    Block::Photo {
+                        photo,
+                        width,
+                        height,
+                    } => {
+                        let held = if replica.holds_blob(photo.full)? {
+                            "full image here"
+                        } else if replica.holds_blob(photo.thumbnail)? {
+                            "thumbnail only"
+                        } else {
+                            "not here yet"
+                        };
+                        println!(
+                            "{i}: [photo {} {width}×{height}, {held}]",
+                            photo.full.short()
+                        );
+                    }
+                    Block::Other(kind) => println!("{i}: [{kind}]"),
+                }
             }
         }
         Note::Edit {
@@ -272,6 +345,155 @@ fn note(dir: &Path, cmd: Note) -> Result<()> {
     Ok(())
 }
 
+async fn photo(dir: &Path, cmd: Photo) -> Result<()> {
+    let (_, mut replica) = open(dir)?;
+    match cmd {
+        Photo::Add { note, files } => {
+            let id = replica.find_note(&note)?.id;
+            let decoder = photos::system_decoder();
+            for file in files {
+                let started = Instant::now();
+                let bytes = std::fs::read(&file)
+                    .with_context(|| format!("can't read {}", file.display()))?;
+                let p = replica
+                    .import_photo(&id, &bytes, decoder.as_deref())
+                    .with_context(|| file.display().to_string())?;
+                let exif = match p.exif_bytes {
+                    0 => "no EXIF".to_owned(),
+                    n => format!("EXIF {} kept", size(n as u64)),
+                };
+                println!(
+                    "{}  {} ({}) -> {}×{}, {} at quality {}, {exif}; thumbnail {} ({} ms)",
+                    p.photo.full.short(),
+                    file.file_name().unwrap_or_default().to_string_lossy(),
+                    size(bytes.len() as u64),
+                    p.width,
+                    p.height,
+                    size(p.full.len() as u64),
+                    p.quality,
+                    size(p.thumbnail.len() as u64),
+                    started.elapsed().as_millis()
+                );
+            }
+            println!("`sync --watch` on this device sends the thumbnails to the other devices.");
+        }
+        Photo::List => {
+            let titles: HashMap<String, String> = replica
+                .list_notes()?
+                .into_iter()
+                .map(|n| (n.id, n.title))
+                .collect();
+            for p in replica.photos()? {
+                let full = match (p.has_full, p.wanted) {
+                    (true, _) => "here",
+                    (false, true) => "asked for",
+                    (false, false) => "not here",
+                };
+                println!(
+                    "{}  thumbnail {:<8}  full image {:<9}  in \"{}\"",
+                    p.photo.full.short(),
+                    if p.has_thumbnail { "here" } else { "not here" },
+                    full,
+                    titles.get(&p.note).map_or("?", String::as_str)
+                );
+            }
+        }
+        Photo::Fetch { photo, wait } => {
+            let p = replica.find_photo(&photo)?;
+            if p.has_full {
+                println!("The full image is already here.");
+                return Ok(());
+            }
+            replica.want_blob(p.photo.full)?;
+            println!(
+                "Asked for the full image of {}. `sync --watch` on this device fetches it.",
+                p.photo.full.short()
+            );
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(wait) {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                if replica.holds_blob(p.photo.full)? {
+                    println!("Arrived after {:.1} s.", started.elapsed().as_secs_f64());
+                    return Ok(());
+                }
+            }
+            println!(
+                "Not here yet: it stays asked for, and arrives once a device that has it is online."
+            );
+        }
+        Photo::Export {
+            photo,
+            path,
+            thumbnail,
+        } => {
+            let p = replica.find_photo(&photo)?.photo;
+            let hash = if thumbnail { p.thumbnail } else { p.full };
+            let bytes = match replica.staged_blob(hash)? {
+                Some(bytes) => Some(bytes),
+                None => mirrorleaf_net::read_blob(&BlobStorage::Disk(dir.join(BLOB_DIR)), hash)
+                    .await
+                    .context("while `sync --watch` runs, use its --export option instead")?,
+            };
+            let Some(bytes) = bytes else {
+                bail!("this device doesn't hold that image yet");
+            };
+            std::fs::write(&path, &bytes)?;
+            println!("Saved {} ({}).", path.display(), size(bytes.len() as u64));
+        }
+    }
+    Ok(())
+}
+
+/// A byte count for people: 980 B, 21.3 KB, 2.9 MB (1 KB = 1000 bytes, as in
+/// the 600 KB photo target).
+fn size(bytes: u64) -> String {
+    match bytes {
+        0..1_000 => format!("{bytes} B"),
+        1_000..1_000_000 => format!("{:.1} KB", bytes as f64 / 1e3),
+        _ => format!("{:.1} MB", bytes as f64 / 1e6),
+    }
+}
+
+/// The photo a blob belongs to, and which of its images the blob is.
+fn photo_of(replica: &Replica, hash: BlobHash) -> Result<Option<(PhotoRef, BlobKind)>> {
+    Ok(replica.photos()?.into_iter().find_map(|p| {
+        if p.photo.full == hash {
+            Some((p.photo, BlobKind::Full))
+        } else if p.photo.thumbnail == hash {
+            Some((p.photo, BlobKind::Thumbnail))
+        } else {
+            None
+        }
+    }))
+}
+
+/// How the CLI names a blob: by its photo, which is named by its full image.
+fn blob_label(node: &SyncNode, hash: BlobHash) -> String {
+    let state = node.state().lock().unwrap();
+    match photo_of(&state.replica, hash) {
+        Ok(Some((photo, kind))) => format!("{kind} of photo {}", photo.full.short()),
+        _ => format!("blob {}", hash.short()),
+    }
+}
+
+/// Saves the blob `hash` into `folder`, named after its photo, if it belongs to
+/// one and this device holds it.
+async fn export_blob(node: &SyncNode, folder: &Path, hash: BlobHash) -> Result<()> {
+    let found = photo_of(&node.state().lock().unwrap().replica, hash)?;
+    let Some((photo, kind)) = found else {
+        return Ok(());
+    };
+    let Some(bytes) = node.blob(hash).await? else {
+        return Ok(());
+    };
+    let name = match kind {
+        BlobKind::Full => format!("{}.jpg", photo.full.short()),
+        BlobKind::Thumbnail => format!("{}-thumbnail.jpg", photo.full.short()),
+    };
+    std::fs::write(folder.join(name), bytes)?;
+    Ok(())
+}
+
 /// Splits "P:O:REST" into two numbers and the rest.
 fn parse_spec(spec: &str) -> Result<(u32, u32, &str)> {
     let mut parts = spec.splitn(3, ':');
@@ -285,11 +507,32 @@ fn parse_spec(spec: &str) -> Result<(u32, u32, &str)> {
     ))
 }
 
-async fn sync(dir: &Path, watch: bool) -> Result<()> {
+async fn sync(dir: &Path, watch: bool, export: Option<PathBuf>) -> Result<()> {
     let (secret, replica) = open(dir)?;
     let account =
         Account::load(&replica)?.context("no account yet: run `dev-account new` or `join`")?;
-    let node = SyncNode::bind(State { replica, account }, secret, Network::Internet).await?;
+    let node = SyncNode::bind(
+        State { replica, account },
+        secret,
+        Network::Internet,
+        BlobStorage::Disk(dir.join(BLOB_DIR)),
+    )
+    .await?;
+    for (hash, len) in node.store_staged().await? {
+        println!(
+            "stored {} added here ({})",
+            blob_label(&node, hash),
+            size(len)
+        );
+    }
+    if let Some(folder) = &export {
+        std::fs::create_dir_all(folder)?;
+        let photos = node.state().lock().unwrap().replica.photos()?;
+        for p in photos {
+            export_blob(&node, folder, p.photo.thumbnail).await?;
+            export_blob(&node, folder, p.photo.full).await?;
+        }
+    }
     // Names come from the live device list, which grows as devices join.
     let label = |id: DeviceId| {
         let state = node.state().lock().unwrap();
@@ -342,6 +585,28 @@ async fn sync(dir: &Path, watch: bool) -> Result<()> {
                         }
                     }
                     Some(Event::Disconnected { peer }) => println!("{} disconnected", label(peer)),
+                    Some(Event::Fetched { peer, path, report, .. }) => {
+                        println!(
+                            "{} via {path}: {}, {} ({} read) in {} ms",
+                            label(peer), blob_label(&node, report.hash), size(report.len),
+                            size(report.bytes_read), report.took.as_millis()
+                        );
+                        if let Some(folder) = &export {
+                            export_blob(&node, folder, report.hash).await?;
+                        }
+                    }
+                    Some(Event::FetchFailed { hash, error, .. }) => {
+                        println!(
+                            "{}: no connected device could send it yet ({error})",
+                            blob_label(&node, hash)
+                        );
+                    }
+                    Some(Event::Stored { hash, len }) => {
+                        println!("stored {} added here ({})", blob_label(&node, hash), size(len));
+                        if let Some(folder) = &export {
+                            export_blob(&node, folder, hash).await?;
+                        }
+                    }
                     None => break,
                 },
             }
@@ -377,8 +642,41 @@ async fn sync(dir: &Path, watch: bool) -> Result<()> {
                     report.traffic.received,
                     started.elapsed().as_millis()
                 ),
-                Ok(Err(e)) => println!("{}: {}", label(peer), describe(&e)),
-                Err(_) => println!("{}: not reachable", label(peer)),
+                Ok(Err(e)) => {
+                    println!("{}: {}", label(peer), describe(&e));
+                    continue;
+                }
+                Err(_) => {
+                    println!("{}: not reachable", label(peer));
+                    continue;
+                }
+            }
+            match node.fetch_missing(peer).await {
+                Ok(fetch) => {
+                    let path = fetch.path.map(|p| p.to_string()).unwrap_or_default();
+                    for (_, report) in fetch.fetched {
+                        println!(
+                            "{} via {path}: {}, {} ({} read) in {} ms",
+                            label(peer),
+                            blob_label(&node, report.hash),
+                            size(report.len),
+                            size(report.bytes_read),
+                            report.took.as_millis()
+                        );
+                        if let Some(folder) = &export {
+                            export_blob(&node, folder, report.hash).await?;
+                        }
+                    }
+                    for failure in fetch.failed {
+                        println!(
+                            "{}: {}: {}",
+                            label(peer),
+                            blob_label(&node, failure.hash),
+                            failure.error
+                        );
+                    }
+                }
+                Err(e) => println!("{}: photos: {}", label(peer), describe(&e)),
             }
         }
     }
@@ -425,6 +723,13 @@ fn status(dir: &Path) -> Result<()> {
         notes.len(),
         trashed,
         replica.change_count()?
+    );
+    let photos = replica.photos()?;
+    println!(
+        "Photos   {} ({} thumbnails and {} full images here)",
+        photos.len(),
+        photos.iter().filter(|p| p.has_thumbnail).count(),
+        photos.iter().filter(|p| p.has_full).count()
     );
     Ok(())
 }

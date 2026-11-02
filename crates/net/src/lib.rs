@@ -2,15 +2,20 @@
 //! authentication. All Iroh use stays inside this crate (implementation plan §5.3).
 
 mod account;
+mod blobs;
 mod frame;
 mod node;
 mod session;
 mod ticket;
 
 pub use account::Account;
+pub use blobs::{BlobStorage, read_blob};
 pub use frame::Traffic;
 pub use iroh::SecretKey;
-pub use node::{Event, Network, PathKind, State, SyncNode, endpoint_addr, path_kind};
+pub use node::{
+    BlobFailure, BlobReport, Event, FetchRound, Network, PathKind, State, SyncNode, endpoint_addr,
+    path_kind,
+};
 pub use session::RoundReport;
 pub use ticket::DevTicket;
 

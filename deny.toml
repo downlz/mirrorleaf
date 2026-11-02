@@ -21,6 +21,7 @@ targets = [
 ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained, not vulnerable: a compile-time macro used by netlink-packet-core through Iroh's netwatch" },
     { id = "RUSTSEC-2026-0215", reason = "smallstr is unmaintained, not vulnerable: used inside yrs" },
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error is unmaintained, not vulnerable: a compile-time macro used by genawaiter through iroh-blobs and bao-tree" },
 ]
 
 [licenses]

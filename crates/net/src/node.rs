@@ -1,20 +1,22 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, ensure};
 use iroh::endpoint::{Connection, Incoming, presets};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMode, SecretKey};
-use mirrorleaf_core::Replica;
-use mirrorleaf_proto::{ALPN, DeviceId, VersionVector};
+use mirrorleaf_core::{BlobKind, Replica};
+use mirrorleaf_proto::{ALPN, BlobHash, DeviceId, VersionVector};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::account::Account;
-use crate::describe;
+use crate::blobs::{BlobStorage, Blobs};
 use crate::frame::Traffic;
 use crate::session::{Role, RoundReport, handshake, round};
+use crate::{AuthError, describe};
 
 /// QUIC close code sent when a peer is refused, with the reason as text.
 const REFUSED: u32 = 1;
@@ -24,6 +26,8 @@ const TICK: Duration = Duration::from_secs(1);
 /// How long `watch` waits before dialling an unreachable device again.
 const REDIAL: Duration = Duration::from_secs(30);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
+/// Longest wait for one photo blob before trying it elsewhere.
+const BLOB_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Everything a sync needs from this device.
 pub struct State {
@@ -75,6 +79,34 @@ pub fn path_kind(conn: &Connection) -> PathKind {
         .unwrap_or(PathKind::Unknown)
 }
 
+/// One photo blob that arrived.
+#[derive(Clone, Debug)]
+pub struct BlobReport {
+    pub hash: BlobHash,
+    /// Bytes read from the network, including iroh-blobs' hash data.
+    pub bytes_read: u64,
+    /// The blob's size.
+    pub len: u64,
+    pub took: Duration,
+}
+
+/// A photo blob a peer couldn't send.
+#[derive(Clone, Debug)]
+pub struct BlobFailure {
+    pub hash: BlobHash,
+    pub kind: BlobKind,
+    pub error: String,
+}
+
+/// What one round of fetching photos from a peer did.
+#[derive(Clone, Debug, Default)]
+pub struct FetchRound {
+    /// How the peer was reached; `None` if nothing needed fetching.
+    pub path: Option<PathKind>,
+    pub fetched: Vec<(BlobKind, BlobReport)>,
+    pub failed: Vec<BlobFailure>,
+}
+
 /// What `watch` reports as it happens.
 #[derive(Debug)]
 pub enum Event {
@@ -96,6 +128,24 @@ pub enum Event {
     Disconnected {
         peer: DeviceId,
     },
+    /// A photo blob arrived from a peer.
+    Fetched {
+        peer: DeviceId,
+        path: PathKind,
+        kind: BlobKind,
+        report: BlobReport,
+    },
+    /// A photo added on this device entered the blob store.
+    Stored {
+        hash: BlobHash,
+        len: u64,
+    },
+    /// No connected device could send a photo blob; it is tried again later.
+    FetchFailed {
+        hash: BlobHash,
+        kind: BlobKind,
+        error: String,
+    },
 }
 
 /// This device on the network: an Iroh endpoint whose key is the device ID.
@@ -108,6 +158,7 @@ struct Inner {
     endpoint: Endpoint,
     state: Shared,
     hints: Mutex<HashMap<DeviceId, EndpointAddr>>,
+    blobs: Blobs,
 }
 
 /// A connected peer, as `watch` tracks it.
@@ -120,19 +171,31 @@ struct Peer {
 
 type Peers = Arc<Mutex<HashMap<DeviceId, Peer>>>;
 
+/// When each blob that no connected device could send was last tried.
+type Backoff = Arc<Mutex<HashMap<BlobHash, Instant>>>;
+
 impl SyncNode {
-    pub async fn bind(state: State, secret: SecretKey, network: Network) -> Result<Self> {
+    /// Binds this device's endpoint and opens its blob store. Staged photos
+    /// stay staged until [`SyncNode::store_staged`] or `watch` moves them, so a
+    /// node with a memory store (a ticket, a join) never takes them.
+    pub async fn bind(
+        state: State,
+        secret: SecretKey,
+        network: Network,
+        storage: BlobStorage,
+    ) -> Result<Self> {
         ensure!(
             DeviceId(*secret.public().as_bytes()) == state.replica.device(),
             "the device key doesn't match this database"
         );
+        let blobs = Blobs::open(&storage).await?;
         let builder = match network {
             Network::Internet => Endpoint::builder(presets::N0),
             Network::Local => Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Disabled),
         };
         let endpoint = builder
             .secret_key(secret)
-            .alpns(vec![ALPN.to_vec()])
+            .alpns(vec![ALPN.to_vec(), iroh_blobs::ALPN.to_vec()])
             .bind()
             .await?;
         Ok(Self {
@@ -140,6 +203,7 @@ impl SyncNode {
                 endpoint,
                 state: Arc::new(Mutex::new(state)),
                 hints: Mutex::default(),
+                blobs,
             }),
         })
     }
@@ -227,15 +291,31 @@ impl SyncNode {
         round(&self.inner.state, send, recv, Role::Opener).await
     }
 
-    /// Accepts the next incoming connection and serves its first round. Returns
-    /// `None` once the endpoint is closed.
+    /// Accepts the next incoming sync connection and serves its first round.
+    /// Blob connections that arrive meanwhile are served in the background.
+    /// Returns `None` once the endpoint is closed.
     pub async fn accept(&self) -> Option<Result<(Connection, RoundReport)>> {
-        let incoming = self.inner.endpoint.accept().await?;
-        Some(self.accept_connection(incoming).await)
+        loop {
+            let incoming = self.inner.endpoint.accept().await?;
+            match self.accept_connection(incoming).await {
+                Ok(None) => continue,
+                Ok(Some(accepted)) => return Some(Ok(accepted)),
+                Err(e) => return Some(Err(e)),
+            }
+        }
     }
 
-    async fn accept_connection(&self, incoming: Incoming) -> Result<(Connection, RoundReport)> {
+    /// Serves an incoming connection: a blob connection in the background
+    /// (`None`), or a sync connection's first round.
+    async fn accept_connection(
+        &self,
+        incoming: Incoming,
+    ) -> Result<Option<(Connection, RoundReport)>> {
         let conn = incoming.await?;
+        if conn.alpn() == iroh_blobs::ALPN {
+            self.serve_blobs(conn);
+            return Ok(None);
+        }
         let (mut send, mut recv) = conn.accept_bi().await?;
         let mut traffic = Traffic::default();
         let shook = handshake(
@@ -248,17 +328,144 @@ impl SyncNode {
         refuse_on_error(&conn, shook.await)?;
         let mut report = round(&self.inner.state, send, recv, Role::Responder).await?;
         report.traffic += traffic;
-        Ok((conn, report))
+        Ok(Some((conn, report)))
     }
 
-    /// Serves the next round the peer starts on `conn`.
-    pub async fn serve(&self, conn: &Connection) -> Result<RoundReport> {
+    /// Serves photo blobs to a device on the account's list, and refuses anyone
+    /// else: iroh-blobs on its own would serve any peer (plan §5.3 step 2).
+    fn serve_blobs(&self, conn: Connection) {
+        let peer = device_of(&conn);
+        if !self
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .account
+            .devices
+            .contains(&peer)
+        {
+            let _ = refuse_on_error(&conn, Err(AuthError::NotOnList.into()));
+            return;
+        }
+        let node = self.clone();
+        tokio::spawn(async move { node.inner.blobs.serve(conn).await });
+    }
+
+    /// Moves photos staged in the database (by `photo add` in another process)
+    /// into the blob store. Returns each blob stored and its size.
+    pub async fn store_staged(&self) -> Result<Vec<(BlobHash, u64)>> {
+        self.inner.blobs.store_staged(&self.inner.state).await
+    }
+
+    /// A blob's content, if this device holds all of it.
+    pub async fn blob(&self, hash: BlobHash) -> Result<Option<Vec<u8>>> {
+        self.inner.blobs.get(hash).await
+    }
+
+    /// Fetches one blob from `addr`. With `stop_after`, gives up once that many
+    /// bytes have arrived and keeps what came, as an interrupted transfer would;
+    /// the next fetch carries on from there.
+    pub async fn fetch_blob(
+        &self,
+        addr: impl Into<EndpointAddr>,
+        hash: BlobHash,
+        stop_after: Option<u64>,
+    ) -> Result<BlobReport> {
+        let started = Instant::now();
+        let conn = self.inner.endpoint.connect(addr, iroh_blobs::ALPN).await?;
+        let fetched = self.fetch_on(&conn, hash, stop_after, started).await;
+        conn.close(0u32.into(), b"done");
+        fetched
+    }
+
+    /// Fetches every missing thumbnail and requested full image from `peer`
+    /// (plan §5.3 step 4).
+    pub async fn fetch_missing(&self, peer: DeviceId) -> Result<FetchRound> {
+        let wanted = self.inner.state.lock().unwrap().replica.blobs_to_fetch()?;
+        self.fetch_from(peer, wanted).await
+    }
+
+    /// Fetches `wanted` from `peer` over one blob connection.
+    async fn fetch_from(
+        &self,
+        peer: DeviceId,
+        wanted: Vec<(BlobHash, BlobKind)>,
+    ) -> Result<FetchRound> {
+        let mut fetch = FetchRound::default();
+        if wanted.is_empty() {
+            return Ok(fetch);
+        }
+        let addr = self.addr_for(peer)?;
+        let conn = tokio::time::timeout(
+            DIAL_TIMEOUT,
+            self.inner.endpoint.connect(addr, iroh_blobs::ALPN),
+        )
+        .await??;
+        for (hash, kind) in wanted {
+            if self.holds(hash) {
+                continue;
+            }
+            let started = Instant::now();
+            let fetched =
+                tokio::time::timeout(BLOB_TIMEOUT, self.fetch_on(&conn, hash, None, started)).await;
+            match fetched {
+                Ok(Ok(report)) => fetch.fetched.push((kind, report)),
+                Ok(Err(e)) => fetch.failed.push(BlobFailure {
+                    hash,
+                    kind,
+                    error: describe(&e),
+                }),
+                Err(_) => fetch.failed.push(BlobFailure {
+                    hash,
+                    kind,
+                    error: "timed out".into(),
+                }),
+            }
+        }
+        fetch.path = Some(path_kind(&conn));
+        conn.close(0u32.into(), b"done");
+        Ok(fetch)
+    }
+
+    async fn fetch_on(
+        &self,
+        conn: &Connection,
+        hash: BlobHash,
+        stop_after: Option<u64>,
+        started: Instant,
+    ) -> Result<BlobReport> {
+        let fetched = self.inner.blobs.fetch(conn, hash, stop_after).await?;
+        self.inner
+            .state
+            .lock()
+            .unwrap()
+            .replica
+            .blob_stored(hash, fetched.len)?;
+        Ok(BlobReport {
+            hash,
+            bytes_read: fetched.bytes_read,
+            len: fetched.len,
+            took: started.elapsed(),
+        })
+    }
+
+    fn holds(&self, hash: BlobHash) -> bool {
+        let state = self.inner.state.lock().unwrap();
+        state.replica.holds_blob(hash).unwrap_or(false)
+    }
+
+    /// Serves the next round the peer starts on `conn`. The time returned runs
+    /// from when the peer opened the round, not from when we started waiting.
+    pub async fn serve(&self, conn: &Connection) -> Result<(RoundReport, Duration)> {
         let (send, recv) = conn.accept_bi().await?;
-        round(&self.inner.state, send, recv, Role::Responder).await
+        let started = Instant::now();
+        let report = round(&self.inner.state, send, recv, Role::Responder).await?;
+        Ok((report, started.elapsed()))
     }
 
     pub async fn close(&self) {
-        self.inner.endpoint.close().await
+        self.inner.endpoint.close().await;
+        self.inner.blobs.shutdown().await;
     }
 
     /// Live mode (plan §5.3, step 5): stays connected to every device on the
@@ -275,9 +482,10 @@ impl SyncNode {
                     tokio::spawn(async move {
                         let started = Instant::now();
                         match node.accept_connection(incoming).await {
-                            Ok((conn, report)) => {
+                            Ok(Some((conn, report))) => {
                                 node.track(&peers, conn, report, started, true, &events)
                             }
+                            Ok(None) => {}
                             Err(e) => {
                                 let error = describe(&e);
                                 let _ = events.send(Event::Failed { peer: None, error });
@@ -290,6 +498,8 @@ impl SyncNode {
 
         let mut tick = tokio::time::interval(TICK);
         let mut last_dial: HashMap<DeviceId, Instant> = HashMap::new();
+        let fetching = Arc::new(AtomicBool::new(false));
+        let backoff: Backoff = Arc::default();
         let result = loop {
             tick.tick().await;
             if self.inner.endpoint.is_closed() {
@@ -332,9 +542,100 @@ impl SyncNode {
                     }
                 }
             }
+
+            match self.store_staged().await {
+                Ok(stored) => {
+                    for (hash, len) in stored {
+                        let _ = events.send(Event::Stored { hash, len });
+                    }
+                }
+                Err(e) => {
+                    let error = describe(&e);
+                    let _ = events.send(Event::Failed { peer: None, error });
+                }
+            }
+            if !fetching.load(Ordering::Acquire) {
+                self.spawn_fetch(&peers, &fetching, &backoff, &events);
+            }
         };
         acceptor.abort();
         result
+    }
+
+    /// Fetches missing thumbnails and requested full images from the connected
+    /// devices, trying each in turn. A blob none of them could send waits
+    /// `REDIAL` before it is tried again.
+    fn spawn_fetch(
+        &self,
+        peers: &Peers,
+        fetching: &Arc<AtomicBool>,
+        backoff: &Backoff,
+        events: &UnboundedSender<Event>,
+    ) {
+        let wanted = {
+            let state = self.inner.state.lock().unwrap();
+            match state.replica.blobs_to_fetch() {
+                Ok(wanted) => wanted,
+                Err(_) => return,
+            }
+        };
+        let mut wanted: Vec<_> = {
+            let backoff = backoff.lock().unwrap();
+            wanted
+                .into_iter()
+                .filter(|(hash, _)| backoff.get(hash).is_none_or(|t| t.elapsed() >= REDIAL))
+                .collect()
+        };
+        let connected: Vec<DeviceId> = peers.lock().unwrap().keys().copied().collect();
+        if wanted.is_empty() || connected.is_empty() {
+            return;
+        }
+        fetching.store(true, Ordering::Release);
+        let (node, fetching, backoff, events) = (
+            self.clone(),
+            fetching.clone(),
+            backoff.clone(),
+            events.clone(),
+        );
+        tokio::spawn(async move {
+            let mut last_error: HashMap<BlobHash, String> = HashMap::new();
+            for peer in connected {
+                wanted.retain(|(hash, _)| !node.holds(*hash));
+                if wanted.is_empty() {
+                    break;
+                }
+                match node.fetch_from(peer, wanted.clone()).await {
+                    Ok(fetch) => {
+                        let path = fetch.path.unwrap_or(PathKind::Unknown);
+                        for (kind, report) in fetch.fetched {
+                            let _ = events.send(Event::Fetched {
+                                peer,
+                                path,
+                                kind,
+                                report,
+                            });
+                        }
+                        for failure in fetch.failed {
+                            last_error.insert(failure.hash, failure.error);
+                        }
+                    }
+                    Err(e) => {
+                        let error = describe(&e);
+                        for (hash, _) in &wanted {
+                            last_error.insert(*hash, error.clone());
+                        }
+                    }
+                }
+            }
+            wanted.retain(|(hash, _)| !node.holds(*hash));
+            let mut backoff = backoff.lock().unwrap();
+            for (hash, kind) in wanted {
+                backoff.insert(hash, Instant::now());
+                let error = last_error.remove(&hash).unwrap_or_default();
+                let _ = events.send(Event::FetchFailed { hash, kind, error });
+            }
+            fetching.store(false, Ordering::Release);
+        });
     }
 
     fn spawn_dial(&self, peers: &Peers, peer: DeviceId, events: &UnboundedSender<Event>) {
@@ -427,14 +728,12 @@ impl SyncNode {
         let (node, peers, events) = (self.clone(), peers.clone(), events.clone());
         tokio::spawn(async move {
             loop {
-                let started = Instant::now();
                 match node.serve(&conn).await {
-                    Ok(report) => {
+                    Ok((report, took)) => {
                         if let Some(p) = peers.lock().unwrap().get_mut(&peer) {
                             p.holds = p.holds.merged(&report.peer_holds);
                         }
                         let path = path_kind(&conn);
-                        let took = started.elapsed();
                         let _ = events.send(Event::Synced {
                             peer,
                             path,

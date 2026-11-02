@@ -6,12 +6,18 @@
 //! document is rebuilt from its rows when it is opened.
 
 mod batch;
+mod blobs;
+mod heif;
+#[cfg(target_os = "macos")]
+mod imageio;
 mod notes;
+pub mod photos;
 mod replica;
 
 pub use batch::{BATCH_WINDOW, Batcher};
-pub use mirrorleaf_proto::{Change, DeviceId, VersionVector};
-pub use notes::{CONTENT_FRAGMENT, INDEX_DOC, NoteMeta};
+pub use blobs::{BLOB_SCHEME, BlobKind, PhotoRef, PhotoStatus};
+pub use mirrorleaf_proto::{BlobHash, Change, DeviceId, VersionVector};
+pub use notes::{Block, CONTENT_FRAGMENT, INDEX_DOC, NoteMeta};
 pub use replica::Replica;
 pub use yrs;
 
@@ -33,6 +39,8 @@ pub enum CoreError {
     NoSuchNote(String),
     #[error("{0}")]
     Invalid(String),
+    #[error("can't import this photo: {0}")]
+    Photo(String),
 }
 
 pub type Result<T, E = CoreError> = std::result::Result<T, E>;

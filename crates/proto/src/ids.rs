@@ -57,3 +57,9 @@ key_id!(
     /// The account's public key, which signs the device list.
     AccountId
 );
+
+key_id!(
+    /// The BLAKE3 hash of a blob's content, which names it in the blob store
+    /// (plan §5.5).
+    BlobHash
+);

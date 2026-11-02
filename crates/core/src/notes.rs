@@ -4,11 +4,11 @@ use mirrorleaf_proto::Change;
 use uuid::Uuid;
 use yrs::{
     Any, GetString, In, Map, MapPrelim, MapRef, Out, ReadTxn, Text, Transact, TransactionMut,
-    WriteTxn, XmlElementPrelim, XmlElementRef, XmlFragment, XmlOut, XmlTextPrelim, XmlTextRef,
+    WriteTxn, Xml, XmlElementPrelim, XmlElementRef, XmlFragment, XmlOut, XmlTextPrelim, XmlTextRef,
 };
 
 use crate::replica::decode_update;
-use crate::{CoreError, Replica, Result};
+use crate::{CoreError, PhotoRef, Replica, Result};
 
 /// The notebook index: one Yjs document mapping note ID → {title, trashed,
 /// updated} (plan §5.1). Trashing is a flag, never a delete, so a device that was
@@ -20,6 +20,21 @@ const NOTES: &str = "notes";
 /// TipTap's collaboration extension uses, so the editor (M5) reads the same data.
 pub const CONTENT_FRAGMENT: &str = "default";
 const PARAGRAPH: &str = "paragraph";
+/// TipTap's Image node, with the photo's address in `src` (plan §5.6).
+const IMAGE: &str = "image";
+
+/// One top-level block of a note's content.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Block {
+    Paragraph(String),
+    Photo {
+        photo: PhotoRef,
+        width: u32,
+        height: u32,
+    },
+    /// A node type this build doesn't show, such as one the editor adds later.
+    Other(String),
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NoteMeta {
@@ -133,6 +148,63 @@ impl Replica {
             .collect())
     }
 
+    /// The note's top-level blocks, in order. A block's position is the index the
+    /// text edits take.
+    pub fn note_blocks(&self, id: &str) -> Result<Vec<Block>> {
+        let doc = self.load_doc(id)?;
+        let txn = doc.transact();
+        let Some(fragment) = txn.get_xml_fragment(CONTENT_FRAGMENT) else {
+            return Ok(Vec::new());
+        };
+        let number = |element: &XmlElementRef, name| match element.get_attribute(&txn, name) {
+            Some(Out::Any(Any::Number(n))) => n.as_f64().unwrap_or(0.0) as u32,
+            _ => 0,
+        };
+        Ok(fragment
+            .children(&txn)
+            .filter_map(|node| match node {
+                XmlOut::Element(e) if e.tag().as_ref() == PARAGRAPH => Some(Block::Paragraph(
+                    e.children(&txn)
+                        .filter_map(|child| match child {
+                            XmlOut::Text(t) => Some(t.get_string(&txn)),
+                            _ => None,
+                        })
+                        .collect(),
+                )),
+                XmlOut::Element(e) if e.tag().as_ref() == IMAGE => {
+                    let photo = match e.get_attribute(&txn, "src") {
+                        Some(Out::Any(Any::String(src))) => PhotoRef::parse(&src),
+                        _ => None,
+                    };
+                    Some(match photo {
+                        Some(photo) => Block::Photo {
+                            photo,
+                            width: number(&e, "width"),
+                            height: number(&e, "height"),
+                        },
+                        None => Block::Other(IMAGE.to_owned()),
+                    })
+                }
+                XmlOut::Element(e) => Some(Block::Other(e.tag().to_string())),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// Adds a photo at the end of the note. Its blobs must already be stored or
+    /// staged (see `photos::prepare`).
+    pub fn add_photo(&mut self, id: &str, photo: &PhotoRef, width: u32, height: u32) -> Result<()> {
+        self.edit_doc(id, |txn| {
+            let content = txn.get_or_insert_xml_fragment(CONTENT_FRAGMENT);
+            let end = content.len(txn);
+            let image = content.insert(txn, end, XmlElementPrelim::empty(IMAGE));
+            image.insert_attribute(txn, "src", photo.to_uri());
+            image.insert_attribute(txn, "width", f64::from(width));
+            image.insert_attribute(txn, "height", f64::from(height));
+        })?;
+        self.touch(id)
+    }
+
     pub fn append_paragraph(&mut self, id: &str, text: &str) -> Result<()> {
         self.edit_doc(id, |txn| {
             let content = txn.get_or_insert_xml_fragment(CONTENT_FRAGMENT);
@@ -214,6 +286,11 @@ fn paragraph_text(txn: &mut TransactionMut, index: u32) -> Result<XmlTextRef> {
     let Some(XmlOut::Element(paragraph)) = content.get(txn, index) else {
         return Err(CoreError::Invalid(format!("no paragraph {index}")));
     };
+    if paragraph.tag().as_ref() != PARAGRAPH {
+        return Err(CoreError::Invalid(format!(
+            "block {index} isn't a paragraph"
+        )));
+    }
     Ok(first_text(txn, &paragraph))
 }
 
@@ -235,7 +312,7 @@ fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use mirrorleaf_proto::DeviceId;
+    use mirrorleaf_proto::{BlobHash, DeviceId};
 
     use super::*;
 
@@ -256,6 +333,33 @@ mod tests {
         replica.trash_note(&id).unwrap();
         let note = replica.find_note(&id[..8]).unwrap();
         assert_eq!((note.title.as_str(), note.trashed), ("Shopping", true));
+    }
+
+    #[test]
+    fn photos_sit_between_paragraphs_as_blocks() {
+        let mut replica = Replica::open_in_memory(DeviceId([1; 32])).unwrap();
+        let id = replica.create_note("Trip").unwrap();
+        replica.append_paragraph(&id, "before").unwrap();
+        let photo = PhotoRef {
+            full: BlobHash([1; 32]),
+            thumbnail: BlobHash([2; 32]),
+        };
+        replica.add_photo(&id, &photo, 2048, 1536).unwrap();
+        replica.append_paragraph(&id, "after").unwrap();
+        assert_eq!(
+            replica.note_blocks(&id).unwrap(),
+            [
+                Block::Paragraph("before".into()),
+                Block::Photo {
+                    photo,
+                    width: 2048,
+                    height: 1536
+                },
+                Block::Paragraph("after".into()),
+            ]
+        );
+        assert!(replica.insert_text(&id, 1, 0, "x").is_err());
+        replica.insert_text(&id, 2, 5, "wards").unwrap();
     }
 
     #[test]

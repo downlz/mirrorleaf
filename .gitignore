@@ -21,3 +21,4 @@ google-services.json
 docs/implementation-plan.md
 docs/adr/ADR-001-foundation-decisions.md
 docs/adr/ADR-002-sync-core-decisions.md
+docs/adr/ADR-003-photo-decisions.md

@@ -6,6 +6,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use yrs::updates::decoder::Decode;
 use yrs::{Doc, Transact, Update};
 
+use crate::blobs::record_refs;
 use crate::{CoreError, Result};
 
 /// Schema version 1 (plan §5.1). `docs` holds snapshots, which compaction writes
@@ -36,9 +37,37 @@ const SCHEMA_V1: &str = "
     );
 ";
 
+/// Schema version 2 (M2): photos (plan §5.5). The blob store itself belongs to
+/// the network layer; these tables say which photos notes refer to and which
+/// blobs this device holds, so sync can tell what to fetch without loading a
+/// document.
+const SCHEMA_V2: &str = "
+    -- Every photo any change refers to, found in the change's bytes.
+    CREATE TABLE photo_refs (
+        full   BLOB PRIMARY KEY,
+        thumb  BLOB NOT NULL,
+        doc_id TEXT NOT NULL
+    );
+    -- Blobs the blob store holds in full.
+    CREATE TABLE blobs_held (
+        hash BLOB PRIMARY KEY,
+        len  INTEGER NOT NULL
+    );
+    -- Full images asked for, until they arrive.
+    CREATE TABLE blob_wants (
+        hash BLOB PRIMARY KEY
+    );
+    -- Blobs waiting to enter the blob store, from a process that doesn't have
+    -- the store open (the CLI's `photo add`).
+    CREATE TABLE staged_blobs (
+        hash BLOB PRIMARY KEY,
+        data BLOB NOT NULL
+    );
+";
+
 /// One device's copy of the account's notes.
 pub struct Replica {
-    conn: Connection,
+    pub(crate) conn: Connection,
     device: DeviceId,
 }
 
@@ -61,6 +90,9 @@ impl Replica {
         if version == 0 {
             conn.execute_batch(SCHEMA_V1)?;
             conn.pragma_update(None, "user_version", 1)?;
+        }
+        if version < 2 {
+            migrate_to_v2(&conn)?;
         }
         let mut replica = Self { conn, device };
         match replica.meta("device_id")? {
@@ -259,7 +291,28 @@ fn insert_change(conn: &Connection, change: &Change) -> Result<()> {
          ON CONFLICT (origin) DO UPDATE SET seq = excluded.seq",
         params![&change.origin.0[..], change.seq as i64],
     )?;
-    Ok(())
+    record_refs(conn, &change.doc_id, &change.update)
+}
+
+/// Adds the photo tables, and finds the photos changes already in the log refer to.
+fn migrate_to_v2(conn: &Connection) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let migrated = (|| {
+        conn.execute_batch(SCHEMA_V2)?;
+        let mut stmt = conn.prepare("SELECT doc_id, update_v1 FROM changes ORDER BY rowid")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            record_refs(conn, &row.get::<_, String>(0)?, &row.get::<_, Vec<u8>>(1)?)?;
+        }
+        conn.pragma_update(None, "user_version", 2)?;
+        Ok(())
+    })();
+    conn.execute_batch(if migrated.is_ok() {
+        "COMMIT"
+    } else {
+        "ROLLBACK"
+    })?;
+    migrated
 }
 
 fn device_id(bytes: Vec<u8>) -> rusqlite::Result<DeviceId> {
@@ -356,6 +409,46 @@ mod tests {
         let doc = replica.load_doc("doc").unwrap();
         let txn = doc.transact();
         assert_eq!(txn.get_text("t").unwrap().get_string(&txn), "hello");
+    }
+
+    #[test]
+    fn an_m1_database_gains_the_photo_tables() {
+        use crate::{BlobHash, PhotoRef};
+
+        let dir = std::env::temp_dir().join(format!("mirrorleaf-v1-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m1.db");
+        let _ = std::fs::remove_file(&path);
+        let photo = PhotoRef {
+            full: BlobHash([1; 32]),
+            thumbnail: BlobHash([2; 32]),
+        };
+        {
+            // A database as M1 left it, holding a change that refers to a photo.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+            let change = Change {
+                origin: DeviceId([1; 32]),
+                seq: 1,
+                doc_id: "note".into(),
+                update: photo.to_uri().into_bytes(),
+            };
+            conn.execute(
+                "INSERT INTO changes (origin, seq, doc_id, update_v1) VALUES (?1, ?2, ?3, ?4)",
+                params![&change.origin.0[..], 1, change.doc_id, change.update],
+            )
+            .unwrap();
+        }
+        let replica = Replica::open(&path, DeviceId([1; 32])).unwrap();
+        let version: i64 = replica
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        assert_eq!(replica.photos().unwrap()[0].photo, photo);
+        drop(replica);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
