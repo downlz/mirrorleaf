@@ -89,6 +89,10 @@ impl AccountKey {
         AccountId(self.0.verifying_key().to_bytes())
     }
 
+    pub(crate) fn signing_key(&self) -> &SigningKey {
+        &self.0
+    }
+
     pub fn sign(&self, list: DeviceList) -> SignedDeviceList {
         let list = list.normalised();
         let signature = self.0.sign(&list.signing_message()).to_bytes().to_vec();

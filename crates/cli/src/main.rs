@@ -8,15 +8,22 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use mirrorleaf_core::{BlobHash, BlobKind, Block, PhotoRef, Replica, photos};
+use mirrorleaf_net::ledger::{DeviceProfile, LedgerClient};
 use mirrorleaf_net::{
     Account, BlobStorage, DevTicket, Event, Network, SecretKey, State, SyncNode, describe,
 };
+use mirrorleaf_proto::ledger::{Platform, StatusResponse, WakeResponse};
 use mirrorleaf_proto::{DeviceEntry, DeviceId};
 
 const KEY_FILE: &str = "device.key";
 const DB_FILE: &str = "mirrorleaf.db";
 /// The blob store's folder inside the data folder.
 const BLOB_DIR: &str = "blobs";
+/// Where the ledger settings are kept in the database's `meta` table.
+const LEDGER_URL: &str = "ledger_url";
+const LEDGER_PLATFORM: &str = "ledger_platform";
+const LEDGER_PUSH_TOKEN: &str = "ledger_push_token";
+const LEDGER_NOTIFICATIONS: &str = "ledger_notifications";
 const DEVICE_NAME: &str = "device_name";
 const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -45,6 +52,9 @@ enum Command {
     Note(Note),
     #[command(subcommand)]
     Photo(Photo),
+    /// The sync-status ledger (M3)
+    #[command(subcommand)]
+    Ledger(LedgerCmd),
     /// Sync with every device on the account that can be reached
     Sync {
         /// Stay connected and keep syncing until Ctrl-C
@@ -104,6 +114,33 @@ enum Note {
 }
 
 #[derive(Subcommand)]
+enum LedgerCmd {
+    /// Register this device with a ledger; `sync` then reports to it
+    Register {
+        /// The ledger's address, for example http://192.168.1.20:8080
+        url: String,
+        /// Report as this platform instead of this machine's. `android` lets a
+        /// CLI device stand in for a phone in Phase 0 tests.
+        #[arg(long)]
+        platform: Option<Platform>,
+        /// A push token to report. A made-up one makes the ledger decide (and,
+        /// without FCM, log) pushes for this device.
+        #[arg(long)]
+        push_token: Option<String>,
+        /// Report that this device may show notifications
+        #[arg(long)]
+        notifications: bool,
+    },
+    /// Report once and show what the ledger knows about each device
+    Status,
+    /// Ask the ledger to wake the device holding what this one lacks, as
+    /// opening the app while behind does
+    Wake,
+    /// Remove this device from the ledger and stop reporting to it
+    Leave,
+}
+
+#[derive(Subcommand)]
 enum Photo {
     /// Import photos into a note: resized to 2048 px and at most 600 KB, with
     /// their EXIF kept, plus a 320 px thumbnail
@@ -150,6 +187,7 @@ async fn main() -> Result<()> {
         Command::DevAccount(cmd) => dev_account(&dir, cmd).await,
         Command::Note(cmd) => note(&dir, cmd),
         Command::Photo(cmd) => photo(&dir, cmd).await,
+        Command::Ledger(cmd) => ledger(&dir, cmd).await,
         Command::Sync { watch, export } => sync(&dir, watch, export).await,
         Command::Status => status(&dir),
     }
@@ -494,6 +532,171 @@ async fn export_blob(node: &SyncNode, folder: &Path, hash: BlobHash) -> Result<(
     Ok(())
 }
 
+async fn ledger(dir: &Path, cmd: LedgerCmd) -> Result<()> {
+    let (secret, mut replica) = open(dir)?;
+    let account =
+        Account::load(&replica)?.context("no account yet: run `dev-account new` or `join`")?;
+    let vv = replica.version_vector()?;
+    let names = device_names(&account);
+    match cmd {
+        LedgerCmd::Register {
+            url,
+            platform,
+            push_token,
+            notifications,
+        } => {
+            let profile = DeviceProfile {
+                platform: platform.unwrap_or_else(Platform::this),
+                push_token,
+                notifications,
+            };
+            let client = LedgerClient::new(&url, &secret, &account, profile.clone())?;
+            client.register().await?;
+            replica.set_meta(LEDGER_URL, url.as_bytes())?;
+            replica.set_meta(LEDGER_PLATFORM, profile.platform.to_string().as_bytes())?;
+            match &profile.push_token {
+                Some(token) => replica.set_meta(LEDGER_PUSH_TOKEN, token.as_bytes())?,
+                None => replica.set_meta(LEDGER_PUSH_TOKEN, b"")?,
+            }
+            replica.set_meta(LEDGER_NOTIFICATIONS, &[u8::from(notifications)])?;
+            println!("Registered with {url} as {}.", profile.platform);
+            let response = client.report(&vv, None).await?;
+            print_devices(&response, &names, device_of(&secret));
+            println!("`sync` and `sync --watch` now report to this ledger.");
+        }
+        LedgerCmd::Status => {
+            let client = ledger_client(&replica, &secret, &account)?
+                .context("no ledger yet: run `ledger register <url>`")?;
+            // Leaves this device's online state alone, so it is safe while
+            // `sync --watch` runs.
+            let response = client.report(&vv, None).await?;
+            print_devices(&response, &names, device_of(&secret));
+        }
+        LedgerCmd::Wake => {
+            let client = ledger_client(&replica, &secret, &account)?
+                .context("no ledger yet: run `ledger register <url>`")?;
+            client.report(&vv, None).await?;
+            let name = |d: &DeviceId| names.get(d).cloned().unwrap_or_else(|| d.short());
+            match client.wake().await? {
+                WakeResponse::UpToDate => println!("Nothing to fetch: this device is up to date."),
+                WakeResponse::HolderOnline { device } => {
+                    println!(
+                        "{} holds the changes and is online: `sync` reaches it directly.",
+                        name(&device)
+                    )
+                }
+                WakeResponse::Woken {
+                    device,
+                    changes,
+                    high_priority,
+                } => println!(
+                    "Woke {} ({} priority) to deliver {changes} changes.",
+                    name(&device),
+                    if high_priority { "high" } else { "normal" }
+                ),
+                WakeResponse::AlreadyWaking { device } => {
+                    println!(
+                        "{} was already woken in the last two minutes.",
+                        name(&device)
+                    )
+                }
+                WakeResponse::NoWakeableHolder => println!(
+                    "The devices holding the changes are offline and can't be woken (only Android devices can)."
+                ),
+            }
+        }
+        LedgerCmd::Leave => {
+            let client = ledger_client(&replica, &secret, &account)?
+                .context("this device isn't using a ledger")?;
+            client.leave().await?;
+            replica.set_meta(LEDGER_URL, b"")?;
+            println!("Removed this device from {}.", client.url());
+        }
+    }
+    Ok(())
+}
+
+/// The ledger this device reports to, if one is set.
+fn ledger_client(
+    replica: &Replica,
+    secret: &SecretKey,
+    account: &Account,
+) -> Result<Option<LedgerClient>> {
+    let text = |key| -> Result<String> {
+        Ok(replica
+            .meta(key)?
+            .map(|v| String::from_utf8_lossy(&v).into_owned())
+            .unwrap_or_default())
+    };
+    let url = text(LEDGER_URL)?;
+    if url.is_empty() {
+        return Ok(None);
+    }
+    let token = text(LEDGER_PUSH_TOKEN)?;
+    let profile = DeviceProfile {
+        platform: text(LEDGER_PLATFORM)?
+            .parse()
+            .unwrap_or_else(|_| Platform::this()),
+        push_token: (!token.is_empty()).then_some(token),
+        notifications: replica.meta(LEDGER_NOTIFICATIONS)?.as_deref() == Some(&[1]),
+    };
+    Ok(Some(LedgerClient::new(&url, secret, account, profile)?))
+}
+
+fn device_names(account: &Account) -> HashMap<DeviceId, String> {
+    account
+        .devices
+        .list
+        .devices
+        .iter()
+        .map(|d| (d.id, d.name.clone()))
+        .collect()
+}
+
+/// One line per device of the account, as the ledger sees it.
+fn print_devices(response: &StatusResponse, names: &HashMap<DeviceId, String>, me: DeviceId) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    for d in &response.devices {
+        let name = names
+            .get(&d.device)
+            .map_or("unknown device", String::as_str);
+        let seen = if d.device == me {
+            "this device".to_owned()
+        } else if d.online {
+            String::new()
+        } else {
+            format!("last seen {} min ago", ((now - d.last_seen) / 60).max(0))
+        };
+        println!(
+            "  {}  {:<16} {:<8} {:<8} behind {:<6} {seen}",
+            d.device.short(),
+            name,
+            d.platform.to_string(),
+            if d.online { "online" } else { "offline" },
+            d.behind
+        );
+    }
+}
+
+/// The ledger's view in one line, for `sync --watch`.
+fn ledger_summary(response: &StatusResponse, names: &HashMap<DeviceId, String>) -> String {
+    response
+        .devices
+        .iter()
+        .map(|d| {
+            let name = names
+                .get(&d.device)
+                .map_or_else(|| d.device.short(), Clone::clone);
+            let online = if d.online { "online" } else { "offline" };
+            format!("{name} {online}, behind {}", d.behind)
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
 /// Splits "P:O:REST" into two numbers and the rest.
 fn parse_spec(spec: &str) -> Result<(u32, u32, &str)> {
     let mut parts = spec.splitn(3, ':');
@@ -511,6 +714,8 @@ async fn sync(dir: &Path, watch: bool, export: Option<PathBuf>) -> Result<()> {
     let (secret, replica) = open(dir)?;
     let account =
         Account::load(&replica)?.context("no account yet: run `dev-account new` or `join`")?;
+    let ledger = ledger_client(&replica, &secret, &account)?;
+    let names = device_names(&account);
     let node = SyncNode::bind(
         State { replica, account },
         secret,
@@ -518,6 +723,10 @@ async fn sync(dir: &Path, watch: bool, export: Option<PathBuf>) -> Result<()> {
         BlobStorage::Disk(dir.join(BLOB_DIR)),
     )
     .await?;
+    if let Some(ledger) = ledger {
+        println!("Reporting to the ledger at {}.", ledger.url());
+        node.use_ledger(ledger);
+    }
     for (hash, len) in node.store_staged().await? {
         println!(
             "stored {} added here ({})",
@@ -557,6 +766,7 @@ async fn sync(dir: &Path, watch: bool, export: Option<PathBuf>) -> Result<()> {
             let node = node.clone();
             tokio::spawn(async move { node.watch(events).await })
         };
+        let mut last_ledger = String::new();
         // Report each device's failures once, not on every redial.
         let mut last_error: HashMap<Option<DeviceId>, String> = HashMap::new();
         loop {
@@ -601,6 +811,20 @@ async fn sync(dir: &Path, watch: bool, export: Option<PathBuf>) -> Result<()> {
                             blob_label(&node, hash)
                         );
                     }
+                    Some(Event::LedgerReported { response }) => {
+                        // Only when the picture changes, not on every heartbeat.
+                        let summary = ledger_summary(&response, &names);
+                        if summary != last_ledger {
+                            println!("ledger: {summary}");
+                            last_ledger = summary;
+                        }
+                    }
+                    Some(Event::LedgerFailed { error }) => {
+                        if last_ledger != error {
+                            println!("ledger: {error}");
+                            last_ledger = error;
+                        }
+                    }
                     Some(Event::Stored { hash, len }) => {
                         println!("stored {} added here ({})", blob_label(&node, hash), size(len));
                         if let Some(folder) = &export {
@@ -612,6 +836,12 @@ async fn sync(dir: &Path, watch: bool, export: Option<PathBuf>) -> Result<()> {
             }
         }
         watching.abort();
+        if node.ledger().is_some() {
+            match node.go_offline().await {
+                Ok(()) => println!("ledger: reported going offline"),
+                Err(e) => println!("ledger: couldn't report going offline: {}", describe(&e)),
+            }
+        }
     } else {
         let me = node.device();
         let peers: Vec<DeviceId> = {
@@ -679,6 +909,14 @@ async fn sync(dir: &Path, watch: bool, export: Option<PathBuf>) -> Result<()> {
                 Err(e) => println!("{}: photos: {}", label(peer), describe(&e)),
             }
         }
+        // A one-off sync doesn't stay online: it reports what it now holds as it leaves.
+        if let Some(ledger) = node.ledger() {
+            let vv = node.state().lock().unwrap().replica.version_vector()?;
+            match ledger.report(&vv, Some(0)).await {
+                Ok(response) => println!("ledger: {}", ledger_summary(&response, &names)),
+                Err(e) => println!("ledger: {}", describe(&e)),
+            }
+        }
     }
     node.close().await;
     Ok(())
@@ -724,6 +962,19 @@ fn status(dir: &Path) -> Result<()> {
         trashed,
         replica.change_count()?
     );
+    match ledger_client(&replica, &secret, &account)? {
+        Some(ledger) => println!(
+            "Ledger   {} (as {}{})",
+            ledger.url(),
+            ledger.profile().platform,
+            if ledger.profile().push_token.is_some() {
+                ", with a push token"
+            } else {
+                ""
+            }
+        ),
+        None => println!("Ledger   none (`ledger register <url>` to use one)"),
+    }
     let photos = replica.photos()?;
     println!(
         "Photos   {} ({} thumbnails and {} full images here)",

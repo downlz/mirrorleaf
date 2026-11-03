@@ -4,6 +4,7 @@
 mod account;
 mod blobs;
 mod frame;
+pub mod ledger;
 mod node;
 mod session;
 mod ticket;

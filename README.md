@@ -103,6 +103,31 @@ Run the two devices on different networks and note, for each case, whether the c
 
 Case 4 should still sync, through a relay.
 
+## The ledger (sync status)
+
+The ledger is a small service that knows which devices an account has, how many changes each holds, which are online, and how to wake a phone. It never sees note content, titles or photos. Every request is signed with the device's key.
+
+Run it with Docker Compose (Postgres 18 is included):
+
+```bash
+cd ledger
+cp env.example .env
+docker compose up -d --build
+```
+
+Set `POSTGRES_PASSWORD` in `.env` first. Without a Firebase service-account key (`FCM_SERVICE_ACCOUNT`), the ledger decides pushes and only logs them.
+
+Then register each device:
+
+```bash
+mirrorleaf-cli ledger register http://<ledger-host>:8080
+mirrorleaf-cli ledger status
+```
+
+From then on, `sync` and `sync --watch` report to it: when changes are made (at most every 30 seconds), every 5 minutes while online, and when going offline. `ledger wake` asks it to wake the device holding what this one lacks. A CLI device can stand in for a phone with `ledger register <url> --platform android --push-token <any text> --notifications`, so the ledger makes push decisions for it.
+
+The step-by-step test is in [docs/tests/m3-ledger-tests.md](docs/tests/m3-ledger-tests.md).
+
 ## Licence
 
 There's no licence yet. Mirrorleaf will be open source; until a licence is chosen, all rights are reserved.

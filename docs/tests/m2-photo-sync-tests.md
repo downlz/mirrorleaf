@@ -34,9 +34,19 @@ cargo build -p mirrorleaf-cli
 
 The binary is `target/debug/mirrorleaf-cli`.
 
+Or use CI's Apple silicon build: download the `mirrorleaf-cli-aarch64-apple-darwin` artifact, unzip it into a folder of its own (**not** `target/`, where Cargo would take it for its own build and stop rebuilding), then:
+
+```bash
+chmod +x mirrorleaf-cli
+xattr -d com.apple.quarantine mirrorleaf-cli
+./mirrorleaf-cli status
+```
+
+The `xattr` step is needed because macOS marks files downloaded with a browser as quarantined, and silently kills an unsigned quarantined program (exit code 137, no message). zsh only looks for commands on your `PATH`, never in the current folder, so a program in the current folder needs `./` in front, or an alias such as `alias ml="$PWD/mirrorleaf-cli"`.
+
 **Ubuntu**, either:
 
-- **From CI:** after you commit and push, open the CI run's page on GitHub, download the `mirrorleaf-cli-x86_64-unknown-linux-gnu` artifact, unzip it, then run `chmod +x mirrorleaf-cli`; or
+- **From CI:** after you commit and push, open the CI run's page on GitHub, download the `mirrorleaf-cli-x86_64-unknown-linux-gnu` artifact, unzip it, then run `chmod +x mirrorleaf-cli` (artifacts lose the executable bit) and start it as `./mirrorleaf-cli`; or
 - **Build it there:** pull the branch and run `cargo build -p mirrorleaf-cli`.
 
 ### 2. Check both devices upgraded
@@ -248,6 +258,8 @@ cargo test -p mirrorleaf-net --test loopback an_interrupted_transfer_resumes -- 
 | `… no connected device could send it yet (…)` | No connected device holds that blob yet. It is retried every 30 s. Check that the device that added the photo is running `sync --watch`. |
 | Photos added on the Mac never reach Ubuntu | Check the Mac's watcher printed `stored … added here` lines. If `photo add` ran while no watcher was running, the next `sync` or `sync --watch` on the Mac stores them. |
 | Ubuntu's `status` has no `Photos` line | Ubuntu is still running the M1 build. |
+| `zsh: command not found: mirrorleaf-cli` in the folder that holds it | zsh doesn't look in the current folder. Run `./mirrorleaf-cli`, or set an alias. |
+| A downloaded Mac build prints nothing and exits (code 137) | macOS quarantine. Run `xattr -d com.apple.quarantine mirrorleaf-cli`. |
 
 ---
 
@@ -257,33 +269,87 @@ Fill in and keep with the M2 notes; these figures go into the Phase 0 report (pl
 
 ### Import size (test 1)
 
-| # | File | Format | Original size | Output dimensions | Full image size | Quality | EXIF kept | Thumbnail size | ≤ 600 KB? |
-|---|---|---|---|---|---|---|---|---|---|
-| 1 | | | | | | | | | |
-| 2 | | | | | | | | | |
-| 3 | | | | | | | | | |
-| 4 | | | | | | | | | |
-| 5 | | | | | | | | | |
-| 6 | | | | | | | | | |
-| 7 | | | | | | | | | |
-| 8 | | | | | | | | | |
-| 9 | | | | | | | | | |
-| 10 | | | | | | | | | |
+**Run 1 — 2 November 2026, Mac (CI's Apple silicon build from `d004c4f`).** Note `01a19d2a-42c2`, photos from `~/Documents/Projects/Local_Notes/mirrorleaf-samples/`. Time is the import time per photo.
+
+| # | Photo | File | Format | Original size | Output dimensions | Full image size | Quality | EXIF kept | Thumbnail size | Time | ≤ 600 KB? |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 4229ed85 | 865A1904.JPG | JPEG | 10.1 MB | 2048×1365 | 553.0 KB | 80 | 31.2 KB | 20.9 KB | 566 ms | ✅ |
+| 2 | 98d64f14 | 865A1965.JPG | JPEG | 8.5 MB | 2048×1365 | 416.5 KB | 85 | 28.7 KB | 16.6 KB | 491 ms | ✅ |
+| 3 | 2c9fc1b3 | 865A1967.JPG | JPEG | 8.2 MB | 2048×1365 | 421.2 KB | 85 | 29.3 KB | 17.3 KB | 485 ms | ✅ |
+| 4 | 31f59475 | 865A1981.JPG | JPEG | 8.7 MB | 1365×2048 (portrait) | 516.4 KB | 80 | 31.9 KB | 22.1 KB | 642 ms | ✅ |
+| 5 | fd47b17d | 865A1983.JPG | JPEG | 7.6 MB | 2048×1365 | 378.8 KB | 85 | 28.8 KB | 16.4 KB | 484 ms | ✅ |
+| 6 | b6bbf374 | 865A1984.JPG | JPEG | 8.0 MB | 2048×1365 | 386.2 KB | 85 | 28.8 KB | 16.3 KB | 486 ms | ✅ |
+| 7 | df699e4f | rsz_1rsz_865a1750.jpg | JPEG | 6.5 MB | 2048×1524 | 544.7 KB | 80 | 30.1 KB | 21.7 KB | 280 ms | ✅ |
+| 8 | 8af9689d | rsz_865a1750.jpg | JPEG | 6.2 MB | 2048×1680 | 523.4 KB | 75 | 30.1 KB | 24.0 KB | 334 ms | ✅ |
+
+**Run 1 findings**
+
+- All 8 imported at ≤ 600 KB (378.8–553.0 KB) in under 0.7 s each, with their EXIF kept (28.7–31.9 KB) and thumbnails of 16.3–24.0 KB.
+- The portrait photo (#4) came out upright (1365×2048).
+- Four photos needed a lower quality than the first step (80, or 75 for #8) to fit; none needed shrinking below 2048 px. The EXIF block (about 30 KB each) counts towards the 600 KB.
+- Run 1 had no HEIC; see run 2. The `865A….JPG` names and 3:2 shape suggest a dedicated camera rather than a phone, and #7–#8 were resized before import (`rsz_`).
+
+**Run 2 — 2 November 2026, Mac (same build).** HEIC photos, into the same note, from `~/Documents/Projects/Local_Notes/mirrorleaf-samples/2/`. Decoded with macOS ImageIO.
+
+| # | Photo | File | Format | Original size | Output dimensions | Full image size | Quality | EXIF kept | Thumbnail size | Time | ≤ 600 KB? |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 9 | 4cd43a7d | childrens-show-theater.heic | HEIC | 1.3 MB | 2048×1536 | 458.7 KB | 85 | 2.2 KB | 15.4 KB | 283 ms | ✅ |
+| 10 | da330abf | classic-car.heic | HEIC | 2.0 MB | 1536×2048 (portrait) | 521.8 KB | 85 | 2.4 KB | 13.2 KB | 139 ms | ✅ |
+| 11 | 7e24a773 | greyhounds-looking-for-a-table.heic | HEIC | 1.7 MB | 1536×2048 (portrait) | 570.4 KB | 75 | 2.4 KB | 23.1 KB | 191 ms | ✅ |
+| 12 | 62d726bf | old-safe-wall.heic | HEIC | 2.8 MB | 1536×2048 (portrait) | 594.9 KB | 70 | 2.4 KB | 23.5 KB | 233 ms | ✅ |
+| 13 | e84835b7 | soundboard.heic | HEIC | 1.2 MB | 1536×2048 (portrait) | 501.3 KB | 85 | 842 B | 24.1 KB | 133 ms | ✅ |
+
+**Run 2 findings**
+
+- All 5 HEIC photos imported at ≤ 600 KB (458.7–594.9 KB), each in under 0.3 s; ImageIO decodes faster than the Rust JPEG path because it scales while decoding.
+- The four portrait photos came out upright (1536×2048).
+- **Smallest margin so far:** #12 (`old-safe-wall`, a detailed texture) needed quality 70 and landed at 594.9 KB, 5 KB under the limit. Two quality steps (65, 60) and the shrink step are still in reserve, so the limit holds, but detailed photos will be noticeably more compressed than the rest.
+- Their EXIF blocks are small (0.8–2.4 KB) compared with a phone's usual 10–30 KB, which suggests these are sample files with most metadata already removed. Check against a HEIC straight from your phone if you want to confirm that location and camera details survive (test 3's `exiftool` step).
+
+**Totals after runs 1 and 2:** 13 photos (8 JPEG, 5 HEIC), all ≤ 600 KB.
 
 ### Transfer (tests 2, 3 and 6)
 
 | Network row | Path (direct / relay) | Thumbnail: delay after `photo add` | Thumbnail transfer time | Full image transfer time | Text edit time (sending side) |
 |---|---|---|---|---|---|
-| 1 Same Wi-Fi | | | | | |
+| 1 Same Wi-Fi | Direct (test 2 run 1) | | | | |
 | 2 Phone hotspot | | | | | |
 | 3 Different Wi-Fi | | | | | |
 | 4 UDP blocked | | | | | |
+
+### Test 2 log
+
+**Run 1 — 2 November 2026, same Wi-Fi.** Mac `09330754` (mac) and Ubuntu `28460260` (ubuntu).
+
+**Mac side (step 2):**
+
+| Check | Result |
+|---|---|
+| Photos from test 1 entered the photo store when the watcher started | ✅ 26 `stored … added here` lines: a full image and a thumbnail for each of the 13 photos, sizes matching test 1 |
+| Connection to Ubuntu | ✅ `connected to 28460260 (ubuntu) via direct`, then `connected from 28460260 (ubuntu) via direct` (each side dialled the other) |
+| Changes sent | 29 changes (the note and its 13 photo additions) in **1,032 ms**: 5,970 B out, 327 B in, about 205 B per change |
+
+**Ubuntu side (steps 3–5):** confirmed by the owner on 2 November 2026: every check matched the expected result. Timings weren't recorded.
+
+| Check | Result |
+|---|---|
+| A `thumbnail of photo …` line for each of the 13 photos, and how long after connecting | ✅ As expected |
+| `ls -l ~/mirrorleaf-photos`: 13 `<photo>-thumbnail.jpg` files, no full images | ✅ As expected |
+| `photo list`: every photo `thumbnail here   full image not here` | ✅ As expected |
+| A thumbnail opened on Ubuntu is upright and 320 px on its long side (check portrait #4 `31f59475`) | ✅ As expected |
+| Live add (step 5): delay from `photo add` on the Mac to the Ubuntu thumbnail line | ✅ As expected |
+
+### Tests 3–7
+
+Confirmed by the owner on 2 November 2026: all steps passed and matched the expected results. No figures were recorded, so the transfer table above is still empty apart from the path for row 1.
 
 ### Pass or fail
 
 | M2 "done when" | Result | Evidence |
 |---|---|---|
-| A photo added on one peer shows as a thumbnail on the other within seconds on the LAN | | Test 2 |
-| The full image arrives on request | | Test 3 |
-| An interrupted transfer resumes | | Test 7 |
-| Ten sample phone photos (12 MP JPEG and HEIC) each import at ≤ 600 KB | | Test 1 |
+| A photo added on one peer shows as a thumbnail on the other within seconds on the LAN | ✅ Pass (owner-confirmed, 2 Nov 2026) | Test 2 |
+| The full image arrives on request | ✅ Pass (owner-confirmed, 2 Nov 2026) | Test 3 |
+| An interrupted transfer resumes | ✅ Pass (automated test `an_interrupted_transfer_resumes`; owner-confirmed, 2 Nov 2026) | Test 7 |
+| Ten sample phone photos (12 MP JPEG and HEIC) each import at ≤ 600 KB | ✅ Pass on size: 13 of 13 (8 JPEG, 5 HEIC; runs 1–2). Caveat: the JPEGs look like camera photos and the HEICs like sample files, not straight from a phone | Test 1 |
+
+**M2 result (2 November 2026): all four "done when" items pass.** Open follow-ups, none blocking M2: transfer timings for each network row (plan §7.1) for the Phase 0 report, and an optional EXIF check on HEIC photos straight from a phone.

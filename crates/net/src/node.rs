@@ -15,6 +15,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::account::Account;
 use crate::blobs::{BlobStorage, Blobs};
 use crate::frame::Traffic;
+use crate::ledger::{HEARTBEAT, LedgerClient, MIN_REPORT_INTERVAL, ONLINE_FOR_SECS};
 use crate::session::{Role, RoundReport, handshake, round};
 use crate::{AuthError, describe};
 
@@ -146,6 +147,13 @@ pub enum Event {
         kind: BlobKind,
         error: String,
     },
+    /// The ledger took a status report and answered with the account's devices.
+    LedgerReported {
+        response: mirrorleaf_proto::ledger::StatusResponse,
+    },
+    LedgerFailed {
+        error: String,
+    },
 }
 
 /// This device on the network: an Iroh endpoint whose key is the device ID.
@@ -159,6 +167,17 @@ struct Inner {
     state: Shared,
     hints: Mutex<HashMap<DeviceId, EndpointAddr>>,
     blobs: Blobs,
+    ledger: Mutex<Option<Arc<LedgerClient>>>,
+}
+
+/// What `watch` last told the ledger.
+#[derive(Default)]
+struct Reporting {
+    busy: bool,
+    last_attempt: Option<Instant>,
+    /// What the ledger last accepted.
+    reported: Option<VersionVector>,
+    last_success: Option<Instant>,
 }
 
 /// A connected peer, as `watch` tracks it.
@@ -204,8 +223,31 @@ impl SyncNode {
                 state: Arc::new(Mutex::new(state)),
                 hints: Mutex::default(),
                 blobs,
+                ledger: Mutex::default(),
             }),
         })
+    }
+
+    /// Reports to this ledger while watching: at once, then whenever the
+    /// change log grows (at most every 30 s), and every 5 minutes as the
+    /// heartbeat (plan M3, ADR-004).
+    pub fn use_ledger(&self, ledger: LedgerClient) {
+        *self.inner.ledger.lock().unwrap() = Some(Arc::new(ledger));
+    }
+
+    pub fn ledger(&self) -> Option<Arc<LedgerClient>> {
+        self.inner.ledger.lock().unwrap().clone()
+    }
+
+    /// Tells the ledger this device is going offline, so it stops counting on
+    /// it straight away. Best effort: gives up after a few seconds.
+    pub async fn go_offline(&self) -> Result<()> {
+        let Some(ledger) = self.ledger() else {
+            return Ok(());
+        };
+        let vv = self.inner.state.lock().unwrap().replica.version_vector()?;
+        tokio::time::timeout(Duration::from_secs(5), ledger.report(&vv, Some(0))).await??;
+        Ok(())
     }
 
     pub fn state(&self) -> &Arc<Mutex<State>> {
@@ -500,6 +542,7 @@ impl SyncNode {
         let mut last_dial: HashMap<DeviceId, Instant> = HashMap::new();
         let fetching = Arc::new(AtomicBool::new(false));
         let backoff: Backoff = Arc::default();
+        let reporting: Arc<Mutex<Reporting>> = Arc::default();
         let result = loop {
             tick.tick().await;
             if self.inner.endpoint.is_closed() {
@@ -557,9 +600,54 @@ impl SyncNode {
             if !fetching.load(Ordering::Acquire) {
                 self.spawn_fetch(&peers, &fetching, &backoff, &events);
             }
+            self.maybe_report(&ours, &reporting, &events);
         };
         acceptor.abort();
         result
+    }
+
+    /// Sends a status report if one is due: the first, a changed log after
+    /// `MIN_REPORT_INTERVAL`, or the heartbeat.
+    fn maybe_report(
+        &self,
+        ours: &VersionVector,
+        reporting: &Arc<Mutex<Reporting>>,
+        events: &UnboundedSender<Event>,
+    ) {
+        let Some(ledger) = self.ledger() else {
+            return;
+        };
+        {
+            let mut r = reporting.lock().unwrap();
+            let since = |t: Option<Instant>| t.map_or(Duration::MAX, |t| t.elapsed());
+            // A changed log, or the heartbeat, but never more often than every
+            // 30 s, so an unreachable ledger isn't asked every second.
+            let changed = r.reported.as_ref() != Some(ours);
+            let heartbeat = since(r.last_success) >= HEARTBEAT;
+            let due = r.last_attempt.is_none()
+                || (since(r.last_attempt) >= MIN_REPORT_INTERVAL && (changed || heartbeat));
+            if r.busy || !due {
+                return;
+            }
+            r.busy = true;
+            r.last_attempt = Some(Instant::now());
+        }
+        let (vv, reporting, events) = (ours.clone(), reporting.clone(), events.clone());
+        tokio::spawn(async move {
+            let result = ledger.report(&vv, Some(ONLINE_FOR_SECS)).await;
+            let mut r = reporting.lock().unwrap();
+            r.busy = false;
+            let _ = events.send(match result {
+                Ok(response) => {
+                    r.reported = Some(vv);
+                    r.last_success = Some(Instant::now());
+                    Event::LedgerReported { response }
+                }
+                Err(e) => Event::LedgerFailed {
+                    error: describe(&e),
+                },
+            });
+        });
     }
 
     /// Fetches missing thumbnails and requested full images from the connected

@@ -1,0 +1,50 @@
+# The Phase 0 ledger and its Postgres on the Ubuntu machine (implementation
+# plan §3.4, M3). From this folder: `docker compose up -d --build`.
+# Settings come from `.env` in this folder; see `env.example`.
+name: mirrorleaf-ledger
+
+services:
+  db:
+    image: postgres:18
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ledger
+    volumes:
+      # From postgres:18 the image keeps its data under /var/lib/postgresql
+      # (17 and earlier used /var/lib/postgresql/data). A volume made by
+      # another major version can't be opened: remove it with
+      # `docker compose down -v`, and devices register again on their next
+      # report (ADR-004).
+      - db:/var/lib/postgresql
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d ledger']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  ledger:
+    build:
+      context: ..
+      dockerfile: ledger/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD}@db:5432/ledger
+      FCM_SERVICE_ACCOUNT: ${FCM_SERVICE_ACCOUNT:-}
+      RUST_LOG: info,sqlx=warn
+    volumes:
+      # The Firebase service-account key, when there is one. Never committed.
+      - ./secrets:/secrets:ro
+    ports:
+      - '8080:8080'
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: '3'
+
+volumes:
+  db:

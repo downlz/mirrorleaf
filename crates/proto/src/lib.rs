@@ -4,6 +4,7 @@
 mod change;
 mod devices;
 mod ids;
+pub mod ledger;
 mod wire;
 
 pub use change::{Change, VersionVector};

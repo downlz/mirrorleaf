@@ -1,0 +1,10 @@
+# Only the Rust workspace goes into the ledger's image build.
+target/
+node_modules/
+.git/
+.github/
+docs/
+packages/
+ledger/secrets/
+**/.env
+*.db
