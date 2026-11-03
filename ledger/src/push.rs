@@ -1,9 +1,12 @@
 //! Sending pushes: FCM HTTP v1 (plan §5.8), or only logging them when no
 //! Firebase credentials are configured, or recording them for tests.
 //!
-//! Wake-ups are data messages with no note content: what kind of job to start
-//! and which device it concerns. Only the fallback is a notification message,
-//! with fixed generic text (ADR-004, gap 3).
+//! A push carries only its type (`pull`, `deliver` or `fallback`; plan §5.9):
+//! no device IDs, change counts or names, so Google can't link a user's
+//! devices or see how much they edit. The woken phone reads the rest from the
+//! ledger's status reply. Only the fallback is a notification message, with
+//! fixed generic text (ADR-004, gap 3). The ledger's own log keeps the details,
+//! because it never leaves our server.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -75,37 +78,33 @@ pub fn describe(push: &Push) -> String {
     format!("{} {priority}: {what}", push.to.short())
 }
 
-/// The FCM message for a push (HTTP v1 format).
+/// The FCM message for a push (HTTP v1 format). The kind's device and change
+/// count stay out of it (plan §5.9).
 pub fn message(push: &Push) -> Value {
     let priority = match push.priority {
         Priority::Normal => "NORMAL",
         Priority::High => "HIGH",
     };
-    match &push.kind {
+    let kind = match push.kind {
+        PushKind::Pull { .. } => "pull",
+        PushKind::Deliver { .. } => "deliver",
+        PushKind::Fallback => "fallback",
+    };
+    let data = json!({ "type": kind });
+    match push.kind {
         PushKind::Fallback => json!({
             "token": push.token,
             "notification": { "title": FALLBACK_TITLE, "body": FALLBACK_BODY },
-            "data": { "type": "fallback" },
+            "data": data,
             "android": { "priority": priority },
         }),
-        kind => {
-            let data = match kind {
-                PushKind::Pull { from } => json!({ "type": "pull", "peer": from.to_string() }),
-                PushKind::Deliver { to, changes } => json!({
-                    "type": "deliver",
-                    "peer": to.to_string(),
-                    "changes": changes.to_string(),
-                }),
-                PushKind::Fallback => unreachable!(),
-            };
-            // One collapse key: if the phone is unreachable, FCM keeps only the
-            // latest wake-up rather than a queue of them.
-            json!({
-                "token": push.token,
-                "data": data,
-                "android": { "priority": priority, "collapse_key": "sync" },
-            })
-        }
+        // One collapse key: if the phone is unreachable, FCM keeps only the
+        // latest wake-up rather than a queue of them.
+        _ => json!({
+            "token": push.token,
+            "data": data,
+            "android": { "priority": priority, "collapse_key": "sync" },
+        }),
     }
 }
 
@@ -275,28 +274,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wake_ups_carry_no_content_and_the_fallback_is_generic() {
+    fn pushes_carry_only_their_type_and_the_fallback_is_generic() {
+        let peer = DeviceId([2; 32]);
         let deliver = Push {
             to: DeviceId([1; 32]),
             token: "tok".into(),
             priority: Priority::High,
             kind: PushKind::Deliver {
-                to: DeviceId([2; 32]),
+                to: peer,
                 changes: 3,
             },
         };
         let m = message(&deliver);
         assert_eq!(m["android"]["priority"], "HIGH");
-        assert_eq!(m["data"]["type"], "deliver");
-        assert_eq!(m["data"]["changes"], "3");
+        assert_eq!(m["data"], json!({ "type": "deliver" }));
         assert!(m.get("notification").is_none());
+
+        let pull = Push {
+            priority: Priority::Normal,
+            kind: PushKind::Pull { from: peer },
+            ..deliver.clone()
+        };
+        let m = message(&pull);
+        assert_eq!(m["android"]["priority"], "NORMAL");
+        assert_eq!(m["data"], json!({ "type": "pull" }));
 
         let fallback = Push {
             kind: PushKind::Fallback,
             ..deliver
         };
         let m = message(&fallback);
+        assert_eq!(m["data"], json!({ "type": "fallback" }));
         assert_eq!(m["notification"]["body"], FALLBACK_BODY);
         assert_eq!(m["android"]["priority"], "HIGH");
+
+        // Nothing anywhere in the messages names a device.
+        let deliver = Push {
+            kind: PushKind::Deliver {
+                to: peer,
+                changes: 3,
+            },
+            ..fallback.clone()
+        };
+        for m in [message(&deliver), message(&pull), message(&fallback)] {
+            let text = m.to_string();
+            assert!(!text.contains(&peer.to_string()), "{text}");
+            assert!(!text.contains(&DeviceId([1; 32]).to_string()), "{text}");
+        }
     }
 }

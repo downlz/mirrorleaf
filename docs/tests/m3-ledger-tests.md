@@ -278,10 +278,58 @@ cargo test -p mirrorleaf-ledger
 |---|---|
 | `the_ledger_marks_the_right_devices_as_stale` | Staleness counts, online and offline, minute-precision presence |
 | `rule_1_…`, `rule_2_…`, `rules_3_and_4_…` | Each rule: target, priority, kind, the 2-minute limit, the 60 s fallback once |
-| `wake_requests_answer_without_a_push_when_none_helps` | Up to date, holder online, no wakeable holder, normal priority without notification permission |
-| `the_fcm_client_sends_http_v1_messages_and_drops_dead_tokens` | The real FCM client against a fake FCM: access token, message format, forgetting a dead token |
+| `wake_requests_answer_without_a_push_when_none_helps` | Up to date, holder online, no wakeable holder (naming the holder), normal priority without notification permission |
+| `the_fcm_client_sends_http_v1_messages_and_drops_dead_tokens` | The real FCM client against a fake FCM: access token, message format (only the type, no device IDs), forgetting a dead token, and a refused push answered as "no wakeable holder" with no fallback after it |
 | `devices_register_report_and_go_offline_through_the_client` | The CLI's client and `sync --watch` against the ledger |
 | `registration_…`, `devices_can_be_removed_…` | Signatures, approvals, clock skew, removal, 90-day pruning |
+
+`cargo test -p mirrorleaf-net` also runs the fallback prompt's own tests (`nothing_to_wait_for_…`, `a_holder_no_push_can_reach_…`, `a_woken_holder_gets_ninety_seconds_…`).
+
+---
+
+## Test 6 — The fallback without FCM (follow-up, 3 Nov 2026)
+
+Added before M4 (plan §5.9, "When no push can reach a device"). Run it with the ledger still in log-only mode (no Firebase key): once a real key is set, FCM refuses the made-up token and part B answers like part A. Rebuild the CLI first (`cargo build -p mirrorleaf-cli`) on both machines. Start from both devices in sync.
+
+### A: no push can reach the holder, so the prompt shows at once
+
+1. **Ubuntu:** register as a phone **without** a push token (as a phone without Google Play services does), then make a change and report it:
+
+   ```bash
+   mirrorleaf-cli ledger register http://<mac-address>:8080 --platform android --notifications
+   mirrorleaf-cli note new "Test 6A" --text "no push token"
+   mirrorleaf-cli ledger status
+   ```
+
+2. **Mac:** `mirrorleaf-cli ledger wake`
+
+**Expected:** `ubuntu holds the changes but can't be woken: …`, then `Open Mirrorleaf on ubuntu to sync.` No push in the ledger log.
+
+3. Start `mirrorleaf-cli sync --watch` on both ("opening the app" on each): the changes arrive with no push at all. Stop both watchers.
+
+### B: the holder is woken but doesn't answer, so the prompt shows after 90 s
+
+1. **Ubuntu:** register as a phone **with** a made-up token, make a change and report it:
+
+   ```bash
+   mirrorleaf-cli ledger register http://<mac-address>:8080 --platform android --push-token test-token --notifications
+   mirrorleaf-cli note new "Test 6B" --text "woken, no answer"
+   mirrorleaf-cli ledger status
+   ```
+
+2. Wait 2 minutes. **Mac:** `mirrorleaf-cli sync --watch`, then in a second terminal `mirrorleaf-cli ledger wake --wait`.
+
+**Expected:** `Woke ubuntu (high priority) …` and `Waiting up to 90 s …`. About 60 s later the log shows `push <ubuntu> high: fallback notification` (rule 4). At 90 s the Mac prints `Open Mirrorleaf on ubuntu to sync.`
+
+### C: the changes arrive while waiting, so no prompt
+
+Repeat B with a new note on Ubuntu. While the Mac waits, start `mirrorleaf-cli sync --watch` on Ubuntu.
+
+**Expected:** within a few seconds the Mac prints `ubuntu's changes have arrived.` and no prompt.
+
+### Pushes carry only their type
+
+There's nothing to see in log-only mode: the ledger's log keeps the details on purpose (`push <ubuntu> normal: pull from <mac>`), because it never leaves our server. What FCM receives is checked by `the_fcm_client_…` (test 5), and on a real phone in M4.
 
 ---
 
@@ -311,22 +359,40 @@ To stop the ledger: `docker compose down` in the `ledger` folder. The database i
 
 ### Tests 1–4
 
+**Run 1 — 3 November 2026.** The ledger on the Mac with OrbStack (Postgres 18.6, the variant in section 1). The Mac registered with `http://localhost:8080`; the Ubuntu machine (`192.168.1.4`), standing in for an Android phone, registered with the Mac's address `http://192.168.1.13:8080`. The owner confirmed every step matched the expected result; no figures were recorded.
+
 | Test | Expected | Result |
 |---|---|---|
-| 1 Register both devices | Both listed by `ledger status` on each | |
-| 2 Online / going offline | `mac` online while watching, offline at once after Ctrl-C | |
-| 3 Staleness | `ubuntu behind 3` after the Mac's note; 0 after syncing | |
-| 4 Rule 1 | `push <ubuntu> normal: pull from <mac>` | |
-| 4 Rule 2 | `push <ubuntu> normal: deliver 3 changes to <mac>` | |
-| 4 Rule 3 | `push <ubuntu> high: deliver 3 changes to <mac>`; then "already woken" | |
-| 4 Rule 4 | `push <ubuntu> high: fallback notification`, once, 60–75 s later | |
-| 4 No push needed | "up to date" or "holder online", no push | |
-| 5 Automated tests | 19 pass | |
+| 1 Register both devices | Both listed by `ledger status` on each | ✅ Pass (owner-confirmed, 3 Nov 2026) |
+| 2 Online / going offline | `mac` online while watching, offline at once after Ctrl-C | ✅ Pass (owner-confirmed, 3 Nov 2026) |
+| 3 Staleness | `ubuntu behind 3` after the Mac's note; 0 after syncing | ✅ Pass (owner-confirmed, 3 Nov 2026) |
+| 4 Rule 1 | `push <ubuntu> normal: pull from <mac>` | ✅ Pass (owner-confirmed, 3 Nov 2026) |
+| 4 Rule 2 | `push <ubuntu> normal: deliver 3 changes to <mac>` | ✅ Pass (owner-confirmed, 3 Nov 2026) |
+| 4 Rule 3 | `push <ubuntu> high: deliver 3 changes to <mac>`; then "already woken" | ✅ Pass (owner-confirmed, 3 Nov 2026) |
+| 4 Rule 4 | `push <ubuntu> high: fallback notification`, once, 60–75 s later | ✅ Pass (owner-confirmed, 3 Nov 2026) |
+| 4 No push needed | "up to date" or "holder online", no push | ✅ Pass (owner-confirmed, 3 Nov 2026) |
+| 5 Automated tests | 19 pass | ✅ 19 pass against Postgres 17.6 (Supabase) and 18.6 (OrbStack); CI run 41650001449 green on all 6 jobs, with its own Postgres 18 |
 
 ### Pass or fail
 
 | M3 "done when" | Result | Evidence |
 |---|---|---|
 | Integration tests show the ledger marks the right devices as stale | ✅ Pass (3 Nov 2026, against Postgres 17.6 and 18.6) | `the_ledger_marks_the_right_devices_as_stale`; test 3 |
-| For every rule in §5.9, it sends the right push to the right device at the right priority | ✅ Pass in the automated tests (3 Nov 2026) | Rule tests and `the_fcm_client_…`; test 4 to confirm on the deployed ledger |
-| CLI peers report their status to the deployed ledger | | Tests 1–2 on the Ubuntu deployment |
+| For every rule in §5.9, it sends the right push to the right device at the right priority | ✅ Pass (automated tests, and on the deployed ledger, owner-confirmed, 3 Nov 2026) | Rule tests and `the_fcm_client_…`; test 4 |
+| CLI peers report their status to the deployed ledger | ✅ Pass (owner-confirmed, 3 Nov 2026) | Tests 1–2, with the ledger deployed on the Mac (OrbStack) |
+
+**M3 result (3 November 2026): all three "done when" items pass.** Open follow-ups, none blocking M3:
+
+- The ledger hasn't yet been deployed on the Ubuntu machine itself (x86_64), only on the Mac with OrbStack.
+- Pushes were only logged: real FCM delivery needs the Firebase project and the Android app (M4).
+
+### Follow-up before M4 (3 November 2026)
+
+Owner-approved changes after M3 closed: pushes carry only their type (no device IDs or change counts); `/v1/wake` sends the push before answering and answers "no wakeable holder" when FCM refuses it; that answer names the holder; and the fallback prompt that needs no push (`Fallback` in `mirrorleaf-net`, `ledger wake --wait` in the CLI).
+
+| Check | Result |
+|---|---|
+| Automated tests (5) | ✅ 10 rule and 9 integration tests pass against Postgres 18 (a throwaway container on the Mac); the three new `mirrorleaf-net` tests pass; clippy, fmt and `cargo deny` clean |
+| Ledger image rebuilt on the Mac | ✅ `docker compose build ledger`, 16 s with cached dependencies; not started (the ledger wasn't running) |
+| Test 6 A–C | Not yet run |
+- The ledger is plain HTTP on the LAN; reaching it from mobile data (a tunnel with HTTPS) is decided in M4.

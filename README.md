@@ -124,7 +124,7 @@ mirrorleaf-cli ledger register http://<ledger-host>:8080
 mirrorleaf-cli ledger status
 ```
 
-From then on, `sync` and `sync --watch` report to it: when changes are made (at most every 30 seconds), every 5 minutes while online, and when going offline. `ledger wake` asks it to wake the device holding what this one lacks. A CLI device can stand in for a phone with `ledger register <url> --platform android --push-token <any text> --notifications`, so the ledger makes push decisions for it.
+From then on, `sync` and `sync --watch` report to it: when changes are made (at most every 30 seconds), every 5 minutes while online, and when going offline. `ledger wake` asks it to wake the device holding what this one lacks. With `--wait`, it then waits as the app does: if that device's changes haven't arrived within 90 seconds, or no push can reach it, it prints "Open Mirrorleaf on <name> to sync". A CLI device can stand in for a phone with `ledger register <url> --platform android --push-token <any text> --notifications`, so the ledger makes push decisions for it.
 
 The step-by-step test is in [docs/tests/m3-ledger-tests.md](docs/tests/m3-ledger-tests.md).
 

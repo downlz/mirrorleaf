@@ -550,10 +550,14 @@ async fn wake_requests_answer_without_a_push_when_none_helps() {
     desktop
         .report(&t, &[(&laptop, 5), (&desktop, 2)], Some(0))
         .await;
+    let response = laptop.wake(&t).await;
     assert_eq!(
-        laptop.wake(&t).await["result"],
-        "no_wakeable_holder",
-        "a sleeping desktop can't be woken"
+        (response["result"].as_str(), response["device"].as_str()),
+        (
+            Some("no_wakeable_holder"),
+            Some(desktop.id().to_string().as_str())
+        ),
+        "a sleeping desktop can't be woken, and the answer names it for the prompt"
     );
 
     // A phone that may not show notifications is woken at normal priority only.
@@ -659,9 +663,13 @@ async fn the_fcm_client_sends_http_v1_messages_and_drops_dead_tokens() {
                     assert_eq!(project, "mirrorleaf-test");
                     assert_eq!(headers["authorization"], "Bearer fake-access");
                     let message = body["message"].clone();
-                    let gone = message["token"] == "gone";
+                    let answer = match message["token"].as_str() {
+                        Some("gone") => StatusCode::NOT_FOUND,
+                        Some("broken") => StatusCode::INTERNAL_SERVER_ERROR,
+                        _ => StatusCode::OK,
+                    };
                     f.lock().unwrap().messages.push((project, message));
-                    if gone { StatusCode::NOT_FOUND } else { StatusCode::OK }
+                    answer
                 },
             ),
         )
@@ -699,30 +707,73 @@ async fn the_fcm_client_sends_http_v1_messages_and_drops_dead_tokens() {
             "rule 2 (normal), rule 3 (high), rule 4 (fallback): {kinds:#?}"
         );
         assert_eq!(kinds[0]["android"]["priority"], "NORMAL");
-        assert_eq!(kinds[0]["data"]["type"], "deliver");
+        assert_eq!(kinds[0]["data"], json!({ "type": "deliver" }));
         assert_eq!(kinds[1]["android"]["priority"], "HIGH");
-        assert_eq!(kinds[1]["data"]["changes"], "3");
+        assert_eq!(kinds[1]["data"], json!({ "type": "deliver" }));
+        assert_eq!(kinds[2]["data"], json!({ "type": "fallback" }));
         assert_eq!(kinds[2]["notification"]["body"], FALLBACK_BODY);
         assert!(
             kinds
                 .iter()
                 .all(|m| m["token"] == phone.token.clone().unwrap())
         );
+        // Only the type reaches Google: no device IDs or change counts (plan §5.9).
+        for m in &kinds {
+            let text = m.to_string();
+            assert!(!text.contains(&laptop.id().to_string()), "{text}");
+            assert!(!text.contains(&phone.id().to_string()), "{text}");
+        }
     }
 
-    // FCM answers 404 for a token it no longer knows: the ledger forgets it.
+    // FCM answers 404 for a token it no longer knows: the ledger forgets it,
+    // and the device in use hears at once that the phone can't be woken.
     phone.token = Some("gone".into());
     phone
         .report(&t, &[(&laptop, 5), (&phone, 4)], Some(0))
         .await;
     t.advance(WAKE_INTERVAL_SECS);
-    assert_eq!(laptop.wake(&t).await["result"], "woken");
+    let response = laptop.wake(&t).await;
+    assert_eq!(
+        (response["result"].as_str(), response["device"].as_str()),
+        (
+            Some("no_wakeable_holder"),
+            Some(phone.id().to_string().as_str())
+        )
+    );
     let token: Option<String> = query_scalar("SELECT push_token FROM devices WHERE device_id = $1")
         .bind(&phone.id().0[..])
         .fetch_one(&t.ledger.db)
         .await
         .unwrap();
     assert_eq!(token, None);
+
+    // Any other failure (here a 500): the same answer, the token is kept, and
+    // no fallback notification follows, because nothing is on its way.
+    phone.token = Some("broken".into());
+    phone
+        .report(&t, &[(&laptop, 5), (&phone, 5)], Some(0))
+        .await;
+    t.advance(WAKE_INTERVAL_SECS);
+    let response = laptop.wake(&t).await;
+    assert_eq!(
+        (response["result"].as_str(), response["device"].as_str()),
+        (
+            Some("no_wakeable_holder"),
+            Some(phone.id().to_string().as_str())
+        )
+    );
+    let sent = fake.lock().unwrap().messages.len();
+    t.advance(60);
+    t.ledger.tick().await.unwrap();
+    assert_eq!(fake.lock().unwrap().messages.len(), sent, "no fallback");
+    let (token, wake_at): (Option<String>, Option<i64>) = sqlx_core::query_as::query_as(
+        "SELECT push_token, wake_at FROM devices WHERE device_id = $1",
+    )
+    .bind(&phone.id().0[..])
+    .fetch_one(&t.ledger.db)
+    .await
+    .unwrap();
+    assert_eq!((token.as_deref(), wake_at), (Some("broken"), None));
     t.finish().await;
 }
 

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use mirrorleaf_core::{BlobHash, BlobKind, Block, PhotoRef, Replica, photos};
-use mirrorleaf_net::ledger::{DeviceProfile, LedgerClient};
+use mirrorleaf_net::ledger::{DeviceProfile, Fallback, LedgerClient, PROMPT_AFTER};
 use mirrorleaf_net::{
     Account, BlobStorage, DevTicket, Event, Network, SecretKey, State, SyncNode, describe,
 };
@@ -135,7 +135,13 @@ enum LedgerCmd {
     Status,
     /// Ask the ledger to wake the device holding what this one lacks, as
     /// opening the app while behind does
-    Wake,
+    Wake {
+        /// Then wait, as the app does: if the holder's changes haven't arrived
+        /// within 90 s, show the fallback prompt. Run `sync --watch` on this
+        /// device too, so it can receive them.
+        #[arg(long)]
+        wait: bool,
+    },
     /// Remove this device from the ledger and stop reporting to it
     Leave,
 }
@@ -572,17 +578,18 @@ async fn ledger(dir: &Path, cmd: LedgerCmd) -> Result<()> {
             let response = client.report(&vv, None).await?;
             print_devices(&response, &names, device_of(&secret));
         }
-        LedgerCmd::Wake => {
+        LedgerCmd::Wake { wait } => {
             let client = ledger_client(&replica, &secret, &account)?
                 .context("no ledger yet: run `ledger register <url>`")?;
-            client.report(&vv, None).await?;
+            let status = client.report(&vv, None).await?;
             let name = |d: &DeviceId| names.get(d).cloned().unwrap_or_else(|| d.short());
-            match client.wake().await? {
+            let wake = client.wake().await?;
+            match &wake {
                 WakeResponse::UpToDate => println!("Nothing to fetch: this device is up to date."),
                 WakeResponse::HolderOnline { device } => {
                     println!(
                         "{} holds the changes and is online: `sync` reaches it directly.",
-                        name(&device)
+                        name(device)
                     )
                 }
                 WakeResponse::Woken {
@@ -591,18 +598,52 @@ async fn ledger(dir: &Path, cmd: LedgerCmd) -> Result<()> {
                     high_priority,
                 } => println!(
                     "Woke {} ({} priority) to deliver {changes} changes.",
-                    name(&device),
-                    if high_priority { "high" } else { "normal" }
+                    name(device),
+                    if *high_priority { "high" } else { "normal" }
                 ),
                 WakeResponse::AlreadyWaking { device } => {
                     println!(
                         "{} was already woken in the last two minutes.",
-                        name(&device)
+                        name(device)
                     )
                 }
-                WakeResponse::NoWakeableHolder => println!(
-                    "The devices holding the changes are offline and can't be woken (only Android devices can)."
+                WakeResponse::NoWakeableHolder { device } => println!(
+                    "{} holds the changes but can't be woken: it's a desktop, has no push token, or the push failed.",
+                    name(device)
                 ),
+            }
+            // The fallback that needs no push (plan §5.9).
+            let Some(fallback) = Fallback::after_wake(&wake, &status, Instant::now()) else {
+                return Ok(());
+            };
+            let prompt = || println!("Open Mirrorleaf on {} to sync.", name(&fallback.holder));
+            if fallback.due(&vv, Instant::now()) {
+                prompt();
+                return Ok(());
+            }
+            if !wait {
+                println!("Run with --wait to wait for its changes, as the app does.");
+                return Ok(());
+            }
+            println!(
+                "Waiting up to {} s for its changes (Ctrl-C to stop)…",
+                PROMPT_AFTER.as_secs()
+            );
+            loop {
+                // `sync --watch` writes what arrives to the same database.
+                let mine = replica.version_vector()?;
+                if fallback.arrived(&mine) {
+                    println!("{}'s changes have arrived.", name(&fallback.holder));
+                    break;
+                }
+                if fallback.due(&mine, Instant::now()) {
+                    prompt();
+                    break;
+                }
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                }
             }
         }
         LedgerCmd::Leave => {

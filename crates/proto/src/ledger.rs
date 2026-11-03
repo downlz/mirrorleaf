@@ -255,8 +255,14 @@ pub enum WakeResponse {
         #[serde(with = "hex_id")]
         device: DeviceId,
     },
-    /// The devices holding the changes are offline and can't be woken (desktops).
-    NoWakeableHolder,
+    /// No device holding the changes can be woken: they are offline desktops,
+    /// phones without a push token, or the push failed. `device` is the
+    /// offline device holding the most of what the caller lacks, for the
+    /// fallback prompt "Open Mirrorleaf on <name> to sync" (plan §5.9).
+    NoWakeableHolder {
+        #[serde(with = "hex_id")]
+        device: DeviceId,
+    },
 }
 
 /// `DELETE /v1/devices/{id}` for a device other than the signer.
@@ -390,5 +396,18 @@ mod tests {
         let json = serde_json::to_string(&wake).unwrap();
         assert!(json.starts_with("{\"result\":\"woken\""), "{json}");
         assert_eq!(serde_json::from_str::<WakeResponse>(&json).unwrap(), wake);
+
+        let none = WakeResponse::NoWakeableHolder {
+            device: DeviceId([3; 32]),
+        };
+        let json = serde_json::to_string(&none).unwrap();
+        assert_eq!(
+            json,
+            format!(
+                "{{\"result\":\"no_wakeable_holder\",\"device\":\"{}\"}}",
+                DeviceId([3; 32])
+            )
+        );
+        assert_eq!(serde_json::from_str::<WakeResponse>(&json).unwrap(), none);
     }
 }

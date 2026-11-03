@@ -156,7 +156,9 @@ pub enum WakeDecision {
     HolderOnline(DeviceId),
     AlreadyWaking(DeviceId),
     Wake(Push),
-    NoWakeableHolder,
+    /// No holder can be woken. Names the one holding the most of what `me`
+    /// lacks, so the device in use can ask the user to open it (plan §5.9).
+    NoWakeableHolder(DeviceId),
 }
 
 pub fn on_wake(devices: &[Device], me: DeviceId, now: i64) -> WakeDecision {
@@ -173,7 +175,14 @@ pub fn on_wake(devices: &[Device], me: DeviceId, now: i64) -> WakeDecision {
         return WakeDecision::HolderOnline(online.id);
     }
     let Some(holder) = best_holder(devices, mine, now) else {
-        return WakeDecision::NoWakeableHolder;
+        // Behind means some other device holds what `me` lacks, so there is
+        // always one to name.
+        let top = devices
+            .iter()
+            .filter(|d| d.id != me && d.ahead_of(mine) > 0)
+            .max_by_key(|d| (d.ahead_of(mine), d.id))
+            .map_or(me, |d| d.id);
+        return WakeDecision::NoWakeableHolder(top);
     };
     if holder.wake.is_some_and(|w| now - w.at < WAKE_INTERVAL_SECS) {
         return WakeDecision::AlreadyWaking(holder.id);
@@ -191,7 +200,7 @@ pub fn on_wake(devices: &[Device], me: DeviceId, now: i64) -> WakeDecision {
     };
     match Push::to(holder, priority, kind) {
         Some(push) => WakeDecision::Wake(push),
-        None => WakeDecision::NoWakeableHolder,
+        None => WakeDecision::NoWakeableHolder(holder.id),
     }
 }
 
@@ -419,10 +428,21 @@ mod tests {
             WakeDecision::HolderOnline(id(2))
         );
 
-        let sleeping_desktop = [laptop, device(2, Platform::Macos, &[5, 3])];
+        let sleeping_desktop = [laptop.clone(), device(2, Platform::Macos, &[5, 3])];
         assert_eq!(
             on_wake(&sleeping_desktop, id(1), NOW),
-            WakeDecision::NoWakeableHolder
+            WakeDecision::NoWakeableHolder(id(2))
+        );
+
+        // A phone without a push token (no Google Play services, or a token FCM
+        // rejected) can't be woken either. The answer names the device holding
+        // the most of what the laptop lacks, so its prompt can say which to open.
+        let mut no_token = device(2, Platform::Android, &[5, 3, 0]);
+        no_token.push_token = None;
+        let desktop = device(3, Platform::Macos, &[5, 0, 1]);
+        assert_eq!(
+            on_wake(&[laptop, no_token, desktop], id(1), NOW),
+            WakeDecision::NoWakeableHolder(id(2))
         );
     }
 

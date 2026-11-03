@@ -66,25 +66,32 @@ impl Ledger {
         (self.clock)()
     }
 
-    /// Sends pushes decided in a committed transaction. A token FCM rejects is
-    /// forgotten; other failures are logged.
+    /// Sends pushes decided in a committed transaction.
     async fn send(&self, pushes: &[Push]) {
         for push in pushes {
-            tracing::info!("push {}", push::describe(push));
-            match self.pusher.send(push).await {
-                Ok(()) => {}
-                Err(PushError::Unregistered) => {
-                    tracing::info!(
-                        "forgetting {}'s push token: FCM no longer knows it",
-                        push.to.short()
-                    );
-                    if let Err(e) = db::forget_token(&self.db, &push.to, &push.token).await {
-                        tracing::warn!("couldn't forget a push token: {e:#}");
-                    }
+            self.send_one(push).await;
+        }
+    }
+
+    /// Sends one push and says whether FCM took it (log-only mode counts as
+    /// taken). A token FCM rejects is forgotten; other failures are logged.
+    async fn send_one(&self, push: &Push) -> bool {
+        tracing::info!("push {}", push::describe(push));
+        match self.pusher.send(push).await {
+            Ok(()) => true,
+            Err(PushError::Unregistered) => {
+                tracing::info!(
+                    "forgetting {}'s push token: FCM no longer knows it",
+                    push.to.short()
+                );
+                if let Err(e) = db::forget_token(&self.db, &push.to, &push.token).await {
+                    tracing::warn!("couldn't forget a push token: {e:#}");
                 }
-                Err(PushError::Other(e)) => {
-                    tracing::warn!("push to {} failed: {e:#}", push.to.short())
-                }
+                false
+            }
+            Err(PushError::Other(e)) => {
+                tracing::warn!("push to {} failed: {e:#}", push.to.short());
+                false
             }
         }
     }
@@ -316,7 +323,9 @@ async fn status(State(l): State<Ledger>, req: Signed) -> Result<Json<StatusRespo
     Ok(Json(response))
 }
 
-/// `POST /v1/wake`: the signer was opened while behind (rule 3).
+/// `POST /v1/wake`: the signer was opened while behind (rule 3). The push goes
+/// out before the answer, so a push FCM refuses is answered as "no wakeable
+/// holder" and the device in use can prompt the user at once (plan §5.9).
 async fn wake(State(l): State<Ledger>, req: Signed) -> Result<Json<WakeResponse>, ApiError> {
     let account = db::account_of(&l.db, &req.device)
         .await?
@@ -332,7 +341,7 @@ async fn wake(State(l): State<Ledger>, req: Signed) -> Result<Json<WakeResponse>
         WakeDecision::UpToDate => (WakeResponse::UpToDate, None),
         WakeDecision::HolderOnline(device) => (WakeResponse::HolderOnline { device }, None),
         WakeDecision::AlreadyWaking(device) => (WakeResponse::AlreadyWaking { device }, None),
-        WakeDecision::NoWakeableHolder => (WakeResponse::NoWakeableHolder, None),
+        WakeDecision::NoWakeableHolder(device) => (WakeResponse::NoWakeableHolder { device }, None),
         WakeDecision::Wake(push) => {
             db::set_wake(&mut tx, &push.to, &req.device, now).await?;
             let changes = match push.kind {
@@ -348,8 +357,16 @@ async fn wake(State(l): State<Ledger>, req: Signed) -> Result<Json<WakeResponse>
         }
     };
     tx.commit().await?;
-    if let Some(push) = push {
-        l.send(&[push]).await;
+    if let Some(push) = push
+        && !l.send_one(&push).await
+    {
+        // Nothing is on its way, so rule 4 has nothing to follow up. The
+        // holder's last_push_at stays, so a failing FCM isn't asked again
+        // for two minutes.
+        let mut tx = l.db.begin().await?;
+        db::clear_wake(&mut tx, &push.to).await?;
+        tx.commit().await?;
+        return Ok(Json(WakeResponse::NoWakeableHolder { device: push.to }));
     }
     Ok(Json(response))
 }
