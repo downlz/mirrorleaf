@@ -3,3 +3,25 @@ name = "mirrorleaf-ffi"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+
+# The engine the apps drive (implementation plan §5.7): one per process, used by
+# the Tauri screen directly and by native code through uniffi (Kotlin now, Swift
+# later). Built into the app's native library, not a library of its own.
+[dependencies]
+anyhow.workspace = true
+mirrorleaf-core.workspace = true
+mirrorleaf-net.workspace = true
+mirrorleaf-proto.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uniffi.workspace = true
+
+# Android startup (ADR-005): Iroh's network code reads Android's context through
+# ndk-context, and HTTPS certificate checks call Android's verifier through JNI.
+[target.'cfg(target_os = "android")'.dependencies]
+jni.workspace = true
+ndk-context.workspace = true
+rustls-platform-verifier.workspace = true
+tracing-subscriber.workspace = true

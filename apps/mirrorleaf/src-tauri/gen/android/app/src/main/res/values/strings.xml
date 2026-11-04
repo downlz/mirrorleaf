@@ -1,0 +1,17 @@
+<resources>
+    <string name="app_name">"Mirrorleaf"</string>
+    <string name="main_activity_title">"Mirrorleaf"</string>
+
+    <string name="channel_sync">Syncing</string>
+    <string name="channel_fallback">Waiting changes</string>
+    <string name="syncing">Syncing…</string>
+    <plurals name="sending_changes">
+        <item quantity="one">Sending %1$d change to %2$s</item>
+        <item quantity="other">Sending %1$d changes to %2$s</item>
+    </plurals>
+
+    <!-- The fallback push names these keys, so its text can be translated and FCM never sees it
+         (ADR-004, gap 3). It can't name a device: the ledger can't read device names. -->
+    <string name="sync_fallback_title">Mirrorleaf</string>
+    <string name="sync_fallback_body">You have changes waiting to sync. Open Mirrorleaf to send them.</string>
+</resources>

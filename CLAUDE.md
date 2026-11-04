@@ -21,11 +21,23 @@ Mirrorleaf keeps notes only on the user's own devices and syncs them device to d
 | Install JS dependencies | `pnpm install` |
 | Lint / format | `pnpm lint`, `pnpm format` (CI runs `pnpm format:check`) |
 | Types / tests | `pnpm -r typecheck`, `pnpm -r test` |
+| Android APK (arm64, debug) | in `apps/mirrorleaf/src-tauri`: `cargo tauri android build --debug --target aarch64 --apk --ci` |
+| Rust lint for Android | `cargo clippy --target aarch64-linux-android -p mirrorleaf-ffi -p mirrorleaf-app -- -D warnings`, with `CC_aarch64_linux_android` and `AR_aarch64_linux_android` pointing at the NDK's `aarch64-linux-android24-clang` and `llvm-ar` |
+| Phone logs | `adb logcat -s mirrorleaf` (the engine logs there; the push-woken job has no screen) |
+
+## Android (M4, ADR-005)
+
+- One engine per process (`crates/ffi`). On Android, `MirrorleafApp.onCreate` starts it in every process, before the screen or a push-woken job; Tauri commands and the Kotlin code share it.
+- The Kotlin bindings are generated during the Gradle build into `.../java/app/mirrorleaf/generated/` and are not committed.
+- Tauri's template targets Java 8: Kotlin helpers compiled for Java 11 (such as WorkManager's `OneTimeWorkRequestBuilder`) don't compile; use the plain builders.
+- `vendor/ndk-context` is a patched copy that allows a second initialisation (owner's decision). Don't remove the `[patch.crates-io]` entry.
+- The Android build uses the Gradle and Kotlin versions Tauri's template generated (owner's decision); don't upgrade them without asking.
 
 ## Working on the 8 GB Mac
 
 - `.cargo/config.toml` caps Cargo at 4 jobs, and dependencies build without debug info.
 - Use a physical Android phone, never the emulator (from M4).
+- Run `./gradlew --stop` (in `apps/mirrorleaf/src-tauri/gen/android`) before Docker builds or long Rust builds.
 - Release builds, all-CPU Android builds and size checks run in CI.
 
 ## Versions and dependencies

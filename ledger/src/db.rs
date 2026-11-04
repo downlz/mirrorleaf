@@ -264,6 +264,29 @@ pub async fn accounts_with_wakes(pool: &PgPool) -> Result<Vec<AccountId>> {
     rows.into_iter().map(|b| key(b).map(AccountId)).collect()
 }
 
+/// The devices whose ID starts with `prefix` (lower-case hex), with their push
+/// tokens. For the operator's `test-push` command (plan §7.2).
+pub async fn find_devices(pool: &PgPool, prefix: &str) -> Result<Vec<(DeviceId, Option<String>)>> {
+    anyhow::ensure!(
+        prefix.chars().all(|c| c.is_ascii_hexdigit()),
+        "a device ID prefix is hex digits only"
+    );
+    let rows = query(
+        "SELECT device_id, push_token FROM devices WHERE encode(device_id, 'hex') LIKE $1 || '%'",
+    )
+    .bind(prefix.to_ascii_lowercase())
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok((
+                DeviceId(key(row.try_get("device_id")?)?),
+                row.try_get("push_token")?,
+            ))
+        })
+        .collect()
+}
+
 /// Forgets a push token FCM no longer accepts.
 pub async fn forget_token(pool: &PgPool, device: &DeviceId, token: &str) -> Result<()> {
     query("UPDATE devices SET push_token = NULL WHERE device_id = $1 AND push_token = $2")

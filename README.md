@@ -13,12 +13,14 @@ Mirrorleaf is a private notes app for rich text and photos. Notes live only on y
 | `crates/core` | Storage, Yjs documents, change log, sync engine, photos |
 | `crates/proto` | Wire messages and versioning, shared with the ledger |
 | `crates/net` | Iroh networking and peer authentication |
-| `crates/ffi` | uniffi bindings for native code |
+| `crates/ffi` | The engine the apps drive, with its uniffi API for native code |
 | `crates/cli` | Headless peer for tests and measurements |
+| `crates/uniffi-bindgen` | Generates the engine's Kotlin bindings during the Android build |
+| `apps/mirrorleaf` | The Tauri app: a Phase 0 test screen, and the Android project with its Kotlin background code |
 | `ledger/` | Sync-status service (axum and Postgres) |
 | `packages/editor` | TipTap editor and its bridge to Rust |
-
-The Tauri app (`apps/mirrorleaf`) arrives in milestone M4, and the measurement scripts (`tools/`) after it.
+| `vendor/ndk-context` | A patched copy of `ndk-context` (see its `Cargo.toml`) |
+| `tools/` | Measurement scripts: `push-matrix.py`, the push-to-wake matrix (plan §7.2) |
 
 ## Set up on a Mac (Apple silicon)
 
@@ -36,7 +38,26 @@ The Tauri app (`apps/mirrorleaf`) arrives in milestone M4, and the measurement s
 
 Optional: `cargo install cargo-deny --locked`, then `cargo deny check`, to run CI's dependency checks locally.
 
-Setup steps for Android, Java and Tauri will be added in milestones M4 and M5.
+## Build the Android app
+
+You need a physical Android phone with USB debugging on; Android 17 is the target. On the Mac:
+
+1. JDK 17 (`brew install openjdk@17`, or Temurin 17) and the Android command-line tools with platform 37 and NDK 29.0.14206865. Set `JAVA_HOME`, `ANDROID_HOME` and `NDK_HOME` in your shell profile.
+2. `rustup target add aarch64-linux-android`
+3. The Tauri CLI: `cargo install tauri-cli --version 2.12.4 --locked`
+4. Cap Gradle's memory: put `org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8` in `~/.gradle/gradle.properties`.
+5. Copy your Firebase project's `google-services.json` to `apps/mirrorleaf/src-tauri/gen/android/app/`. It is gitignored: never commit it. The app ID registered in Firebase must be `app.mirrorleaf`.
+6. Build and install:
+
+   ```bash
+   cd apps/mirrorleaf/src-tauri
+   cargo tauri android build --debug --target aarch64 --apk --ci
+   adb install -r gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
+   ```
+
+The test screen joins a developer account from a ticket, registers with a ledger, and shows the device's sync status. Pushes from the ledger wake the app in the background; follow it with `adb logcat -s mirrorleaf`. The step-by-step test is in [docs/tests/m4-android-tests.md](docs/tests/m4-android-tests.md).
+
+The macOS app is set up in M5.
 
 ## Try the headless peer
 

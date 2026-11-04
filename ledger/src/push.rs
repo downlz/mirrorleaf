@@ -4,9 +4,9 @@
 //! A push carries only its type (`pull`, `deliver` or `fallback`; plan §5.9):
 //! no device IDs, change counts or names, so Google can't link a user's
 //! devices or see how much they edit. The woken phone reads the rest from the
-//! ledger's status reply. Only the fallback is a notification message, with
-//! fixed generic text (ADR-004, gap 3). The ledger's own log keeps the details,
-//! because it never leaves our server.
+//! ledger's status reply. Only the fallback is a notification message, and its
+//! generic text is a string in the app, referenced by key (ADR-004, gap 3). The
+//! ledger's own log keeps the details, because it never leaves our server.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -20,10 +20,14 @@ use serde_json::{Value, json};
 
 use crate::rules::{Priority, Push, PushKind};
 
-/// The fallback notification (ADR-004, gap 3). It is shown by the system when
-/// the app can't run, so it can't name devices: the ledger can't read their names.
-pub const FALLBACK_TITLE: &str = "Mirrorleaf";
-pub const FALLBACK_BODY: &str = "You have changes waiting to sync. Open Mirrorleaf to send them.";
+/// The fallback notification (ADR-004, gap 3), as the names of strings in the
+/// Android app (`res/values/strings.xml`): the text can be translated, and FCM
+/// never sees it. The system shows it when the app can't run, so it can't name
+/// devices: the ledger can't read their names.
+pub const FALLBACK_TITLE_KEY: &str = "sync_fallback_title";
+pub const FALLBACK_BODY_KEY: &str = "sync_fallback_body";
+/// The app's notification channel for the fallback.
+pub const FALLBACK_CHANNEL: &str = "fallback";
 
 const FCM_SCOPE: &str = "https://www.googleapis.com/auth/firebase.messaging";
 const DEFAULT_FCM_API: &str = "https://fcm.googleapis.com";
@@ -51,7 +55,7 @@ pub enum Pusher {
 impl Pusher {
     pub async fn send(&self, push: &Push) -> Result<(), PushError> {
         match self {
-            Pusher::Fcm(fcm) => fcm.send(push).await,
+            Pusher::Fcm(fcm) => fcm.send(push).await.map(drop),
             Pusher::LogOnly => {
                 tracing::info!("push (not sent, FCM not configured): {}", describe(push));
                 Ok(())
@@ -94,9 +98,15 @@ pub fn message(push: &Push) -> Value {
     match push.kind {
         PushKind::Fallback => json!({
             "token": push.token,
-            "notification": { "title": FALLBACK_TITLE, "body": FALLBACK_BODY },
             "data": data,
-            "android": { "priority": priority },
+            "android": {
+                "priority": priority,
+                "notification": {
+                    "title_loc_key": FALLBACK_TITLE_KEY,
+                    "body_loc_key": FALLBACK_BODY_KEY,
+                    "channel_id": FALLBACK_CHANNEL,
+                },
+            },
         }),
         // One collapse key: if the phone is unreachable, FCM keeps only the
         // latest wake-up rather than a queue of them.
@@ -146,7 +156,10 @@ impl Fcm {
         &self.account.project_id
     }
 
-    async fn send(&self, push: &Push) -> Result<(), PushError> {
+    /// Sends one push. Returns FCM's name for the message
+    /// (`projects/<project>/messages/<id>`); the app logs the same ID when the
+    /// push arrives, which the push-to-wake matrix uses (plan §7.2).
+    pub async fn send(&self, push: &Push) -> Result<String, PushError> {
         let token = self.access_token().await?;
         let url = format!(
             "{}/v1/projects/{}/messages:send",
@@ -164,7 +177,13 @@ impl Fcm {
             .await
             .map_err(anyhow::Error::from)?;
         match response.status().as_u16() {
-            200..=299 => Ok(()),
+            200..=299 => {
+                let body = response.bytes().await.map_err(anyhow::Error::from)?;
+                Ok(serde_json::from_slice::<Value>(&body)
+                    .ok()
+                    .and_then(|v| v["name"].as_str().map(str::to_owned))
+                    .unwrap_or_default())
+            }
             404 => Err(PushError::Unregistered),
             status => {
                 let text = response.text().await.unwrap_or_default();
@@ -305,8 +324,15 @@ mod tests {
         };
         let m = message(&fallback);
         assert_eq!(m["data"], json!({ "type": "fallback" }));
-        assert_eq!(m["notification"]["body"], FALLBACK_BODY);
+        assert_eq!(
+            m["android"]["notification"]["body_loc_key"],
+            FALLBACK_BODY_KEY
+        );
+        assert_eq!(m["android"]["notification"]["channel_id"], FALLBACK_CHANNEL);
         assert_eq!(m["android"]["priority"], "HIGH");
+        // The wording stays in the app: FCM sees only the keys.
+        assert!(m.get("notification").is_none());
+        assert!(!m.to_string().contains("Open Mirrorleaf"));
 
         // Nothing anywhere in the messages names a device.
         let deliver = Push {

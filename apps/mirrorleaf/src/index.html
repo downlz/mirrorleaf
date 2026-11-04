@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Mirrorleaf</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <h1>Mirrorleaf</h1>
+    <p class="hint">Phase 0 test screen. It will be replaced by the real app in M5.</p>
+
+    <p id="prompt" class="prompt" hidden></p>
+
+    <section>
+      <h2>This device</h2>
+      <pre id="status">Loading…</pre>
+    </section>
+
+    <section id="join-section" hidden>
+      <h2>Join a developer account</h2>
+      <p class="hint">
+        On the Mac, run <code>mirrorleaf-cli dev-account ticket</code> and paste the ticket here.
+      </p>
+      <textarea id="ticket" rows="4" placeholder="Ticket"></textarea>
+      <button id="join">Join</button>
+    </section>
+
+    <section>
+      <h2>Ledger</h2>
+      <input id="ledger" type="url" value="http://192.168.1.13:8080" />
+      <button id="use-ledger">Use this ledger</button>
+    </section>
+
+    <section>
+      <h2>Notes</h2>
+      <input id="title" placeholder="Title" />
+      <input id="text" placeholder="First paragraph" />
+      <button id="new-note">New note</button>
+      <div id="notes"></div>
+    </section>
+
+    <p id="message" class="message"></p>
+    <script src="app.js"></script>
+  </body>
+</html>

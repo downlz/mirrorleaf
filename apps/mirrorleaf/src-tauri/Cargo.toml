@@ -1,0 +1,19 @@
+[package]
+name = "mirrorleaf-app"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# The Tauri app for macOS and Android (implementation plan §4, M4). On Android the
+# same native library also carries the uniffi API used by the Kotlin background
+# code, so one engine serves the screen and the push-woken job (plan §5.7).
+[lib]
+name = "mirrorleaf_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+tauri.workspace = true
+mirrorleaf-ffi.workspace = true

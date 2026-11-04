@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "ledger"]
+members = ["crates/*", "ledger", "apps/mirrorleaf/src-tauri", "vendor/ndk-context"]
 
 [workspace.package]
 version = "0.0.0"
@@ -12,6 +12,7 @@ publish = false
 # step with Yjs in the editor (plan §9).
 [workspace.dependencies]
 mirrorleaf-core = { path = "crates/core" }
+mirrorleaf-ffi = { path = "crates/ffi" }
 mirrorleaf-net = { path = "crates/net" }
 mirrorleaf-proto = { path = "crates/proto" }
 
@@ -24,6 +25,11 @@ data-encoding = "2.11.1"
 ed25519-dalek = "3.0.0"
 # JPEG, PNG and WebP are decoded in Rust; HEIC needs the platform's decoder (plan §5.5).
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
+# Android only: the app's startup code hands the JVM and the application context
+# to Iroh's network code and to HTTPS certificate checks (ADR-005).
+jni = "0.22.4"
+ndk-context = "0.1.1"
+rustls-platform-verifier = "0.7.1"
 iroh = "=1.4.1"
 # Pre-1.0, so pinned exactly. 0.104.0 was under 7 days old at M2 (ADR-003).
 iroh-blobs = { version = "=0.103.1", default-features = false, features = ["fs-store"] }
@@ -43,12 +49,25 @@ serde_json = "1.0.154"
 # two crates linking SQLite even when the driver is switched off (ADR-004).
 sqlx-core = { version = "=0.9.0", default-features = false, features = ["_rt-tokio", "_tls-rustls-ring-webpki", "json"] }
 sqlx-postgres = { version = "=0.9.0", default-features = false, features = ["json"] }
+# Tauri 2 (Tauri 3 is still in alpha). Its Android template's Gradle versions are
+# kept as generated (owner's decision, 4 Nov 2026).
+tauri = "2.12.5"
+tauri-build = "2.7.4"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# Pinned exactly: the generated Kotlin and the Rust scaffolding must come from the
+# same release (ADR-005). Features are added per crate.
+uniffi = { version = "=0.32.2", default-features = false }
 uuid = { version = "1.29.0", features = ["v7"] }
 yrs = "=0.28.0"
+
+# ADR-005 (owner's decision, 4 Nov 2026): a patched ndk-context that allows a
+# second initialisation, so a push-woken job and Tauri's screen can both set
+# Android's context in one process. See vendor/ndk-context/Cargo.toml.
+[patch.crates-io]
+ndk-context = { path = "vendor/ndk-context" }
 
 # Implementation plan §3.3: no debug info for dependencies keeps debug builds
 # smaller and lighter on the 8 GB Mac.

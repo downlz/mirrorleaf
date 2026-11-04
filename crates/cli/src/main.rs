@@ -8,23 +8,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use mirrorleaf_core::{BlobHash, BlobKind, Block, PhotoRef, Replica, photos};
+use mirrorleaf_net::device::{self, DeviceDir, device_names, device_of, ledger_client, me};
 use mirrorleaf_net::ledger::{DeviceProfile, Fallback, LedgerClient, PROMPT_AFTER};
 use mirrorleaf_net::{
     Account, BlobStorage, DevTicket, Event, Network, SecretKey, State, SyncNode, describe,
 };
+use mirrorleaf_proto::DeviceId;
 use mirrorleaf_proto::ledger::{Platform, StatusResponse, WakeResponse};
-use mirrorleaf_proto::{DeviceEntry, DeviceId};
 
-const KEY_FILE: &str = "device.key";
-const DB_FILE: &str = "mirrorleaf.db";
-/// The blob store's folder inside the data folder.
-const BLOB_DIR: &str = "blobs";
-/// Where the ledger settings are kept in the database's `meta` table.
-const LEDGER_URL: &str = "ledger_url";
-const LEDGER_PLATFORM: &str = "ledger_platform";
-const LEDGER_PUSH_TOKEN: &str = "ledger_push_token";
-const LEDGER_NOTIFICATIONS: &str = "ledger_notifications";
-const DEVICE_NAME: &str = "device_name";
 const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Parser)]
@@ -208,18 +199,13 @@ fn data_dir(given: Option<PathBuf>) -> Result<PathBuf> {
 }
 
 fn init(dir: &Path, name: Option<String>) -> Result<()> {
-    let key_path = dir.join(KEY_FILE);
-    if key_path.exists() {
-        bail!("{} is already set up", dir.display());
-    }
-    std::fs::create_dir_all(dir)?;
-    let secret = SecretKey::generate();
-    write_private(&key_path, &secret.to_bytes())?;
-    let device = device_of(&secret);
-    let mut replica = Replica::open(dir.join(DB_FILE), device)?;
-    let name = name.unwrap_or_else(|| format!("device {}", device.short()));
-    replica.set_meta(DEVICE_NAME, name.as_bytes())?;
-    println!("Set up {name} ({device}) in {}", dir.display());
+    let (secret, replica) = DeviceDir::new(dir).init(name.as_deref())?;
+    let name = device::device_name(&replica)?;
+    println!(
+        "Set up {name} ({}) in {}",
+        device_of(&secret),
+        dir.display()
+    );
     println!("Next: `dev-account new` here, or `dev-account join <ticket>` from another device.");
     Ok(())
 }
@@ -474,7 +460,7 @@ async fn photo(dir: &Path, cmd: Photo) -> Result<()> {
             let hash = if thumbnail { p.thumbnail } else { p.full };
             let bytes = match replica.staged_blob(hash)? {
                 Some(bytes) => Some(bytes),
-                None => mirrorleaf_net::read_blob(&BlobStorage::Disk(dir.join(BLOB_DIR)), hash)
+                None => mirrorleaf_net::read_blob(&DeviceDir::new(dir).blob_storage(), hash)
                     .await
                     .context("while `sync --watch` runs, use its --export option instead")?,
             };
@@ -558,13 +544,7 @@ async fn ledger(dir: &Path, cmd: LedgerCmd) -> Result<()> {
             };
             let client = LedgerClient::new(&url, &secret, &account, profile.clone())?;
             client.register().await?;
-            replica.set_meta(LEDGER_URL, url.as_bytes())?;
-            replica.set_meta(LEDGER_PLATFORM, profile.platform.to_string().as_bytes())?;
-            match &profile.push_token {
-                Some(token) => replica.set_meta(LEDGER_PUSH_TOKEN, token.as_bytes())?,
-                None => replica.set_meta(LEDGER_PUSH_TOKEN, b"")?,
-            }
-            replica.set_meta(LEDGER_NOTIFICATIONS, &[u8::from(notifications)])?;
+            device::save_ledger(&mut replica, &url, &profile)?;
             println!("Registered with {url} as {}.", profile.platform);
             let response = client.report(&vv, None).await?;
             print_devices(&response, &names, device_of(&secret));
@@ -650,48 +630,11 @@ async fn ledger(dir: &Path, cmd: LedgerCmd) -> Result<()> {
             let client = ledger_client(&replica, &secret, &account)?
                 .context("this device isn't using a ledger")?;
             client.leave().await?;
-            replica.set_meta(LEDGER_URL, b"")?;
+            device::forget_ledger(&mut replica)?;
             println!("Removed this device from {}.", client.url());
         }
     }
     Ok(())
-}
-
-/// The ledger this device reports to, if one is set.
-fn ledger_client(
-    replica: &Replica,
-    secret: &SecretKey,
-    account: &Account,
-) -> Result<Option<LedgerClient>> {
-    let text = |key| -> Result<String> {
-        Ok(replica
-            .meta(key)?
-            .map(|v| String::from_utf8_lossy(&v).into_owned())
-            .unwrap_or_default())
-    };
-    let url = text(LEDGER_URL)?;
-    if url.is_empty() {
-        return Ok(None);
-    }
-    let token = text(LEDGER_PUSH_TOKEN)?;
-    let profile = DeviceProfile {
-        platform: text(LEDGER_PLATFORM)?
-            .parse()
-            .unwrap_or_else(|_| Platform::this()),
-        push_token: (!token.is_empty()).then_some(token),
-        notifications: replica.meta(LEDGER_NOTIFICATIONS)?.as_deref() == Some(&[1]),
-    };
-    Ok(Some(LedgerClient::new(&url, secret, account, profile)?))
-}
-
-fn device_names(account: &Account) -> HashMap<DeviceId, String> {
-    account
-        .devices
-        .list
-        .devices
-        .iter()
-        .map(|d| (d.id, d.name.clone()))
-        .collect()
 }
 
 /// One line per device of the account, as the ledger sees it.
@@ -761,7 +704,7 @@ async fn sync(dir: &Path, watch: bool, export: Option<PathBuf>) -> Result<()> {
         State { replica, account },
         secret,
         Network::Internet,
-        BlobStorage::Disk(dir.join(BLOB_DIR)),
+        DeviceDir::new(dir).blob_storage(),
     )
     .await?;
     if let Some(ledger) = ledger {
@@ -966,10 +909,7 @@ async fn sync(dir: &Path, watch: bool, export: Option<PathBuf>) -> Result<()> {
 fn status(dir: &Path) -> Result<()> {
     let (secret, replica) = open(dir)?;
     let device = device_of(&secret);
-    let name = replica
-        .meta(DEVICE_NAME)?
-        .map(|n| String::from_utf8_lossy(&n).into_owned())
-        .unwrap_or_default();
+    let name = device::device_name(&replica)?;
     println!("Device   {name} ({device})");
     let Some(account) = Account::load(&replica)? else {
         println!("Account  none yet");
@@ -1027,39 +967,9 @@ fn status(dir: &Path) -> Result<()> {
 }
 
 fn open(dir: &Path) -> Result<(SecretKey, Replica)> {
-    let bytes = std::fs::read(dir.join(KEY_FILE))
-        .with_context(|| format!("{} isn't set up: run `init` first", dir.display()))?;
-    let secret = SecretKey::from_bytes(
-        &bytes
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("{KEY_FILE} is corrupt"))?,
-    );
-    let replica = Replica::open(dir.join(DB_FILE), device_of(&secret))?;
-    Ok((secret, replica))
-}
-
-fn me(replica: &Replica, secret: &SecretKey) -> Result<DeviceEntry> {
-    let name = replica
-        .meta(DEVICE_NAME)?
-        .map(|n| String::from_utf8_lossy(&n).into_owned())
-        .unwrap_or_default();
-    Ok(DeviceEntry {
-        id: device_of(secret),
-        name,
-    })
-}
-
-fn device_of(secret: &SecretKey) -> DeviceId {
-    DeviceId(*secret.public().as_bytes())
-}
-
-/// Writes the device key readable by this user only.
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    options.open(path)?.write_all(bytes)?;
-    Ok(())
+    let device_dir = DeviceDir::new(dir);
+    if !device_dir.is_set_up() {
+        bail!("{} isn't set up: run `init` first", dir.display());
+    }
+    device_dir.open()
 }

@@ -3,6 +3,7 @@
 
 mod account;
 mod blobs;
+pub mod device;
 mod frame;
 pub mod ledger;
 mod node;

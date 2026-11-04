@@ -1,0 +1,5 @@
+# Kotlin bindings for the engine (ADR-005). The engine is compiled into the Tauri
+# app's native library, so the bindings load that library.
+[bindings.kotlin]
+package_name = "app.mirrorleaf.engine"
+cdylib_name = "mirrorleaf_app_lib"

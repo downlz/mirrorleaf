@@ -1,0 +1,17 @@
+# A patched copy of ndk-context 0.1.1 (MIT OR Apache-2.0, by the Rust Windowing
+# contributors, https://github.com/rust-windowing/android-ndk-rs). It replaces the
+# crates.io release through `[patch.crates-io]` in the workspace manifest.
+#
+# Why (ADR-005, owner's decision 4 Nov 2026): Iroh reads Android's context through
+# this crate. Tauri sets it when the app's screen first opens, but a push-woken
+# job runs with no screen, so Mirrorleaf must set it first. The original asserts
+# that it is set only once, which would crash the app when the screen opens after
+# a job in the same process. This copy ignores a second initialisation instead.
+[package]
+name = "ndk-context"
+version = "0.1.1"
+edition = "2024"
+description = "Handles for accessing Android APIs (patched for Mirrorleaf: initialising twice is allowed)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rust-windowing/android-ndk-rs"
+publish = false

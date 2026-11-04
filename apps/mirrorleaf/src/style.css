@@ -1,0 +1,63 @@
+body {
+  font:
+    15px/1.4 system-ui,
+    sans-serif;
+  margin: 0;
+  /* Android draws the app under the status bar, and its WebView doesn't report the inset. */
+  padding: max(48px, env(safe-area-inset-top)) 16px max(24px, env(safe-area-inset-bottom));
+}
+h1 {
+  margin: 8px 0 0;
+}
+h2 {
+  font-size: 1.05em;
+  margin: 20px 0 6px;
+}
+pre {
+  white-space: pre-wrap;
+  background: #f3f3f3;
+  padding: 8px;
+  border-radius: 6px;
+}
+input,
+textarea,
+button {
+  font: inherit;
+  box-sizing: border-box;
+  width: 100%;
+  margin: 4px 0;
+  padding: 8px;
+}
+.hint {
+  color: #666;
+  font-size: 0.9em;
+}
+.prompt {
+  background: #fff3cd;
+  border: 1px solid #e0c060;
+  padding: 10px;
+  border-radius: 6px;
+}
+.note {
+  border-top: 1px solid #ddd;
+  padding: 8px 0;
+}
+.message {
+  color: #444;
+}
+@media (prefers-color-scheme: dark) {
+  body {
+    background: #121212;
+    color: #eee;
+  }
+  pre {
+    background: #222;
+  }
+  .hint,
+  .message {
+    color: #aaa;
+  }
+  .prompt {
+    background: #3a3000;
+  }
+}

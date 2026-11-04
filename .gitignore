@@ -24,3 +24,7 @@ docs/adr/ADR-002-sync-core-decisions.md
 docs/adr/ADR-003-photo-decisions.md
 ledger/secrets/
 docs/adr/ADR-004-ledger-decisions.md
+docs/adr/ADR-005-android-background-decisions.md
+
+# Push-to-wake matrix results (tools/push-matrix.py); summaries go in docs/tests.
+tools/push-matrix-results/

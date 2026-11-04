@@ -11,7 +11,7 @@ use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
-use mirrorleaf_ledger::push::{FALLBACK_BODY, Fcm, Pusher, http_client};
+use mirrorleaf_ledger::push::{FALLBACK_BODY_KEY, Fcm, Pusher, http_client};
 use mirrorleaf_ledger::rules::{Priority, Push, PushKind, WAKE_INTERVAL_SECS};
 use mirrorleaf_ledger::{Ledger, db};
 use mirrorleaf_proto::ledger::{Approval, DeviceKey, Platform};
@@ -711,7 +711,10 @@ async fn the_fcm_client_sends_http_v1_messages_and_drops_dead_tokens() {
         assert_eq!(kinds[1]["android"]["priority"], "HIGH");
         assert_eq!(kinds[1]["data"], json!({ "type": "deliver" }));
         assert_eq!(kinds[2]["data"], json!({ "type": "fallback" }));
-        assert_eq!(kinds[2]["notification"]["body"], FALLBACK_BODY);
+        assert_eq!(
+            kinds[2]["android"]["notification"]["body_loc_key"],
+            FALLBACK_BODY_KEY
+        );
         assert!(
             kinds
                 .iter()
