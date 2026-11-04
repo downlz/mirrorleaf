@@ -11,7 +11,7 @@ mod session;
 mod ticket;
 
 pub use account::Account;
-pub use blobs::{BlobStorage, read_blob};
+pub use blobs::{BlobStorage, PhotoStore, read_blob};
 pub use frame::Traffic;
 pub use iroh::SecretKey;
 pub use node::{

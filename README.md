@@ -20,7 +20,7 @@ Mirrorleaf is a private notes app for rich text and photos. Notes live only on y
 | `ledger/` | Sync-status service (axum and Postgres) |
 | `packages/editor` | TipTap editor and its bridge to Rust |
 | `vendor/ndk-context` | A patched copy of `ndk-context` (see its `Cargo.toml`) |
-| `tools/` | Measurement scripts: `push-matrix.py`, the push-to-wake matrix (plan §7.2) |
+| `tools/` | Measurement scripts: `push-matrix.py`, the push-to-wake matrix (plan §7.2); `mem-trace.py`, the Android app's memory over time (plan §7.3) |
 
 ## Set up on a Mac (Apple silicon)
 

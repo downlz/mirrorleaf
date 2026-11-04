@@ -13,7 +13,7 @@ use mirrorleaf_proto::{ALPN, BlobHash, DeviceId, VersionVector};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::account::Account;
-use crate::blobs::{BlobStorage, Blobs};
+use crate::blobs::{BlobStorage, Blobs, PhotoStore};
 use crate::frame::Traffic;
 use crate::ledger::{HEARTBEAT, LedgerClient, MIN_REPORT_INTERVAL, ONLINE_FOR_SECS};
 use crate::session::{Role, RoundReport, handshake, round};
@@ -167,6 +167,8 @@ struct Inner {
     state: Shared,
     hints: Mutex<HashMap<DeviceId, EndpointAddr>>,
     blobs: Blobs,
+    /// Whether this node opened its photo store, and so closes it.
+    owns_store: bool,
     ledger: Mutex<Option<Arc<LedgerClient>>>,
 }
 
@@ -203,11 +205,32 @@ impl SyncNode {
         network: Network,
         storage: BlobStorage,
     ) -> Result<Self> {
+        let blobs = Blobs::open(&storage).await?;
+        Self::bind_inner(state, secret, network, blobs, true).await
+    }
+
+    /// Binds this device's endpoint with a photo store opened earlier and
+    /// shared with other nodes. Closing the node leaves the store open.
+    pub async fn bind_with_store(
+        state: State,
+        secret: SecretKey,
+        network: Network,
+        store: &PhotoStore,
+    ) -> Result<Self> {
+        Self::bind_inner(state, secret, network, store.0.clone(), false).await
+    }
+
+    async fn bind_inner(
+        state: State,
+        secret: SecretKey,
+        network: Network,
+        blobs: Blobs,
+        owns_store: bool,
+    ) -> Result<Self> {
         ensure!(
             DeviceId(*secret.public().as_bytes()) == state.replica.device(),
             "the device key doesn't match this database"
         );
-        let blobs = Blobs::open(&storage).await?;
         let builder = match network {
             Network::Internet => Endpoint::builder(presets::N0),
             Network::Local => Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Disabled),
@@ -223,6 +246,7 @@ impl SyncNode {
                 state: Arc::new(Mutex::new(state)),
                 hints: Mutex::default(),
                 blobs,
+                owns_store,
                 ledger: Mutex::default(),
             }),
         })
@@ -507,7 +531,9 @@ impl SyncNode {
 
     pub async fn close(&self) {
         self.inner.endpoint.close().await;
-        self.inner.blobs.shutdown().await;
+        if self.inner.owns_store {
+            self.inner.blobs.shutdown().await;
+        }
     }
 
     /// Live mode (plan §5.3, step 5): stays connected to every device on the

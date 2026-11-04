@@ -8,7 +8,8 @@ use mirrorleaf_core::Replica;
 use mirrorleaf_net::device::{self, DeviceDir, device_of};
 use mirrorleaf_net::ledger::{DeviceProfile, Fallback, LedgerClient, ONLINE_FOR_SECS};
 use mirrorleaf_net::{
-    Account, DevTicket, Event, Network, SecretKey, State, SyncNode, describe, endpoint_addr,
+    Account, DevTicket, Event, Network, PhotoStore, SecretKey, State, SyncNode, describe,
+    endpoint_addr,
 };
 use mirrorleaf_proto::DeviceId;
 use mirrorleaf_proto::ledger::{Platform, StatusResponse};
@@ -122,6 +123,10 @@ pub struct Engine {
     replica: Mutex<Replica>,
     runtime: Runtime,
     slot: tokio::sync::Mutex<Slot>,
+    /// The photo store, opened the first time a node is bound and kept open for
+    /// the life of the process (ADR-005): reopening it for every job leaked a
+    /// thread each time.
+    photos: tokio::sync::OnceCell<PhotoStore>,
     /// The bound node, for the few places that can't wait for `slot`.
     node: Mutex<Option<SyncNode>>,
     live: AtomicBool,
@@ -380,6 +385,7 @@ impl Engine {
             replica: Mutex::new(replica),
             runtime,
             slot: tokio::sync::Mutex::default(),
+            photos: tokio::sync::OnceCell::new(),
             node: Mutex::default(),
             live: AtomicBool::new(false),
             last_status: Mutex::default(),
@@ -409,11 +415,16 @@ impl Engine {
         let account =
             Account::load(&replica)?.context("this device hasn't joined an account yet")?;
         let ledger = device::ledger_client(&replica, &secret, &account)?;
-        let node = SyncNode::bind(
+        let storage = self.dir.blob_storage();
+        let photos = self
+            .photos
+            .get_or_try_init(|| async move { PhotoStore::open(&storage).await })
+            .await?;
+        let node = SyncNode::bind_with_store(
             State { replica, account },
             secret,
             Network::Internet,
-            self.dir.blob_storage(),
+            photos,
         )
         .await?;
         if let Some(ledger) = ledger {

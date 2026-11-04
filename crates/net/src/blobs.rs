@@ -26,12 +26,33 @@ pub enum BlobStorage {
 /// The blob store and the protocol that serves it (plan §5.3 step 4, §5.5).
 /// iroh-blobs checks every chunk against the blob's BLAKE3 hash as it arrives,
 /// and a fetch only asks for the chunks the store doesn't hold yet, so an
-/// interrupted transfer carries on where it stopped.
+/// interrupted transfer carries on where it stopped. Cloning shares the store.
+#[derive(Clone)]
 pub(crate) struct Blobs {
     store: StoreKind,
     protocol: BlobsProtocol,
 }
 
+/// An open photo store, shared by the nodes one process binds one after
+/// another (ADR-005). The engine opens it once per process: iroh-blobs' file
+/// store runs its own thread pool, and closing the store leaves one of those
+/// threads behind each time, so opening it for every push-woken job leaked a
+/// thread per job.
+#[derive(Clone)]
+pub struct PhotoStore(pub(crate) Blobs);
+
+impl PhotoStore {
+    pub async fn open(storage: &BlobStorage) -> Result<Self> {
+        Ok(Self(Blobs::open(storage).await?))
+    }
+
+    /// Closes the store. Nodes bound with it can no longer move photos.
+    pub async fn shutdown(&self) {
+        self.0.shutdown().await;
+    }
+}
+
+#[derive(Clone)]
 enum StoreKind {
     Disk(FsStore),
     Memory(MemStore),

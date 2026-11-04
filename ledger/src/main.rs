@@ -18,7 +18,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
-use mirrorleaf_ledger::push::{Fcm, Pusher};
+use mirrorleaf_ledger::push::{Fcm, Pusher, test_message};
 use mirrorleaf_ledger::rules::{Priority, Push, PushKind};
 use mirrorleaf_ledger::{Ledger, db, system_clock};
 use sqlx_postgres::PgPoolOptions;
@@ -106,7 +106,8 @@ async fn main() -> Result<()> {
 }
 
 /// `test-push <device ID prefix> <normal|high>`: sends one `pull` push to a
-/// registered device, outside the push rules and their limits, for the
+/// registered device, outside the push rules and their limits and without a
+/// collapse key, for the
 /// push-to-wake matrix (plan §7.2, `tools/push-matrix.py`). It has no HTTP
 /// endpoint: only someone with a shell on the ledger's host can run it, with
 /// `docker compose exec ledger mirrorleaf-ledger test-push …`.
@@ -156,7 +157,12 @@ async fn test_push(args: &[String]) -> Result<()> {
         kind: PushKind::Pull { from: device },
     };
     let sent = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
-    let name = fcm.send(&push).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Without the collapse key: FCM throttles collapsible messages after a
+    // burst of 20 per device, which the matrix's trials would hit.
+    let name = fcm
+        .send_message(test_message(&push))
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     println!("sent {sent} {name}");
     Ok(())
 }

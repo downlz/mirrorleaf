@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use mirrorleaf_core::{BlobKind, PhotoRef, Replica, photos};
 use mirrorleaf_net::{
-    Account, AuthError, BlobStorage, Event, Network, PathKind, SecretKey, State, SyncNode,
+    Account, AuthError, BlobStorage, Event, Network, PathKind, PhotoStore, SecretKey, State,
+    SyncNode,
 };
 use mirrorleaf_proto::{AccountKey, DeviceEntry, DeviceId};
 
@@ -413,4 +414,43 @@ async fn live_mode_fetches_new_thumbnails() {
     assert!(b.blob(photo.full).await.unwrap().is_none());
     a.close().await;
     b.close().await;
+}
+
+/// The engine binds a node for each push-woken job and keeps one photo store
+/// open for the whole process (ADR-005), so closing a node must leave a shared
+/// store working for the next one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shared_photo_store_outlives_the_nodes_using_it() {
+    let dir = std::env::temp_dir().join(format!("mirrorleaf-shared-store-{}", std::process::id()));
+    let store = PhotoStore::open(&BlobStorage::Disk(dir.clone()))
+        .await
+        .unwrap();
+    let secret = SecretKey::generate();
+    let device = DeviceId(*secret.public().as_bytes());
+    let full = image_bytes(50_000);
+    let mut photo = None;
+    for job in 0..3 {
+        let replica = Replica::open_in_memory(device).unwrap();
+        let account = Account::create(DeviceEntry {
+            id: device,
+            name: "phone".into(),
+        });
+        let node = SyncNode::bind_with_store(
+            State { replica, account },
+            secret.clone(),
+            Network::Local,
+            &store,
+        )
+        .await
+        .unwrap();
+        if job == 0 {
+            let note = new_note(&node, "Photos");
+            photo = Some(add_photo(&node, &note, &full).await);
+        }
+        let held = node.blob(photo.unwrap().full).await.unwrap();
+        assert_eq!(held.as_deref(), Some(&full[..]), "job {job}");
+        node.close().await;
+    }
+    store.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
 }

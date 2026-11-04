@@ -118,6 +118,20 @@ pub fn message(push: &Push) -> Value {
     }
 }
 
+/// The message for an operator's test push (`mirrorleaf-ledger test-push`):
+/// as [`message`], but without the collapse key. FCM limits collapsible
+/// messages to a burst of 20 per app per device, then one every 3 minutes,
+/// which the push-to-wake matrix's 20 trials in a row would hit (ADR-005).
+/// The rules' pushes keep the key, so an unreachable phone is sent only the
+/// latest wake-up.
+pub fn test_message(push: &Push) -> Value {
+    let mut m = message(push);
+    if let Some(android) = m.get_mut("android").and_then(Value::as_object_mut) {
+        android.remove("collapse_key");
+    }
+    m
+}
+
 /// The parts of a Firebase service-account key the ledger uses.
 #[derive(Deserialize)]
 struct ServiceAccount {
@@ -160,13 +174,18 @@ impl Fcm {
     /// (`projects/<project>/messages/<id>`); the app logs the same ID when the
     /// push arrives, which the push-to-wake matrix uses (plan §7.2).
     pub async fn send(&self, push: &Push) -> Result<String, PushError> {
+        self.send_message(message(push)).await
+    }
+
+    /// Sends one message in FCM's HTTP v1 format (as [`message`] builds).
+    pub async fn send_message(&self, message: Value) -> Result<String, PushError> {
         let token = self.access_token().await?;
         let url = format!(
             "{}/v1/projects/{}/messages:send",
             self.api, self.account.project_id
         );
-        let body = serde_json::to_vec(&json!({ "message": message(push) }))
-            .map_err(anyhow::Error::from)?;
+        let body =
+            serde_json::to_vec(&json!({ "message": message })).map_err(anyhow::Error::from)?;
         let response = self
             .http
             .post(url)
@@ -291,6 +310,25 @@ mod tests {
     use mirrorleaf_proto::DeviceId;
 
     use super::*;
+
+    #[test]
+    fn test_pushes_are_rule_pushes_without_the_collapse_key() {
+        let push = Push {
+            to: DeviceId([1; 32]),
+            token: "tok".into(),
+            priority: Priority::High,
+            kind: PushKind::Pull {
+                from: DeviceId([2; 32]),
+            },
+        };
+        let rule = message(&push);
+        assert_eq!(rule["android"]["collapse_key"], "sync");
+        let test = test_message(&push);
+        assert!(test["android"].get("collapse_key").is_none());
+        assert_eq!(test["android"]["priority"], "HIGH");
+        assert_eq!(test["data"], rule["data"]);
+        assert_eq!(test["token"], "tok");
+    }
 
     #[test]
     fn pushes_carry_only_their_type_and_the_fallback_is_generic() {
