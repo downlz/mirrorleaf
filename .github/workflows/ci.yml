@@ -67,6 +67,10 @@ jobs:
           # 24.04 rather than ubuntu-latest: the binary then runs on Ubuntu 24.04 and newer.
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+          # ARM Linux (a Raspberry Pi, an ARM mini-PC or cloud server as an
+          # extra peer), built natively on GitHub's ARM runner; 24.04 as above.
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
           - os: macos-latest
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
