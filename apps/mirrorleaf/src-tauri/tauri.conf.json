@@ -4,24 +4,48 @@
   "version": "0.1.0",
   "identifier": "app.mirrorleaf",
   "build": {
-    "frontendDist": "../src"
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
   },
   "app": {
     "windows": [
       {
+        "label": "main",
+        "create": false,
         "title": "Mirrorleaf",
-        "width": 480,
-        "height": 720
+        "width": 1120,
+        "height": 740,
+        "minWidth": 360,
+        "minHeight": 480,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": { "x": 20, "y": 26 },
+        "dragDropEnabled": false
       }
     ],
     "security": {
-      "csp": null
+      "csp": {
+        "default-src": "'self' ipc: http://ipc.localhost",
+        "img-src": "'self' data: blob: mirrorleaf-blob: http://mirrorleaf-blob.localhost",
+        "style-src": "'self' 'unsafe-inline'",
+        "connect-src": "'self' ipc: http://ipc.localhost"
+      },
+      "devCsp": {
+        "default-src": "'self' ipc: http://ipc.localhost",
+        "img-src": "'self' data: blob: mirrorleaf-blob: http://mirrorleaf-blob.localhost",
+        "style-src": "'self' 'unsafe-inline'",
+        "connect-src": "'self' ipc: http://ipc.localhost ws://localhost:5173 http://localhost:5173"
+      }
     },
-    "withGlobalTauri": true
+    "withGlobalTauri": false
   },
   "bundle": {
     "active": true,
     "targets": "all",
+    "category": "Productivity",
+    "shortDescription": "Your notes, mirrored on your devices. Nowhere else.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -29,6 +53,14 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "macOS": {
+      "minimumSystemVersion": "13.0"
+    },
+    "linux": {
+      "deb": {
+        "depends": ["libayatana-appindicator3-1"]
+      }
+    },
     "android": {
       "minSdkVersion": 24
     }

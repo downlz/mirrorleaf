@@ -4,9 +4,11 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
-# The Tauri app for macOS and Android (implementation plan §4, M4). On Android the
-# same native library also carries the uniffi API used by the Kotlin background
-# code, so one engine serves the screen and the push-woken job (plan §5.7).
+# The Tauri app for macOS and Android (implementation plan §4, M4–M5). On
+# Android the same native library also carries the uniffi API used by the
+# Kotlin background code, so one engine serves the screen and the push-woken
+# job (plan §5.7). On the desktop the same process is the background agent:
+# closing the window leaves it syncing from the menu bar (M5).
 [lib]
 name = "mirrorleaf_app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
@@ -15,5 +17,18 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build.workspace = true
 
 [dependencies]
-tauri.workspace = true
 mirrorleaf-ffi.workspace = true
+serde.workspace = true
+tauri = { workspace = true, features = ["tray-icon"] }
+tokio.workspace = true
+tracing.workspace = true
+
+[target.'cfg(any(target_os = "macos", target_os = "linux", windows))'.dependencies]
+tauri-plugin-autostart.workspace = true
+tauri-plugin-single-instance.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2.workspace = true
+objc2-app-kit.workspace = true
+objc2-foundation.workspace = true

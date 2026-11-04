@@ -12,5 +12,6 @@ mod android;
 mod engine;
 
 pub use engine::{
-    DeviceSummary, Engine, EngineError, EngineStatus, NoteSummary, SyncListener, SyncSummary,
+    DeviceSummary, Engine, EngineError, EngineStatus, FolderItem, NoteItem, NoteList, PhotoInfo,
+    SyncListener, SyncSummary, UiEvent,
 };

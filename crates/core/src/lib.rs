@@ -17,7 +17,9 @@ mod replica;
 pub use batch::{BATCH_WINDOW, Batcher};
 pub use blobs::{BLOB_SCHEME, BlobKind, PhotoRef, PhotoStatus};
 pub use mirrorleaf_proto::{BlobHash, Change, DeviceId, VersionVector};
-pub use notes::{Block, CONTENT_FRAGMENT, INDEX_DOC, NoteMeta};
+pub use notes::{
+    Block, CONTENT_FRAGMENT, FolderMeta, INDEX_DOC, NoteMeta, PREVIEW_CHARS, TOUCH_INTERVAL_MS,
+};
 pub use replica::Replica;
 pub use yrs;
 

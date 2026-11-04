@@ -53,6 +53,15 @@ sqlx-postgres = { version = "=0.9.0", default-features = false, features = ["jso
 # kept as generated (owner's decision, 4 Nov 2026).
 tauri = "2.12.5"
 tauri-build = "2.7.4"
+# Desktop agent (M5): one instance, and starting at login. Both from Tauri's
+# plugins workspace; Apache-2.0 OR MIT.
+tauri-plugin-autostart = "=2.7.0"
+tauri-plugin-single-instance = "=2.5.4"
+# macOS sleep and wake notifications for the desktop agent (M5). Already in the
+# tree through Tauri's window code; only features are added.
+block2 = "0.6.2"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSWorkspace"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSNotification", "NSOperation", "NSString"] }
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1.44"

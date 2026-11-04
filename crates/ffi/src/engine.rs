@@ -1,20 +1,26 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, bail};
-use mirrorleaf_core::Replica;
+use anyhow::Context;
+use mirrorleaf_core::{BATCH_WINDOW, Batcher, Replica};
 use mirrorleaf_net::device::{self, DeviceDir, device_of};
-use mirrorleaf_net::ledger::{DeviceProfile, Fallback, LedgerClient, ONLINE_FOR_SECS};
+use mirrorleaf_net::ledger::{DeviceProfile, Fallback, ONLINE_FOR_SECS};
 use mirrorleaf_net::{
-    Account, DevTicket, Event, Network, PhotoStore, SecretKey, State, SyncNode, describe,
+    Account, Event, Network, PathKind, PhotoStore, SecretKey, State, SyncNode, describe,
     endpoint_addr,
 };
 use mirrorleaf_proto::DeviceId;
 use mirrorleaf_proto::ledger::{Platform, StatusResponse};
 use tokio::runtime::Runtime;
 use tracing::{info, warn};
+
+mod screen;
+
+use screen::OpenNote;
+pub use screen::{FolderItem, NoteItem, NoteList, PhotoInfo, UiEvent};
 
 /// How long one dial may take before the device counts as unreachable.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
@@ -66,6 +72,8 @@ pub struct DeviceSummary {
     /// From the ledger's last answer, if there was one.
     pub online: Option<bool>,
     pub behind: Option<u64>,
+    /// How live sync is connected to it right now ("direct" or "relay"), if it is.
+    pub connection: Option<String>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, uniffi::Record)]
@@ -94,14 +102,6 @@ pub struct SyncSummary {
     pub sent: u64,
     pub received: u64,
     pub took_ms: u64,
-}
-
-/// A note for the Phase 0 screen (throwaway, like the screen itself).
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct NoteSummary {
-    pub id: String,
-    pub title: String,
-    pub paragraphs: Vec<String>,
 }
 
 /// Whoever is using the network node. The photo store can be opened once per
@@ -134,6 +134,16 @@ pub struct Engine {
     last_status: Mutex<Option<StatusResponse>>,
     /// Armed when the app is opened while behind (plan §5.9).
     fallback: Mutex<Option<Fallback>>,
+    /// The devices live sync is connected to, and how.
+    connected: Mutex<HashMap<DeviceId, PathKind>>,
+    /// The editor's updates, waiting to become one change per note (plan §5.2).
+    batcher: Mutex<Batcher>,
+    /// Whether a task is waiting to flush the batcher.
+    flushing: AtomicBool,
+    /// The note open in the editor, which hears other devices' edits (plan §5.6).
+    editor: Mutex<Option<OpenNote>>,
+    /// How the screen hears that something changed.
+    ui: Mutex<Option<screen::Listener>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -173,6 +183,7 @@ impl Engine {
             last.as_ref()
                 .and_then(|s| s.devices.iter().find(|d| d.device == id).cloned())
         };
+        let connected = lock(&self.connected).clone();
         let devices = account
             .as_ref()
             .map(|account| {
@@ -188,6 +199,7 @@ impl Engine {
                         changes_held: held.get(&d.id),
                         online: row(d.id).map(|r| r.online),
                         behind: row(d.id).map(|r| r.behind),
+                        connection: connected.get(&d.id).map(ToString::to_string),
                     })
                     .collect()
             })
@@ -280,93 +292,6 @@ impl Engine {
     }
 }
 
-/// For the Tauri screen (Phase 0's throwaway UI), not exported to Kotlin.
-impl Engine {
-    /// The engine, if this process has opened it.
-    pub fn get() -> Option<Arc<Self>> {
-        lock(&ENGINE).clone()
-    }
-
-    /// Joins a developer account from a ticket (plan §5.4), then syncs with the
-    /// inviting device.
-    pub async fn join(self: Arc<Self>, ticket: String) -> Result<String, EngineError> {
-        let this = self.clone();
-        self.on_runtime(async move {
-            let ticket: DevTicket = ticket.trim().parse()?;
-            {
-                let mut replica = lock(&this.replica);
-                if Account::load(&replica)?.is_some() {
-                    bail!("this device already belongs to an account");
-                }
-                let me = device::me(&replica, &this.secret)?;
-                Account::join(ticket.account_key(), &ticket.devices, me)?.save(&mut replica)?;
-            }
-            let node = this.begin_job().await?;
-            let outcome =
-                match tokio::time::timeout(DIAL_TIMEOUT, node.sync_once(ticket.inviter)).await {
-                    Ok(Ok((path, report))) => format!(
-                        "Joined. Synced with the inviting device via {path}: received {} changes.",
-                        report.received_changes
-                    ),
-                    Ok(Err(e)) => format!("Joined, but couldn't sync yet: {}", describe(&e)),
-                    Err(_) => "Joined, but the inviting device didn't answer yet.".to_owned(),
-                };
-            this.end_job().await;
-            Ok(outcome)
-        })
-        .await
-    }
-
-    /// Registers this device with the ledger at `url` and reports to it from now on.
-    pub async fn use_ledger(self: Arc<Self>, url: String) -> Result<String, EngineError> {
-        let this = self.clone();
-        self.on_runtime(async move {
-            let url = url.trim().trim_end_matches('/').to_owned();
-            let (account, profile) = {
-                let replica = lock(&this.replica);
-                let account = Account::load(&replica)?.context("join an account first")?;
-                (account, profile(&replica)?)
-            };
-            let client = LedgerClient::new(&url, &this.secret, &account, profile.clone())?;
-            client.register().await?;
-            device::save_ledger(&mut lock(&this.replica), &url, &profile)?;
-            this.refresh_ledger();
-            Ok(format!("Registered with the ledger at {url}."))
-        })
-        .await
-    }
-
-    pub fn notes(&self) -> Result<Vec<NoteSummary>, EngineError> {
-        let replica = lock(&self.replica);
-        let mut notes = Vec::new();
-        for note in replica.list_notes()? {
-            if note.trashed {
-                continue;
-            }
-            notes.push(NoteSummary {
-                paragraphs: replica.note_paragraphs(&note.id)?,
-                id: note.id,
-                title: note.title,
-            });
-        }
-        Ok(notes)
-    }
-
-    pub fn create_note(&self, title: &str, text: &str) -> Result<String, EngineError> {
-        let mut replica = lock(&self.replica);
-        let id = replica.create_note(title)?;
-        if !text.is_empty() {
-            replica.append_paragraph(&id, text)?;
-        }
-        Ok(id)
-    }
-
-    pub fn append(&self, id: &str, text: &str) -> Result<(), EngineError> {
-        lock(&self.replica).append_paragraph(id, text)?;
-        Ok(())
-    }
-}
-
 impl Engine {
     fn start(data_dir: &str, device_name: &str) -> anyhow::Result<Self> {
         let dir = DeviceDir::new(data_dir);
@@ -390,6 +315,11 @@ impl Engine {
             live: AtomicBool::new(false),
             last_status: Mutex::default(),
             fallback: Mutex::default(),
+            connected: Mutex::default(),
+            batcher: Mutex::new(Batcher::new(BATCH_WINDOW)),
+            flushing: AtomicBool::new(false),
+            editor: Mutex::default(),
+            ui: Mutex::default(),
         })
     }
 
@@ -620,11 +550,17 @@ impl Engine {
             node
         };
         info!("live sync started");
+        self.notify(UiEvent::StatusChanged);
         self.check_behind(&node).await;
         Ok(())
     }
 
     async fn stop_live(&self) -> anyhow::Result<()> {
+        // The editor's waiting edits go into the log first, so live sync can
+        // still send them (flush-on-close).
+        if let Err(e) = self.flush_edits() {
+            warn!("couldn't store edits: {e}");
+        }
         let mut slot = self.slot.lock().await;
         let Some(task) = slot.live.take() else {
             return Ok(());
@@ -632,6 +568,8 @@ impl Engine {
         tokio::time::sleep(FLUSH).await;
         task.abort();
         self.live.store(false, Ordering::Release);
+        lock(&self.connected).clear();
+        self.notify(UiEvent::StatusChanged);
         if let Some(node) = &slot.node {
             report_offline(node).await;
         }
@@ -680,20 +618,40 @@ impl Engine {
     fn on_event(&self, event: Event) {
         match event {
             Event::Connected { peer, path, .. } => {
-                info!("connected to {} via {path}", peer.short())
+                info!("connected to {} via {path}", peer.short());
+                lock(&self.connected).insert(peer, path);
+                self.notify(UiEvent::StatusChanged);
+            }
+            Event::Disconnected { peer } => {
+                lock(&self.connected).remove(&peer);
+                self.notify(UiEvent::StatusChanged);
             }
             Event::Synced {
                 peer, path, report, ..
-            } if report.sent_changes + report.received_changes > 0 => info!(
-                "{} via {path}: sent {}, received {}",
-                peer.short(),
-                report.sent_changes,
-                report.received_changes
-            ),
+            } => {
+                if report.sent_changes + report.received_changes > 0 {
+                    info!(
+                        "{} via {path}: sent {}, received {}",
+                        peer.short(),
+                        report.sent_changes,
+                        report.received_changes
+                    );
+                }
+                if report.received_changes > 0 {
+                    self.forward_to_editor();
+                    self.notify(UiEvent::NotesChanged);
+                }
+            }
+            Event::Fetched { report, .. } => self.notify(UiEvent::PhotoArrived {
+                hash: report.hash.to_string(),
+            }),
             Event::Failed { peer, error } => {
                 info!("{}: {error}", peer.map_or("incoming".into(), |p| p.short()))
             }
-            Event::LedgerReported { response } => *lock(&self.last_status) = Some(response),
+            Event::LedgerReported { response } => {
+                *lock(&self.last_status) = Some(response);
+                self.notify(UiEvent::StatusChanged);
+            }
             Event::LedgerFailed { error } => warn!("ledger: {error}"),
             _ => {}
         }

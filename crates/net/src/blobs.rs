@@ -46,6 +46,12 @@ impl PhotoStore {
         Ok(Self(Blobs::open(storage).await?))
     }
 
+    /// A blob's content, if the store holds all of it. The app's photo
+    /// protocol reads through this (plan §5.6), whether or not a node is bound.
+    pub async fn get(&self, hash: BlobHash) -> Result<Option<Vec<u8>>> {
+        self.0.get(hash).await
+    }
+
     /// Closes the store. Nodes bound with it can no longer move photos.
     pub async fn shutdown(&self) {
         self.0.shutdown().await;

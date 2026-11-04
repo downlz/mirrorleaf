@@ -1,5 +1,4 @@
-# CI for Phase 0 (implementation plan, M0–M4). The macOS app build and the
-# compile-only Windows check join in M5.
+# CI for Phase 0 (implementation plan, M0–M5).
 name: CI
 
 on:
@@ -105,6 +104,8 @@ jobs:
       - run: pnpm format:check
       - run: pnpm -r typecheck
       - run: pnpm -r test
+      # M5: the screen's bundle, as the app build makes it.
+      - run: pnpm --filter @mirrorleaf/app build
 
   # M4: the Android app for arm64, with the engine and the Kotlin background
   # code (ADR-005). Release builds for every CPU type and their size checks
@@ -127,6 +128,13 @@ jobs:
           targets: aarch64-linux-android
       - uses: Swatinem/rust-cache@v2
       - uses: gradle/actions/setup-gradle@v6
+      # M5: the app's build step bundles the screen with Vite.
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
       - name: Install the Tauri CLI
         run: cargo install tauri-cli --version 2.12.4 --locked
       # The real google-services.json stays out of the public repo. With the
@@ -175,3 +183,86 @@ jobs:
           name: mirrorleaf-android-arm64-debug
           path: apps/mirrorleaf/src-tauri/gen/android/app/build/outputs/apk/universal/debug/*.apk
           if-no-files-found: error
+
+  # M5: the macOS app for Apple silicon, unsigned (signing and notarising are
+  # E13), with the installer size gate (plan §7.3: ≤ 25 MB).
+  desktop-macos:
+    name: macOS app (Apple silicon, unsigned) and size check
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Install the Tauri CLI
+        run: cargo install tauri-cli --version 2.12.4 --locked
+      - run: cargo clippy --locked -p mirrorleaf-app -- -D warnings
+      - name: Build the app and installer
+        working-directory: apps/mirrorleaf/src-tauri
+        run: cargo tauri build --bundles app,dmg --ci
+      - name: Installer size (gate ≤ 25 MB)
+        run: |
+          dmg=$(ls target/release/bundle/dmg/*.dmg)
+          app=target/release/bundle/macos/Mirrorleaf.app
+          size=$(stat -f %z "$dmg")
+          echo "Installer: $dmg, $size bytes"
+          echo "App: $(du -sk "$app" | cut -f1) KB"
+          ls -l "$app/Contents/MacOS"
+          echo "### macOS installer: $((size / 1024)) KB (gate 25 MB)" >> "$GITHUB_STEP_SUMMARY"
+          test "$size" -le $((25 * 1024 * 1024))
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mirrorleaf-macos-arm64-unsigned
+          path: target/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+
+  # M5: the desktop app on Linux, as the second desktop peer on the Ubuntu
+  # machine (M5's "done when"). Not a release target.
+  desktop-linux:
+    name: Linux app (x86_64 .deb)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: WebKitGTK and tray libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Install the Tauri CLI
+        run: cargo install tauri-cli --version 2.12.4 --locked
+      - run: cargo clippy --locked -p mirrorleaf-app -- -D warnings
+      - name: Build the .deb
+        working-directory: apps/mirrorleaf/src-tauri
+        run: cargo tauri build --bundles deb --ci
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mirrorleaf-linux-x86_64-deb
+          path: target/release/bundle/deb/*.deb
+          if-no-files-found: error
+
+  # M5: Windows is deferred (29 Oct 2026); this compile-only check keeps the
+  # code building for when it returns (plan §9).
+  windows-check:
+    name: Windows compile check (deferred platform)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked -p mirrorleaf-app -p mirrorleaf-cli

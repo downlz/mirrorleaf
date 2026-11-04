@@ -1,97 +1,91 @@
-//! mirrorleaf-app: the Tauri app (implementation plan §5.7). The Phase 0 screen is
-//! a throwaway test page; what it drives, the engine, is the real foundation.
+//! mirrorleaf-app: the Tauri app (implementation plan §5.6–§5.7). The screen is
+//! a Svelte app in `apps/mirrorleaf/src`, shared by the desktop, Android and
+//! later tablets; it drives the engine through the commands in `commands`.
 //!
 //! On Android the Kotlin startup code opens the engine before the screen exists,
 //! because a push-woken job may need it with no screen at all. On the desktop
-//! the app opens it here.
+//! the app opens it here, and the same process is the background agent.
 
-use std::sync::Arc;
+mod commands;
+#[cfg(desktop)]
+mod desktop;
+mod photos;
+#[cfg(target_os = "macos")]
+mod power;
+mod window;
 
-use mirrorleaf_ffi::{Engine, EngineStatus, NoteSummary};
+use mirrorleaf_ffi::Engine;
+use tauri::{AppHandle, Emitter};
 
-fn engine() -> Result<Arc<Engine>, String> {
-    Engine::get().ok_or_else(|| "the engine isn't open".to_owned())
-}
-
-#[tauri::command]
-fn status() -> Result<EngineStatus, String> {
-    engine()?.status().map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-async fn join(ticket: String) -> Result<String, String> {
-    let engine = engine()?;
-    let joined = engine
-        .clone()
-        .join(ticket)
-        .await
-        .map_err(|e| e.to_string())?;
-    // The app is open, so start syncing straight away.
-    match engine.go_live().await {
-        Ok(()) => Ok(joined),
-        Err(e) => Ok(format!("{joined} Live sync didn't start: {e}")),
-    }
-}
-
-#[tauri::command]
-async fn use_ledger(url: String) -> Result<String, String> {
-    engine()?.use_ledger(url).await.map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-async fn go_live() -> Result<(), String> {
-    engine()?.go_live().await.map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn notes() -> Result<Vec<NoteSummary>, String> {
-    engine()?.notes().map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn new_note(title: String, text: String) -> Result<String, String> {
-    engine()?
-        .create_note(&title, &text)
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn append(id: String, text: String) -> Result<(), String> {
-    engine()?.append(&id, &text).map_err(|e| e.to_string())
-}
-
-/// The device to name in "Open Mirrorleaf on <name> to sync", once due.
-#[tauri::command]
-fn fallback_prompt() -> Option<String> {
-    Engine::get()?.fallback_prompt()
-}
+/// The event the screen listens to for refreshes (`UiEvent` as its payload).
+const ENGINE_EVENT: &str = "engine";
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(desktop)]
+    let builder = desktop::plugins(builder)
+        .on_menu_event(desktop::on_menu_event)
+        .on_window_event(desktop::on_window_event);
+    let app = builder
+        .register_asynchronous_uri_scheme_protocol(photos::SCHEME, photos::handle)
         .setup(|app| {
             #[cfg(desktop)]
-            {
-                use tauri::Manager;
-                let dir = app.path().app_data_dir()?;
-                let engine = Engine::open(dir.to_string_lossy().into_owned(), "Mac".to_owned())?;
-                tauri::async_runtime::spawn(async move {
-                    let _ = engine.go_live().await;
-                });
-            }
-            let _ = app;
+            desktop::setup(app)?;
+            #[cfg(mobile)]
+            window::build_main(app.handle())?;
+            forward_engine_events(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            status,
-            join,
-            use_ledger,
-            go_live,
-            notes,
-            new_note,
-            append,
-            fallback_prompt
+            commands::platform,
+            commands::status,
+            commands::create_account,
+            commands::ticket,
+            commands::join,
+            commands::use_ledger,
+            commands::fallback_prompt,
+            commands::note_list,
+            commands::create_note,
+            commands::trash_note,
+            commands::restore_note,
+            commands::set_pinned,
+            commands::move_note,
+            commands::create_folder,
+            commands::rename_folder,
+            commands::delete_folder,
+            commands::set_note_meta,
+            commands::open_note,
+            commands::close_note,
+            commands::edit_note,
+            commands::flush_edits,
+            commands::close_window,
+            commands::import_photo,
+            commands::autostart,
+            commands::set_autostart,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running the Mirrorleaf app");
+        .build(tauri::generate_context!())
+        .expect("error while starting the Mirrorleaf app");
+    app.run(|app, event| {
+        #[cfg(desktop)]
+        desktop::on_run_event(app, &event);
+        let _ = (app, event);
+    });
+}
+
+/// Passes the engine's refresh events to the screen (and, on the desktop, to
+/// the menu bar's status line).
+fn forward_engine_events(app: &AppHandle) {
+    let Some(engine) = Engine::get() else {
+        tracing::warn!("the engine isn't open");
+        return;
+    };
+    let app = app.clone();
+    engine.set_ui_listener(move |event| {
+        #[cfg(desktop)]
+        if event == mirrorleaf_ffi::UiEvent::StatusChanged {
+            desktop::refresh_tray(&app);
+        }
+        let _ = app.emit(ENGINE_EVENT, event);
+    });
 }

@@ -8,7 +8,7 @@ Mirrorleaf keeps notes only on the user's own devices and syncs them device to d
 - **Docs need approval.** Don't edit `docs/implementation-plan.md` without the owner's approval; list the exact changes first.
 - British spelling in docs and comments.
 - Keep all Iroh use inside `mirrorleaf-net` (plan §9).
-- The Phase 0 UI is throwaway. The Rust core, the network layer and the ledger are the real foundation.
+- The Rust core, the network layer and the ledger are the real foundation. The notes screen (M5) is kept and shared by the desktop, Android and later tablets: keep it adaptive (`layout-wide`, `layout-medium`, `layout-narrow`), with touch-sized targets and no hover-only controls (owner, 4 Nov 2026).
 
 ## Commands
 
@@ -20,7 +20,8 @@ Mirrorleaf keeps notes only on the user's own devices and syncs them device to d
 | Rust dependency check | `cargo deny check` |
 | Install JS dependencies | `pnpm install` |
 | Lint / format | `pnpm lint`, `pnpm format` (CI runs `pnpm format:check`) |
-| Types / tests | `pnpm -r typecheck`, `pnpm -r test` |
+| Types / tests | `pnpm -r typecheck`, `pnpm -r test` (the editor's tests include the Yjs ↔ yrs fixture check; `UPDATE_FIXTURES=1` rewrites the fixtures after a deliberate change) |
+| Mac app | in `apps/mirrorleaf/src-tauri`: `cargo tauri dev`; a release `.app` with `cargo tauri build --bundles app` (slow; CI builds the `.dmg`) |
 | Android APK (arm64, debug) | in `apps/mirrorleaf/src-tauri`: `cargo tauri android build --debug --target aarch64 --apk --ci` |
 | Rust lint for Android | `cargo clippy --target aarch64-linux-android -p mirrorleaf-ffi -p mirrorleaf-app -- -D warnings`, with `CC_aarch64_linux_android` and `AR_aarch64_linux_android` pointing at the NDK's `aarch64-linux-android24-clang` and `llvm-ar` |
 | Phone logs | `adb logcat -s mirrorleaf` (the engine logs there; the push-woken job has no screen) |
@@ -32,6 +33,15 @@ Mirrorleaf keeps notes only on the user's own devices and syncs them device to d
 - Tauri's template targets Java 8: Kotlin helpers compiled for Java 11 (such as WorkManager's `OneTimeWorkRequestBuilder`) don't compile; use the plain builders.
 - `vendor/ndk-context` is a patched copy that allows a second initialisation (owner's decision). Don't remove the `[patch.crates-io]` entry.
 - The Android build uses the Gradle and Kotlin versions Tauri's template generated (owner's decision); don't upgrade them without asking.
+
+## Desktop app and screen (M5, ADR-006)
+
+- The screen is Svelte 5 in `apps/mirrorleaf/src`; the editor (TipTap 3, Yjs, the bridge to Rust) is `packages/editor`. Yjs updates and photo files travel as raw bytes (`open_note`, `edit_note`, `import_photo`), never JSON.
+- The engine's screen API is `crates/ffi/src/engine/screen.rs`; the Tauri commands are thin wrappers in `apps/mirrorleaf/src-tauri/src/commands.rs`.
+- The main window is built by the app (`"create": false`), so the agent can start at login without one. Closing it asks the screen to send its last edits (`will-close`, then `close_window`).
+- Photos show through the `mirrorleaf-blob` protocol (`src-tauri/src/photos.rs`); notes keep `mirrorleaf-blob://<full>?thumb=<thumbnail>`.
+- The macOS menu has no Undo or Redo items on purpose: they would catch ⌘Z before the editor's own undo.
+- Without screen access, check layouts with a headless browser and a stand-in for `window.__TAURI_INTERNALS__`; Brave's headless mode hangs here, Firefox's `--screenshot` works.
 
 ## Working on the 8 GB Mac
 

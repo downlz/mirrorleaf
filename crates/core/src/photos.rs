@@ -155,10 +155,16 @@ impl Replica {
         platform: Option<&dyn PlatformDecoder>,
     ) -> Result<PreparedPhoto> {
         let prepared = prepare(bytes, platform)?;
-        self.stage_blob(prepared.photo.full, &prepared.full)?;
-        self.stage_blob(prepared.photo.thumbnail, &prepared.thumbnail)?;
+        self.stage_photo(&prepared)?;
         self.add_photo(id, &prepared.photo, prepared.width, prepared.height)?;
         Ok(prepared)
+    }
+
+    /// Stages a prepared photo's full image and thumbnail for the blob store.
+    /// The editor (M5) then places the photo itself, where the cursor is.
+    pub fn stage_photo(&mut self, prepared: &PreparedPhoto) -> Result<()> {
+        self.stage_blob(prepared.photo.full, &prepared.full)?;
+        self.stage_blob(prepared.photo.thumbnail, &prepared.thumbnail)
     }
 }
 

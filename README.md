@@ -16,7 +16,7 @@ Mirrorleaf is a private notes app for rich text and photos. Notes live only on y
 | `crates/ffi` | The engine the apps drive, with its uniffi API for native code |
 | `crates/cli` | Headless peer for tests and measurements |
 | `crates/uniffi-bindgen` | Generates the engine's Kotlin bindings during the Android build |
-| `apps/mirrorleaf` | The Tauri app: a Phase 0 test screen, and the Android project with its Kotlin background code |
+| `apps/mirrorleaf` | The Tauri app: the notes screen (Svelte, one adaptive layout for desktop, tablet and phone), the desktop agent, and the Android project with its Kotlin background code |
 | `ledger/` | Sync-status service (axum and Postgres) |
 | `packages/editor` | TipTap editor and its bridge to Rust |
 | `vendor/ndk-context` | A patched copy of `ndk-context` (see its `Cargo.toml`) |
@@ -55,9 +55,26 @@ You need a physical Android phone with USB debugging on; Android 17 is the targe
    adb install -r gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
    ```
 
-The test screen joins a developer account from a ticket, registers with a ledger, and shows the device's sync status. Pushes from the ledger wake the app in the background; follow it with `adb logcat -s mirrorleaf`. The step-by-step test is in [docs/tests/m4-android-tests.md](docs/tests/m4-android-tests.md).
+The build bundles the notes screen first (`pnpm build`), so run `pnpm install` once beforehand. In Settings the app joins a developer account from a ticket, registers with a ledger, and shows the device's sync status. Pushes from the ledger wake the app in the background; follow it with `adb logcat -s mirrorleaf`. The step-by-step test is in [docs/tests/m4-android-tests.md](docs/tests/m4-android-tests.md). The full Android screen is M6.
 
-The macOS app is set up in M5.
+## Run the Mac app
+
+Needs the Mac setup above and the Tauri CLI (`cargo install tauri-cli --version 2.12.4 --locked`).
+
+```bash
+cd apps/mirrorleaf/src-tauri
+cargo tauri dev            # development: the screen reloads from Vite
+cargo tauri build --bundles app   # a release .app in target/release/bundle/macos/
+```
+
+- **First start:** open Settings (⌘, or the sliders button above the search field) and either start a new account or join one with a ticket from another device (`mirrorleaf-cli dev-account ticket` on the CLI, or Settings → Add a device… in another app).
+- **Finding and creating:** just start typing: the search field filters the notes, Enter opens the top match, and if no note has that title Enter creates one. ⌘K (Ctrl+K) goes back to the search field from anywhere; Esc in a note does too. Folders are the chips under the search field (+ adds one).
+- **Notes:** the first line of a note is its title. Type `/` for headings, lists, checklists, quotes, dividers and photos; **Aa** in the toolbar for paragraph styles and bold, italic, underline and strikethrough. Drop or paste photos into a note, including HEIC. Right-click a note or a folder chip (long-press on a touch screen) for pin, move, rename and delete.
+- **The agent:** closing the window leaves Mirrorleaf syncing from the menu bar (the leaf icon); its menu shows who it is syncing with and has **Quit Mirrorleaf**. "Open at login" is off until you turn it on in Settings → This computer (it stays off by default until the app has proved reliable). The Mac going to sleep tells the ledger this device is offline; waking it reconnects.
+- **Data:** `~/Library/Application Support/app.mirrorleaf`, the same layout as a CLI device folder, so `mirrorleaf-cli --dir ~/Library/Application\ Support/app.mirrorleaf status` works on it.
+- **Logs:** `cargo tauri dev` prints the engine's log; set `RUST_LOG` to change what it shows.
+
+CI builds an unsigned Apple silicon `.dmg` (checked against the 25 MB limit) and a Linux `.deb` for the second desktop peer. On Ubuntu, install the `.deb` with `sudo apt install ./Mirrorleaf_*.deb`; the menu-bar icon needs `libayatana-appindicator3-1`. The M5 test steps are in [docs/tests/m5-desktop-tests.md](docs/tests/m5-desktop-tests.md).
 
 ## Try the headless peer
 

@@ -4,7 +4,7 @@ use std::time::Duration;
 use mirrorleaf_proto::{Change, DeviceId, VersionVector};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use yrs::updates::decoder::Decode;
-use yrs::{Doc, Transact, Update};
+use yrs::{Doc, ReadTxn, StateVector, Transact, Update};
 
 use crate::blobs::record_refs;
 use crate::{CoreError, Result};
@@ -254,6 +254,44 @@ impl Replica {
             }
         }
         Ok(doc)
+    }
+
+    /// A document's whole state as one Yjs update, for an editor to start from
+    /// (plan §5.6).
+    pub fn doc_state(&self, doc_id: &str) -> Result<Vec<u8>> {
+        let doc = self.load_doc(doc_id)?;
+        let txn = doc.transact();
+        Ok(txn.encode_state_as_update_v1(&StateVector::default()))
+    }
+
+    /// The last row of the change log (0 if it is empty). An editor that opens
+    /// a document after reading this follows it with
+    /// [`Replica::doc_changes_after`].
+    pub fn last_row(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COALESCE(MAX(rowid), 0) FROM changes", [], |row| {
+                row.get(0)
+            })?)
+    }
+
+    /// Updates to `doc_id` that other devices made, stored after log row
+    /// `after`, and the row to continue from. The editor's own changes are left
+    /// out: it already has them.
+    pub fn doc_changes_after(&self, doc_id: &str, after: i64) -> Result<(Vec<Vec<u8>>, i64)> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT rowid, origin, update_v1 FROM changes
+             WHERE doc_id = ?1 AND rowid > ?2 ORDER BY rowid",
+        )?;
+        let mut rows = stmt.query(params![doc_id, after])?;
+        let (mut updates, mut cursor) = (Vec::new(), after);
+        while let Some(row) = rows.next()? {
+            cursor = row.get(0)?;
+            if device_id(row.get(1)?)? != self.device {
+                updates.push(row.get(2)?);
+            }
+        }
+        Ok((updates, cursor))
     }
 
     /// Number of rows in the change log.

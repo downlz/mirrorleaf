@@ -340,7 +340,7 @@ fn note(dir: &Path, cmd: Note) -> Result<()> {
                             photo.full.short()
                         );
                     }
-                    Block::Other(kind) => println!("{i}: [{kind}]"),
+                    Block::Other { kind, text } => println!("{i}: [{kind}] {text}"),
                 }
             }
         }

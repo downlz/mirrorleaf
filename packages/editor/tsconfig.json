@@ -1,4 +1,8 @@
 {
   "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // The cross-language test reads its fixtures with Node's fs.
+    "types": ["node"]
+  },
   "include": ["src"]
 }

@@ -1,0 +1,209 @@
+//! The Tauri commands the screen calls (M5). Each one is a thin wrapper around
+//! the engine (`mirrorleaf-ffi`), which owns the data and sync.
+//!
+//! Yjs updates travel as raw bytes, not JSON: `open_note` answers with the
+//! note's state, other devices' updates arrive on the note's channel, and
+//! `edit_note` and `import_photo` take their bytes as the request body
+//! (plan §5.6).
+
+use std::sync::Arc;
+
+use mirrorleaf_ffi::{Engine, EngineStatus, NoteList, PhotoInfo};
+use tauri::ipc::{Channel, InvokeBody, InvokeResponseBody, Request, Response};
+
+/// The header carrying the note an `edit_note` update belongs to.
+const NOTE_HEADER: &str = "x-mirrorleaf-note";
+
+type Result<T> = std::result::Result<T, String>;
+
+fn engine() -> Result<Arc<Engine>> {
+    Engine::get().ok_or_else(|| "the engine isn't open".to_owned())
+}
+
+fn text<E: ToString>(error: E) -> String {
+    error.to_string()
+}
+
+/// The raw body of a request that carries bytes.
+fn bytes(request: &Request<'_>) -> Result<Vec<u8>> {
+    match request.body() {
+        InvokeBody::Raw(bytes) => Ok(bytes.clone()),
+        InvokeBody::Json(_) => Err("expected raw bytes".to_owned()),
+    }
+}
+
+/// Starts live sync in the background, as opening the app does.
+fn go_live(engine: Arc<Engine>) {
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = engine.go_live().await {
+            tracing::warn!("live sync didn't start: {e}");
+        }
+    });
+}
+
+#[tauri::command]
+pub fn platform() -> &'static str {
+    std::env::consts::OS
+}
+
+#[tauri::command]
+pub fn status() -> Result<EngineStatus> {
+    engine()?.status().map_err(text)
+}
+
+#[tauri::command]
+pub fn create_account() -> Result<String> {
+    let engine = engine()?;
+    let created = engine.create_account().map_err(text)?;
+    go_live(engine);
+    Ok(created)
+}
+
+#[tauri::command]
+pub async fn ticket() -> Result<String> {
+    engine()?.ticket().await.map_err(text)
+}
+
+#[tauri::command]
+pub async fn join(ticket: String) -> Result<String> {
+    let engine = engine()?;
+    let joined = engine.clone().join(ticket).await.map_err(text)?;
+    go_live(engine);
+    Ok(joined)
+}
+
+#[tauri::command]
+pub async fn use_ledger(url: String) -> Result<String> {
+    engine()?.use_ledger(url).await.map_err(text)
+}
+
+/// The device to name in "Open Mirrorleaf on <name> to sync", once due.
+#[tauri::command]
+pub fn fallback_prompt() -> Option<String> {
+    Engine::get()?.fallback_prompt()
+}
+
+#[tauri::command]
+pub fn note_list() -> Result<NoteList> {
+    engine()?.note_list().map_err(text)
+}
+
+#[tauri::command]
+pub fn create_note(folder: Option<String>, title: Option<String>) -> Result<String> {
+    engine()?.create_note(folder, title).map_err(text)
+}
+
+#[tauri::command]
+pub fn trash_note(id: String) -> Result<()> {
+    engine()?.trash_note(&id).map_err(text)
+}
+
+#[tauri::command]
+pub fn restore_note(id: String) -> Result<()> {
+    engine()?.restore_note(&id).map_err(text)
+}
+
+#[tauri::command]
+pub fn set_pinned(id: String, pinned: bool) -> Result<()> {
+    engine()?.set_pinned(&id, pinned).map_err(text)
+}
+
+#[tauri::command]
+pub fn move_note(id: String, folder: Option<String>) -> Result<()> {
+    engine()?.move_note(&id, folder).map_err(text)
+}
+
+#[tauri::command]
+pub fn create_folder(name: String) -> Result<String> {
+    engine()?.create_folder(&name).map_err(text)
+}
+
+#[tauri::command]
+pub fn rename_folder(id: String, name: String) -> Result<()> {
+    engine()?.rename_folder(&id, &name).map_err(text)
+}
+
+#[tauri::command]
+pub fn delete_folder(id: String) -> Result<()> {
+    engine()?.delete_folder(&id).map_err(text)
+}
+
+#[tauri::command]
+pub fn set_note_meta(id: String, title: String, preview: String) -> Result<()> {
+    engine()?.set_note_meta(&id, &title, &preview).map_err(text)
+}
+
+/// Opens a note: answers with its whole state as one Yjs update, then sends
+/// other devices' updates to `updates` until another note is opened.
+#[tauri::command]
+pub fn open_note(id: String, updates: Channel<InvokeResponseBody>) -> Result<Response> {
+    let state = engine()?
+        .open_note(&id, move |update| {
+            let _ = updates.send(InvokeResponseBody::Raw(update));
+        })
+        .map_err(text)?;
+    Ok(Response::new(state))
+}
+
+#[tauri::command]
+pub fn close_note() -> Result<()> {
+    engine()?.close_note().map_err(text)
+}
+
+/// One Yjs update from the editor, as the raw body, for the note named in the
+/// `x-mirrorleaf-note` header.
+#[tauri::command]
+pub fn edit_note(request: Request<'_>) -> Result<()> {
+    let note = request
+        .headers()
+        .get(NOTE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .ok_or("no note given")?
+        .to_owned();
+    engine()?.edit_note(&note, bytes(&request)?).map_err(text)
+}
+
+#[tauri::command]
+pub fn flush_edits() -> Result<()> {
+    engine()?.flush_edits().map_err(text)
+}
+
+/// A photo file's bytes as the raw body: prepared and staged, ready for the
+/// editor to place.
+#[tauri::command]
+pub async fn import_photo(request: Request<'_>) -> Result<PhotoInfo> {
+    let photo = bytes(&request)?;
+    engine()?.import_photo(photo).await.map_err(text)
+}
+
+/// The screen has sent its last edits after `will-close`: close its window.
+#[tauri::command]
+pub fn close_window(window: tauri::WebviewWindow) {
+    #[cfg(desktop)]
+    crate::desktop::close_window(&window);
+    #[cfg(mobile)]
+    let _ = window;
+}
+
+/// Whether the desktop agent starts at login. Always false on Android.
+#[tauri::command]
+pub fn autostart(app: tauri::AppHandle) -> bool {
+    #[cfg(desktop)]
+    return crate::desktop::autostart_enabled(&app);
+    #[cfg(mobile)]
+    {
+        let _ = app;
+        false
+    }
+}
+
+#[tauri::command]
+pub fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<()> {
+    #[cfg(desktop)]
+    return crate::desktop::set_autostart(&app, enabled);
+    #[cfg(mobile)]
+    {
+        let _ = (app, enabled);
+        Err("not available on this device".to_owned())
+    }
+}

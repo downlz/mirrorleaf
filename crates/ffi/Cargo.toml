@@ -18,6 +18,10 @@ tokio.workspace = true
 tracing.workspace = true
 uniffi.workspace = true
 
+[dev-dependencies]
+# Makes a small test photo.
+image.workspace = true
+
 # Android startup (ADR-005): Iroh's network code reads Android's context through
 # ndk-context, and HTTPS certificate checks call Android's verifier through JNI.
 [target.'cfg(target_os = "android")'.dependencies]

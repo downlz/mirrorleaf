@@ -1,14 +1,23 @@
-// The TipTap editor and its Tauri bridge arrive in M5 (implementation plan §5.6).
+// The Mirrorleaf editor: TipTap 3 with Yjs, and its bridge to the Rust engine
+// (implementation plan §4, §5.6).
 
-/** URL scheme a note uses to reference a photo in the blob store (plan §5.1). */
-export const BLOB_SCHEME = 'mirrorleaf-blob';
-
-const BLAKE3_HEX = /^[0-9a-f]{64}$/;
-
-/** Builds the reference a note stores for a photo, from its BLAKE3 hash in lower-case hex. */
-export function blobRef(hash: string): string {
-  if (!BLAKE3_HEX.test(hash)) {
-    throw new Error(`not a BLAKE3 hash: ${hash}`);
-  }
-  return `${BLOB_SCHEME}://${hash}`;
-}
+export { CONTENT_FIELD, openNote } from './editor';
+export type { NoteBridge, NoteEditor, OpenNoteOptions } from './editor';
+export {
+  BLOCK_STYLES,
+  blockStyle,
+  formatState,
+  setBlockStyle,
+  toggleList,
+  toggleMark,
+  toggleQuote,
+} from './formatting';
+export type { BlockStyle, FormatState, ListKind, MarkName } from './formatting';
+export { noteMeta, PREVIEW_CHARS } from './meta';
+export type { NoteMeta } from './meta';
+export type { PhotoAttrs } from './photo';
+export { BLOB_SCHEME, blobRef, parsePhotoSrc, photoUrl } from './photo-src';
+export type { PhotoHashes } from './photo-src';
+export { filterSlashItems, slashItems } from './slash';
+export type { SlashItem } from './slash';
+export { NOTE_HEADER, tauriBridge } from './tauri-bridge';
