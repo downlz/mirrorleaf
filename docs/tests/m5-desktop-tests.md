@@ -145,7 +145,7 @@ No screen access was available to Claude, so the window itself wasn't driven; ev
 | Memory, release build (no link-time optimisation), started as at login with `--background`, so no window ever opened; live sync connected to the peer | **14 MB** physical footprint (Activity Monitor's figure) at 30 s, 2 min and 5 min; 0–0.2% CPU; 21 threads; no WebKit processes. Resident size reads 86 MB, almost all of it macOS framework code shared with other apps. |
 | The same release process after its window was opened (a second launch, which single-instance turns into "show the window") | App 25 MB, 27 threads; WebKit's page process 51 MB, graphics 12 MB, network 7 MB: about 95 MB in all while the window is open. The second launch exited at once. |
 | For comparison: the sync engine alone (release CLI `sync --watch`, idle) | 7.9–8.8 MB |
-| Installer size | `.app` 26.8 MiB without link-time optimisation; as a compressed disk image 12.1 MiB (gate 25 MB) |
+| Installer size | `.app` 26.8 MiB without link-time optimisation; as a compressed disk image 12.1 MiB. **CI's release `.dmg` (M5 run, 4 Nov): 10.3 MB** (gate 25 MB) |
 | Start at login during these tests | Not registered |
 
 ### On the Mac and the Ubuntu machine (owner)

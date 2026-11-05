@@ -54,18 +54,18 @@
   }
 
   function keydown(event: KeyboardEvent) {
-    if (event.key === 'Escape') app.settings = false;
+    if (event.key === 'Escape') app.closeSettings();
   }
 </script>
 
 <svelte:window onkeydown={keydown} />
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="scrim" onpointerdown={() => (app.settings = false)}></div>
+<div class="scrim" onpointerdown={() => app.closeSettings()}></div>
 <div class="sheet" role="dialog" aria-modal="true" aria-label="Settings">
   <header class="sheet-header">
     <h1 class="grow">Settings</h1>
-    <button class="icon-button" title="Close" onclick={() => (app.settings = false)}>
+    <button class="icon-button" title="Close" onclick={() => app.closeSettings()}>
       <Icon name="close" />
     </button>
   </header>

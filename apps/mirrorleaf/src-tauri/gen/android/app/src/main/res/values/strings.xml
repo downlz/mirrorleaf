@@ -14,4 +14,7 @@
          (ADR-004, gap 3). It can't name a device: the ledger can't read device names. -->
     <string name="sync_fallback_title">Mirrorleaf</string>
     <string name="sync_fallback_body">You have changes waiting to sync. Open Mirrorleaf to send them.</string>
+
+    <!-- Share → Mirrorleaf (plan M6). -->
+    <string name="share_failed">Couldn\'t make a note from what you shared.</string>
 </resources>

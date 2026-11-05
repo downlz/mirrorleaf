@@ -17,8 +17,10 @@ use mirrorleaf_proto::ledger::{Platform, StatusResponse};
 use tokio::runtime::Runtime;
 use tracing::{info, warn};
 
+mod native;
 mod screen;
 
+pub use native::{DecodedPixels, PhotoDecoder};
 use screen::OpenNote;
 pub use screen::{FolderItem, NoteItem, NoteList, PhotoInfo, UiEvent};
 
@@ -144,6 +146,10 @@ pub struct Engine {
     editor: Mutex<Option<OpenNote>>,
     /// How the screen hears that something changed.
     ui: Mutex<Option<screen::Listener>>,
+    /// The platform's photo decoder, set by native code (Android, M6).
+    decoder: Mutex<Option<Arc<dyn mirrorleaf_core::photos::PlatformDecoder>>>,
+    /// A note the screen should open when it can (one shared from another app).
+    pending_open: Mutex<Option<String>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -320,6 +326,8 @@ impl Engine {
             flushing: AtomicBool::new(false),
             editor: Mutex::default(),
             ui: Mutex::default(),
+            decoder: Mutex::default(),
+            pending_open: Mutex::default(),
         })
     }
 

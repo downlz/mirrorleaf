@@ -242,9 +242,11 @@ h3 {
   color: var(--muted);
 }
 
-.icon-button:hover {
-  background: var(--hover);
-  color: var(--text);
+@media (hover: hover) {
+  .icon-button:hover {
+    background: var(--hover);
+    color: var(--text);
+  }
 }
 
 .icon-button.on {
@@ -289,8 +291,10 @@ button.link {
   min-height: var(--tap);
 }
 
-.sync-status:hover {
-  background: var(--hover);
+@media (hover: hover) {
+  .sync-status:hover {
+    background: var(--hover);
+  }
 }
 
 .sync-text {
@@ -376,8 +380,10 @@ kbd {
   white-space: nowrap;
 }
 
-.chip:hover {
-  border-color: var(--faint);
+@media (hover: hover) {
+  .chip:hover {
+    border-color: var(--faint);
+  }
 }
 
 .chip[aria-pressed='true'] {
@@ -427,8 +433,10 @@ kbd {
   min-height: calc(var(--row) + 24px);
 }
 
-.note-row:hover {
-  background: var(--hover);
+@media (hover: hover) {
+  .note-row:hover {
+    background: var(--hover);
+  }
 }
 
 .note-row.current {

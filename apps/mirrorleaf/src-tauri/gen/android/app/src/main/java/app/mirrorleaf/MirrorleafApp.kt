@@ -26,6 +26,8 @@ class MirrorleafApp : Application() {
         System.loadLibrary("mirrorleaf_app_lib")
         MirrorleafNative.init(this)
         engine = Engine.open(File(filesDir, "mirrorleaf").path, deviceName())
+        // HEIC and AVIF photos are decoded by Android (plan §5.5, M6).
+        engine.setPhotoDecoder(PhotoDecoding)
         Notifications.createChannels(this)
         engine.setNotifications(Notifications.allowed(this))
         registerForPushes()

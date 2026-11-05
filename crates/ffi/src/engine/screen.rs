@@ -35,6 +35,8 @@ pub enum UiEvent {
     PhotoArrived { hash: String },
     /// Connections or the ledger's answer changed.
     StatusChanged,
+    /// A note was made outside the screen (shared from another app): open it.
+    OpenNote { id: String },
 }
 
 pub(super) type Listener = Arc<dyn Fn(UiEvent) + Send + Sync>;
@@ -369,9 +371,9 @@ impl Engine {
     pub async fn import_photo(self: Arc<Self>, bytes: Vec<u8>) -> Result<PhotoInfo, EngineError> {
         let prepared = self
             .runtime
-            .spawn_blocking(move || {
-                let decoder = photos::system_decoder();
-                photos::prepare(&bytes, decoder.as_deref())
+            .spawn_blocking({
+                let decoder = self.decoder();
+                move || photos::prepare(&bytes, decoder.as_deref())
             })
             .await
             .map_err(|e| EngineError::Failed(format!("photo import failed: {e}")))??;

@@ -64,6 +64,8 @@ class AppState {
     photo?: (hash: string) => void;
     /** Puts the cursor in the open note. */
     focus?: () => void;
+    /** Sends the open note's waiting edits now. */
+    flush?: () => Promise<void>;
   } = {};
   /** Set by the stream: puts the cursor in the search field (not reactive). */
   focusSearch?: (selectAll?: boolean) => void;
@@ -74,6 +76,7 @@ class AppState {
     this.platform = await api.platform();
     await Promise.all([this.refresh(), this.loadStatus()]);
     if (this.layout !== 'narrow') this.selectFirst();
+    await this.openShared();
   }
 
   async refresh() {
@@ -118,7 +121,7 @@ class AppState {
   openView(view: View) {
     this.view = view;
     this.search = '';
-    if (this.layout === 'narrow') this.pane = 'list';
+    if (this.layout === 'narrow') this.closeOverlay('note');
     else this.selectFirst();
   }
 
@@ -128,18 +131,73 @@ class AppState {
 
   select(id: string) {
     this.selectedId = id;
-    if (this.layout === 'narrow') this.pane = 'note';
+    if (this.layout === 'narrow') this.showSheet();
+  }
+
+  // The note sheet and Settings each add a history entry, so Android's back
+  // gesture (which goes back in the web view) closes the newest one (M6).
+  // Closing them from the screen goes back through history too.
+  private overlays: ('note' | 'settings')[] = [];
+
+  private pushOverlay(kind: 'note' | 'settings') {
+    if (this.overlays.includes(kind)) return;
+    this.overlays.push(kind);
+    history.pushState({ mirrorleaf: kind }, '');
+  }
+
+  private showSheet() {
+    this.pane = 'note';
+    this.pushOverlay('note');
+  }
+
+  openSettings() {
+    this.settings = true;
+    this.pushOverlay('settings');
+  }
+
+  closeSettings() {
+    this.closeOverlay('settings');
   }
 
   /** Closes the note sheet on a phone-sized screen. */
   back() {
-    this.pane = 'list';
+    this.closeOverlay('note');
+  }
+
+  private closeOverlay(kind: 'note' | 'settings') {
+    if (this.overlays.at(-1) === kind) {
+      history.back();
+    } else {
+      this.overlays = this.overlays.filter((k) => k !== kind);
+      this.close(kind);
+    }
+  }
+
+  private close(kind: 'note' | 'settings') {
+    if (kind === 'note') this.pane = 'list';
+    else this.settings = false;
+  }
+
+  /** The back gesture, or a close that went through history. */
+  onPopState() {
+    const kind = this.overlays.pop();
+    if (kind) this.close(kind);
+  }
+
+  /** Opens a note that was made outside the screen (shared from another app). */
+  async openShared() {
+    const id = await this.run(api.takePendingOpen);
+    if (!id) return;
+    await this.refresh();
+    this.view = { kind: 'all' };
+    this.search = '';
+    this.select(id);
   }
 
   /** Opens a note and puts the cursor in it. */
   openAndFocus(id: string) {
     if (this.selectedId === id && this.editorHooks.focus) {
-      if (this.layout === 'narrow') this.pane = 'note';
+      if (this.layout === 'narrow') this.showSheet();
       this.editorHooks.focus();
       return;
     }

@@ -34,6 +34,7 @@
       onEngineEvent((event) => {
         if (event.kind === 'notes_changed') refreshSoon();
         else if (event.kind === 'status_changed') void app.loadStatus();
+        else if (event.kind === 'open_note') void app.openShared();
         else app.editorHooks.photo?.(event.hash);
       }),
       // The window is closing: send the editor's last edits first.
@@ -44,9 +45,19 @@
     ];
     const resize = () => (app.width = window.innerWidth);
     window.addEventListener('resize', resize);
+    // Android's back gesture closes the note sheet or Settings.
+    const popstate = () => app.onPopState();
+    window.addEventListener('popstate', popstate);
+    // Going to the background (Android) or hidden: send waiting edits now.
+    const hidden = () => {
+      if (document.visibilityState === 'hidden') void app.editorHooks.flush?.();
+    };
+    document.addEventListener('visibilitychange', hidden);
     return () => {
       clearInterval(timer);
       window.removeEventListener('resize', resize);
+      window.removeEventListener('popstate', popstate);
+      document.removeEventListener('visibilitychange', hidden);
       for (const off of unlisten) void off.then((fn) => fn());
     };
   });
@@ -68,7 +79,7 @@
         void app.newNote();
       } else if (event.key === ',') {
         event.preventDefault();
-        app.settings = true;
+        app.openSettings();
       }
       return;
     }

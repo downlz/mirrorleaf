@@ -1,3 +1,31 @@
+<script lang="ts" module>
+  import type { NoteEditor as Editor } from '@mirrorleaf/editor';
+
+  // The cursor of the note last closed. Rotating a phone or resizing a window
+  // across a layout boundary closes the note view and opens another, so the
+  // cursor (and the keyboard) come back where they were (M6, Android test 2).
+  const KEEP_FOCUS_MS = 2000;
+  let last: { id: string; from: number; to: number; focused: boolean; at: number } | null = null;
+
+  function remember(editor: Editor) {
+    const { from, to } = editor.editor.state.selection;
+    last = { id: editor.id, from, to, focused: editor.editor.isFocused, at: Date.now() };
+  }
+
+  function restore(editor: Editor) {
+    const saved = last;
+    last = null;
+    if (!saved || saved.id !== editor.id) return;
+    const size = editor.editor.state.doc.content.size;
+    const range = { from: Math.min(saved.from, size), to: Math.min(saved.to, size) };
+    if (saved.focused && Date.now() - saved.at < KEEP_FOCUS_MS) {
+      editor.editor.chain().setTextSelection(range).focus().run();
+    } else {
+      editor.editor.commands.setTextSelection(range);
+    }
+  }
+</script>
+
 <script lang="ts">
   import {
     BLOCK_STYLES,
@@ -33,6 +61,7 @@
     const closing = current;
     current = null;
     format = null;
+    if (closing) remember(closing);
     return closing ? closing.close().catch((e) => app.fail(e)) : Promise.resolve();
   }
 
@@ -55,6 +84,8 @@
         if (app.fresh === id) {
           app.fresh = null;
           current.editor.commands.focus('end');
+        } else {
+          restore(current);
         }
       } catch (error) {
         app.fail(error);
@@ -72,6 +103,7 @@
     close: () => (queue = queue.then(closeCurrent)),
     photo: (hash) => current?.refreshPhoto(hash),
     focus: () => current?.editor.commands.focus('end'),
+    flush: () => current?.flush() ?? Promise.resolve(),
   };
 
   onDestroy(() => {
@@ -117,7 +149,12 @@
       >
         <Icon name="checklist" />
       </button>
-      <button class="icon-button" title="Add photos" onclick={() => current?.pickPhotos()}>
+      <button
+        class="icon-button"
+        title="Add photos"
+        onpointerdown={keepFocus}
+        onclick={() => current?.pickPhotos()}
+      >
         <Icon name="photo" />
       </button>
     {/if}

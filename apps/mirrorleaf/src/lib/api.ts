@@ -47,7 +47,10 @@ export interface NoteList {
 }
 
 export type EngineEvent =
-  { kind: 'notes_changed' } | { kind: 'photo_arrived'; hash: string } | { kind: 'status_changed' };
+  | { kind: 'notes_changed' }
+  | { kind: 'photo_arrived'; hash: string }
+  | { kind: 'status_changed' }
+  | { kind: 'open_note'; id: string };
 
 export const api = {
   platform: () => invoke<string>('platform'),
@@ -71,6 +74,7 @@ export const api = {
     invoke<void>('set_note_meta', { id, title, preview }),
   flushEdits: () => invoke<void>('flush_edits'),
   closeWindow: () => invoke<void>('close_window'),
+  takePendingOpen: () => invoke<string | null>('take_pending_open'),
   autostart: () => invoke<boolean>('autostart'),
   setAutostart: (enabled: boolean) => invoke<void>('set_autostart', { enabled }),
 };

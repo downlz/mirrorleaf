@@ -24,11 +24,21 @@ fn text<E: ToString>(error: E) -> String {
     error.to_string()
 }
 
-/// The raw body of a request that carries bytes.
+/// The bytes a request carries. On the desktop they arrive raw. On Android
+/// the web view can't send a request body, so Tauri sends the call as JSON and
+/// the bytes arrive as an array of numbers (M6).
 fn bytes(request: &Request<'_>) -> Result<Vec<u8>> {
     match request.body() {
         InvokeBody::Raw(bytes) => Ok(bytes.clone()),
-        InvokeBody::Json(_) => Err("expected raw bytes".to_owned()),
+        InvokeBody::Json(serde_json::Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_u64()
+                    .and_then(|n| u8::try_from(n).ok())
+                    .ok_or_else(|| "expected bytes".to_owned())
+            })
+            .collect(),
+        InvokeBody::Json(_) => Err("expected bytes".to_owned()),
     }
 }
 
@@ -161,6 +171,24 @@ pub fn edit_note(request: Request<'_>) -> Result<()> {
         .ok_or("no note given")?
         .to_owned();
     engine()?.edit_note(&note, bytes(&request)?).map_err(text)
+}
+
+/// Android: picks photos with the system's photo picker and prepares them,
+/// ready for the editor to place. Empty if the user cancelled.
+#[tauri::command]
+pub async fn pick_photos(app: tauri::AppHandle) -> Result<Vec<PhotoInfo>> {
+    let paths = crate::picker::pick(&app).await?;
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    engine()?.import_photo_files(paths).await.map_err(text)
+}
+
+/// The note to open because it was made outside the screen (shared from
+/// another app), once.
+#[tauri::command]
+pub fn take_pending_open() -> Option<String> {
+    Engine::get()?.take_pending_open()
 }
 
 #[tauri::command]

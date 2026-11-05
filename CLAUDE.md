@@ -34,6 +34,16 @@ Mirrorleaf keeps notes only on the user's own devices and syncs them device to d
 - `vendor/ndk-context` is a patched copy that allows a second initialisation (owner's decision). Don't remove the `[patch.crates-io]` entry.
 - The Android build uses the Gradle and Kotlin versions Tauri's template generated (owner's decision); don't upgrade them without asking.
 
+## Android screen (M6, ADR-007)
+
+- On Android, Tauri sends every call from the screen as JSON (the WebView can't send a request body), so bytes arrive as arrays of numbers: commands taking bytes must accept both (`commands::bytes`). Never send photos or other large data through the web view on Android: the photo button uses `PhotoPickerPlugin` (Kotlin), which hands Rust file paths.
+- HEIC and AVIF are decoded by Android's `ImageDecoder` through the engine's `PhotoDecoder` callback (`PhotoDecoding.kt`), set in `MirrorleafApp.onCreate`.
+- `MainActivity` pads the content view by the system bars, cutout and keyboard; don't rely on CSS `safe-area-inset` on Android.
+- The back gesture closes the note sheet and Settings through browser history (`AppState.onPopState`); open and close them with `select`/`back` and `openSettings`/`closeSettings`, never by setting the state directly.
+- Share → Mirrorleaf: `MainActivity.receiveShare` → `Engine::share_into_note` → the screen opens the note (`open_note` event, `take_pending_open`).
+- Android keyboards: ProseMirror on Chrome Android reads Enter from the text change and simulates keys after the keyboard's input (`readDOMChange`, the `deleteContentBackward` workaround). Anything that changes the note in response to the keyboard must allow for that; see the slash menu's `beforeinput` handling in `packages/editor/src/slash.ts`.
+- Drive the phone from the Mac with `adb exec-out screencap -p`, `adb shell input tap|text|keyevent` and `adb shell am start -a android.intent.action.SEND …`. Debug builds expose the web view's debugger: `adb forward tcp:9333 localabstract:webview_devtools_remote_<pid>`, then the DevTools protocol on `localhost:9333`. Before tapping, check the app is in front (`dumpsys window | grep mCurrentFocus`): the owner may be using the phone.
+
 ## Desktop app and screen (M5, ADR-006)
 
 - The screen is Svelte 5 in `apps/mirrorleaf/src`; the editor (TipTap 3, Yjs, the bridge to Rust) is `packages/editor`. Yjs updates and photo files travel as raw bytes (`open_note`, `edit_note`, `import_photo`), never JSON.

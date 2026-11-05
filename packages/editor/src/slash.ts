@@ -1,5 +1,5 @@
 import { Extension, type Editor, type Range } from '@tiptap/core';
-import { PluginKey } from '@tiptap/pm/state';
+import { Plugin, PluginKey } from '@tiptap/pm/state';
 import Suggestion, { type SuggestionKeyDownProps, type SuggestionProps } from '@tiptap/suggestion';
 
 /** One entry of the slash menu (Notion-style, owner's choice for M5). */
@@ -117,12 +117,16 @@ export interface SlashOptions {
 /** Typing "/" opens a menu of blocks to insert. */
 export const SlashCommand = Extension.create<SlashOptions>({
   name: 'slashCommand',
+  // Before the list extensions, so Enter with the menu open chooses an item
+  // rather than splitting a list item.
+  priority: 1000,
 
   addOptions() {
     return { items: () => [] };
   },
 
   addProseMirrorPlugins() {
+    const menu = slashMenu();
     return [
       Suggestion<SlashItem, SlashItem>({
         editor: this.editor,
@@ -131,21 +135,57 @@ export const SlashCommand = Extension.create<SlashOptions>({
         allowSpaces: false,
         items: ({ query }) => filterSlashItems(this.options.items(), query),
         command: ({ editor, range, props }) => props.run(editor, range),
-        render: slashMenu,
+        render: () => menu,
+      }),
+      // On Android, ProseMirror ignores the keyboard's Enter key press (it
+      // tangles with composition) and reads the new line from the text change
+      // instead, so the menu's Enter handling never runs. Catch that change
+      // while the menu is open and choose the item instead (M6, Android test 2).
+      new Plugin({
+        key: new PluginKey('slashEnter'),
+        props: {
+          // ProseMirror on Chrome Android simulates an Enter when the cursor
+          // moves just after the keyboard's Enter, which the chosen item
+          // does; that second Enter would undo it (an empty checklist item
+          // left again). Swallow it.
+          handleKeyDown: (_view, event) => event.key === 'Enter' && menu.justChose(),
+          handleDOMEvents: {
+            beforeinput: (_view, event) => {
+              const type = (event as InputEvent).inputType;
+              if (type !== 'insertParagraph' && type !== 'insertLineBreak') return false;
+              if (!menu.isOpen()) return false;
+              event.preventDefault();
+              // Choose a moment later. The keyboard may have just changed the
+              // text (Gboard's autocorrect), which ProseMirror reads 20 ms on;
+              // changing the note before then loses that read, and ProseMirror's
+              // Chrome Android workaround then simulates a Backspace that undoes
+              // the chosen block.
+              menu.armChoice();
+              setTimeout(() => menu.chooseSelected(), CHOOSE_AFTER_MS);
+              return true;
+            },
+          },
+        },
       }),
     ];
   },
 });
+
+/** How long after Android's Enter the highlighted item is chosen (see `beforeinput`). */
+const CHOOSE_AFTER_MS = 40;
 
 /** The menu itself: plain DOM, so the editor package needs no UI framework. */
 function slashMenu() {
   let menu: HTMLDivElement | null = null;
   let props: SuggestionProps<SlashItem, SlashItem> | null = null;
   let selected = 0;
+  let chosenAt = 0;
 
   const choose = (index: number) => {
     const item = props?.items[index];
-    if (item && props) props.command(item);
+    if (!item || !props) return;
+    chosenAt = Date.now();
+    props.command(item);
   };
 
   const draw = () => {
@@ -193,6 +233,23 @@ function slashMenu() {
   };
 
   return {
+    /** Whether an item was chosen, or is about to be, in the last moment (see `handleKeyDown`). */
+    justChose(): boolean {
+      return Date.now() - chosenAt < 200;
+    },
+    isOpen(): boolean {
+      return Boolean(menu && props?.items.length);
+    },
+    /** Counts a choice as made now, ahead of the delayed choose. */
+    armChoice() {
+      chosenAt = Date.now();
+    },
+    /** Chooses the highlighted item, if the menu is open. */
+    chooseSelected(): boolean {
+      if (!menu || !props?.items[selected]) return false;
+      choose(selected);
+      return true;
+    },
     onStart(start: SuggestionProps<SlashItem, SlashItem>) {
       props = start;
       selected = 0;

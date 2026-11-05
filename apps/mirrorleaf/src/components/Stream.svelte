@@ -168,7 +168,7 @@
   <header class="pane-header" data-tauri-drag-region>
     <span class="grow" data-tauri-drag-region></span>
     <SyncStatus />
-    <button class="icon-button" title="Settings" onclick={() => (app.settings = true)}>
+    <button class="icon-button" title="Settings" onclick={() => app.openSettings()}>
       <Icon name="settings" />
     </button>
     <button class="icon-button" title="New note" onclick={() => void app.newNote()}>

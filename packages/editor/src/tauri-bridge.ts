@@ -9,6 +9,9 @@ import { BLOB_SCHEME } from './photo-src';
 /** The header naming the note an `edit_note` update belongs to. */
 export const NOTE_HEADER = 'x-mirrorleaf-note';
 
+/** Android's web view sends data to Rust as JSON, so photos go through the system's picker (M6). */
+const android = typeof navigator !== 'undefined' && /Android/i.test(navigator.userAgent);
+
 export const tauriBridge: NoteBridge = {
   async open(id, onRemote) {
     const updates = new Channel<ArrayBuffer>();
@@ -23,4 +26,5 @@ export const tauriBridge: NoteBridge = {
     return invoke<PhotoAttrs>('import_photo', bytes);
   },
   photoBase: () => convertFileSrc('', BLOB_SCHEME),
+  ...(android ? { pickPhotos: () => invoke<PhotoAttrs[]>('pick_photos') } : {}),
 };

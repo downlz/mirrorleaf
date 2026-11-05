@@ -34,6 +34,11 @@ export interface NoteBridge {
   close(): Promise<void>;
   /** Prepares a photo file in the engine, ready to place. */
   importPhoto(file: File): Promise<PhotoAttrs>;
+  /**
+   * Picks photos with the system's own picker and prepares them, where the
+   * platform has one (Android); otherwise the editor shows a file dialog.
+   */
+  pickPhotos?(): Promise<PhotoAttrs[]>;
   /** The base address of the photo protocol. */
   photoBase(): string;
 }
@@ -59,6 +64,8 @@ export interface NoteEditor {
   /** Reloads a photo whose full image has just arrived. */
   refreshPhoto(fullHash: string): void;
   meta(): NoteMeta;
+  /** Sends the edits still waiting to the engine now (the app is going to the background). */
+  flush(): Promise<void>;
   /** Sends what's waiting, stops listening and frees the editor. */
   close(): Promise<void>;
 }
@@ -104,18 +111,22 @@ export async function openNote(options: OpenNoteOptions): Promise<NoteEditor> {
   };
 
   const base = bridge.photoBase();
-  const insertPhotos = async (files: File[], at?: number) => {
+  /** Places a photo at `at`, at the cursor, or at the end with `'end'`. */
+  const place = (photo: PhotoAttrs, at?: number | 'end') => {
+    if (editor.isDestroyed) return;
+    const chain = editor.chain().focus();
+    if (at === 'end') chain.setTextSelection(editor.state.doc.content.size);
+    else if (at !== undefined) chain.setTextSelection(at);
+    chain.insertContent({ type: 'image', attrs: photo }).run();
+    // A photo at the end gets a line after it to carry on typing.
+    if (editor.state.doc.lastChild?.type.name === 'image') {
+      editor.commands.insertContentAt(editor.state.doc.content.size, { type: 'paragraph' });
+    }
+  };
+  const insertPhotos = async (files: File[], at?: number | 'end') => {
     for (const file of files.filter(isImage)) {
       try {
-        const photo = await bridge.importPhoto(file);
-        if (editor.isDestroyed) return;
-        const chain = editor.chain().focus();
-        if (at !== undefined) chain.setTextSelection(at);
-        chain.insertContent({ type: 'image', attrs: photo }).run();
-        // A photo at the end gets a line after it to carry on typing.
-        if (editor.state.doc.lastChild?.type.name === 'image') {
-          editor.commands.insertContentAt(editor.state.doc.content.size, { type: 'paragraph' });
-        }
+        place(await bridge.importPhoto(file), at);
         at = undefined;
       } catch (error) {
         onError(error);
@@ -123,11 +134,21 @@ export async function openNote(options: OpenNoteOptions): Promise<NoteEditor> {
     }
   };
   const pickPhotos = () => {
+    // Without a cursor in the note (it was never tapped), photos go at the
+    // end rather than above the title.
+    const where = editor.isFocused ? undefined : 'end';
+    if (bridge.pickPhotos) {
+      bridge
+        .pickPhotos()
+        .then((photos) => photos.forEach((photo) => place(photo, where)))
+        .catch(onError);
+      return;
+    }
     const input = document.createElement('input');
     input.type = 'file';
     input.accept = 'image/*,.heic,.heif';
     input.multiple = true;
-    input.addEventListener('change', () => void insertPhotos(Array.from(input.files ?? [])));
+    input.addEventListener('change', () => void insertPhotos(Array.from(input.files ?? []), where));
     input.click();
   };
   const droppedImages = (files: FileList | undefined | null) =>
@@ -182,6 +203,13 @@ export async function openNote(options: OpenNoteOptions): Promise<NoteEditor> {
     onTransaction: ({ editor }) => options.onFormat?.(formatState(editor)),
   });
 
+  // When the on-screen keyboard opens, the view shrinks; keep the cursor in sight.
+  const viewport = typeof window === 'undefined' ? undefined : window.visualViewport;
+  const keepCursorInView = () => {
+    if (!editor.isDestroyed && editor.isFocused) editor.commands.scrollIntoView();
+  };
+  viewport?.addEventListener('resize', keepCursorInView);
+
   return {
     id,
     editor,
@@ -195,7 +223,12 @@ export async function openNote(options: OpenNoteOptions): Promise<NoteEditor> {
       }
     },
     meta: () => noteMeta(editor.state.doc),
+    flush() {
+      reportMeta();
+      return send();
+    },
     async close() {
+      viewport?.removeEventListener('resize', keepCursorInView);
       reportMeta();
       await send();
       editor.destroy();

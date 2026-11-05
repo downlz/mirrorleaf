@@ -10,6 +10,7 @@ mod commands;
 #[cfg(desktop)]
 mod desktop;
 mod photos;
+mod picker;
 #[cfg(target_os = "macos")]
 mod power;
 mod window;
@@ -27,6 +28,8 @@ pub fn run() {
     let builder = desktop::plugins(builder)
         .on_menu_event(desktop::on_menu_event)
         .on_window_event(desktop::on_window_event);
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(picker::init());
     let app = builder
         .register_asynchronous_uri_scheme_protocol(photos::SCHEME, photos::handle)
         .setup(|app| {
@@ -61,6 +64,8 @@ pub fn run() {
             commands::flush_edits,
             commands::close_window,
             commands::import_photo,
+            commands::pick_photos,
+            commands::take_pending_open,
             commands::autostart,
             commands::set_autostart,
         ])

@@ -14,7 +14,7 @@
   });
 </script>
 
-<button class="sync-status" title="Sync settings" onclick={() => (app.settings = true)}>
+<button class="sync-status" title="Sync settings" onclick={() => app.openSettings()}>
   <span class="dot {summary.tone}"></span>
   <span class="sync-text">{summary.text}</span>
 </button>
