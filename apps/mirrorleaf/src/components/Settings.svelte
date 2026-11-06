@@ -3,6 +3,7 @@
   import { api } from '../lib/api';
   import { app } from '../lib/state.svelte';
   import Icon from './Icon.svelte';
+  import SyncStatus from './SyncStatus.svelte';
 
   // Phase 0's developer account (plan §5.4). Real pairing with QR codes, the
   // recovery kit and app lock replace this in Phase 1 (E1–E4).
@@ -74,6 +75,7 @@
     {#if status}
       <section>
         <h2>Sync</h2>
+        <SyncStatus />
         {#if !status.account}
           <p class="hint">
             Notes sync only between your own devices. Start an account on your first device, then

@@ -210,9 +210,10 @@ jobs:
           CARGO_PROFILE_RELEASE_STRIP: debuginfo
         run: cargo tauri android build --target ${{ matrix.target }} --apk --split-per-abi --ci
       # The APK stores the native library uncompressed (Android maps it straight from
-      # the APK), so the file is about twice what a store download sends. The gate
-      # applies to the download, estimated as the APK compressed with gzip -9.
-      - name: Download size (gate ≤ 25 MB)
+      # the APK), so the file is about twice what a store download sends (estimated
+      # as the APK compressed with gzip -9). Owner, 6 Nov 2026: size isn't a hard
+      # gate while both stay within 30–40 MB, so CI fails only above 40 MB.
+      - name: APK and download size (limit 40 MB each)
         run: |
           apk=$(find apps/mirrorleaf/src-tauri/gen/android/app/build/outputs/apk -name '*release*.apk' | head -n 1)
           test -n "$apk"
@@ -220,8 +221,9 @@ jobs:
           download=$(gzip -9 -c "$apk" | wc -c)
           echo "APK: $apk, $size bytes; compressed (download estimate): $download bytes"
           unzip -lv "$apk" | sort -k1 -n -r | head -n 12
-          echo "### Android ${{ matrix.target }}: download about $((download / 1024)) KB (gate 25 MB), APK file $((size / 1024)) KB" >> "$GITHUB_STEP_SUMMARY"
-          test "$download" -le $((25 * 1024 * 1024))
+          echo "### Android ${{ matrix.target }}: APK file $((size / 1024)) KB, download about $((download / 1024)) KB (limit 40 MB each)" >> "$GITHUB_STEP_SUMMARY"
+          test "$size" -le $((40 * 1024 * 1024))
+          test "$download" -le $((40 * 1024 * 1024))
       - uses: actions/upload-artifact@v7
         with:
           name: mirrorleaf-android-${{ matrix.target }}-release-unsigned

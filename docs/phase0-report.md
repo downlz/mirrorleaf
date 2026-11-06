@@ -6,7 +6,7 @@
 | **Milestones** | M0–M7, 31 October to 6 November 2026 |
 | **Devices** | MacBook Air M2 (8 GB) running the Mac app and the CLI; a Motorola Edge 60 Pro on Android 17 (near-stock); the Ubuntu machine as a second desktop peer |
 | **Written** | 6 November 2026, by Claude, for the owner's decision |
-| **Status** | Draft, for the owner to confirm |
+| **Status** | **Phase 0 complete** (owner, 6 November 2026). The owner's decisions on §3 recorded the same day; the Go decision for Phase 1 is the owner's |
 
 ---
 
@@ -14,7 +14,7 @@
 
 **Go for Phase 1, with Android option A (Tauri 2 plus native Kotlin background code).**
 
-Every Phase 0 gate in assessment §12 passes. One of them, the Android download size, passes only if "download" means what a user downloads (about 12.7 MB) rather than the APK file (28.5 MB); that reading needs the owner's confirmation (§3, item 1). Push-to-wake works: every high-priority push woke the closed app and it synced (90 of 90 across seven phone states). Normal-priority pushes don't reach a phone that is locked and dozing, which Phase 1's status screen and push rules have to allow for (§4). Nothing found calls for Phase 2's options to be brought forward.
+Every Phase 0 gate in assessment §12 passes. The Android size gate is no longer a hard 25 MB line: the owner set it at 30–40 MB for both the APK file (28.5 MB) and the download (about 12.7 MB), and both are within it (§3, item 1). Push-to-wake works: every high-priority push woke the closed app and it synced (90 of 90 across seven phone states). Normal-priority pushes don't reach a phone that is locked and dozing, which Phase 1's status screen and push rules have to allow for (§4). Nothing found calls for Phase 2's options to be brought forward.
 
 ---
 
@@ -28,7 +28,7 @@ Every Phase 0 gate in assessment §12 passes. One of them, the Android download 
 | macOS and Android sync a rich-text note and a photo over the LAN | ✅ Pass | M6 tests 2.10 and 3.2–3.3, M5 tests 1–2: direct connections on the same Wi-Fi |
 | … and across two different networks, one of them mobile | ✅ Pass (owner-confirmed, no timings) | M5 test 3, rows 2 and 3 of plan §7.1 (phone on mobile data; another Wi-Fi), owner-confirmed 6 Nov. The relay path also carried every sync during the M6 tests while the phone's VPN was on (M6 finding 6) |
 | The ledger flags and wakes stale devices | ✅ Pass | M3: 10 rule tests, 9 integration tests on Postgres 17.6 and 18.6, every rule confirmed on the deployed ledger; M4 run 1 with real FCM pushes to the phone |
-| Every lightweight target passes | ✅ Pass, with one reading to confirm | §2.2 |
+| Every lightweight target passes | ✅ Pass | §2.2 |
 | The three Android tests (option A or B) | ✅ All pass: **stay on option A** | §2.3 |
 | Push-to-wake measured at normal and high priority | ✅ Measured; high priority reliable | §2.4 |
 
@@ -39,7 +39,7 @@ All measured on **release builds** unless marked.
 | Target | Limit | Measured | Result | Evidence |
 |---|---|---|---|---|
 | Desktop installer (macOS) | ≤ 25 MB | **10.3 MB** `.dmg` | ✅ | CI, M5 run (4 Nov) |
-| Android download, per CPU type | ≤ 25 MB | arm64: **about 12.7 MB** compressed for download; the APK file is **28.5 MB** | ✅ as a download; ❌ as a file | §3, item 1. armv7 and x86_64 from the new CI job once committed |
+| Android download, per CPU type | ≤ 25 MB in the assessment; **within 30–40 MB for the file and the download, not a hard gate** (owner, 6 Nov) | arm64: APK file **28.5 MB**, download **about 12.7 MB** | ✅ | §3, item 1. CI fails above 40 MB for either; armv7 and x86_64 from the new CI job once committed |
 | Desktop agent, window closed | ≤ 50 MB RAM (plan M5: ≤ 40 MB), ~0% CPU idle | **14 MB**, 0–0.2% CPU, no web view processes | ✅ | M5 test record (Claude, 4 Nov); M5 test 6 with the window opened then closed, owner-confirmed 6 Nov |
 | Cold start, desktop | ≤ 1 s | **0.45–0.49 s** to the open note being editable (5 launches); 1.9 s on the first launch of a newly built app, while macOS checks it | ✅ | M7, app-side timestamps |
 | Cold start, Android | ≤ 2 s | **0.54–0.65 s** to the note list (5 launches); first frame at 0.26 s | ✅ | M7, app-side timestamps; `am start -W` for the first frame |
@@ -103,12 +103,14 @@ All measured on **release builds** unless marked.
 
 ## 3. Decisions for the owner
 
-| # | Decision | Recommendation | Why |
+Answered by the owner on 6 November 2026.
+
+| # | Question | Decision | Consequence |
 |---|---|---|---|
-| 1 | **What the Android size gate measures.** The assessment says "Android download"; plan §7.3 measures "per-ABI split APK size". arm64 is 12.7 MB as a download and 28.5 MB as an APK file. | Measure the download (as the new CI job does), and record the APK file size beside it | The download is what the user waits for and what the store shows. The file is larger only because Android keeps the library uncompressed so it can be mapped without unpacking. If the file size is the gate, the library has to shrink by about 4 MB first (size-optimised compilation, fewer Iroh features). |
-| 2 | **iroh-blobs or our own blob protocol** (open since M2, "decide at M7") | **Stay on iroh-blobs through the private beta**; decide before the public beta, as ADR-003 suggests | It passed every photo test and the 50 MB job target. Its one problem, a thread leak per job (M4 finding 6), is fixed by opening the store once per process. Its README still calls the 1.x line "not yet production quality", and moving costs about a week, cheapest before the public beta. |
-| 3 | **Confirm ADR-002 to ADR-007** | Confirm, or say what to change | All are still "Proposed". Phase 1 builds on them. |
-| 4 | **The periodic catch-up job** (E8, awaiting approval) | Approve as low value, or drop | Android holds periodic jobs in Doze just as it holds normal pushes (finding 7), so it wouldn't help the sleeping phone. It would help a phone that is awake but missed a push. |
+| 1 | What the Android size gate measures: the download (12.7 MB) or the APK file (28.5 MB), against 25 MB | **Not a hard gate, as long as both stay within 30–40 MB** | Passes today. CI fails if either the APK file or the download goes over 40 MB. The assessment's §12 and plan §7.3 still say 25 MB: changes proposed, waiting for approval |
+| 2 | iroh-blobs or our own blob protocol (open since M2) | **Stay on iroh-blobs through the private beta** | Decide again before the public beta (ADR-003) |
+| 3 | ADR-002 to ADR-007 | **Accepted**: "what has been done so far are good and stable" | Phase 1 builds on them |
+| 4 | The periodic catch-up job (E8, proposed) | **Dropped** | Android would hold it in Doze like a normal push (M4 finding 7). Removing it from plan E8: waiting for approval |
 
 ---
 
@@ -124,7 +126,7 @@ All measured on **release builds** unless marked.
 | How phones on mobile data reach the ledger (HTTPS hosting) | E10 | Phase 0 ran the ledger on the Mac's LAN |
 | LAN sync without internet needs Iroh's mDNS add-on | Open decision | ADR-002 |
 | FCM answers 400 for a malformed token; treat it like 404 | E10 | M4 finding 2 |
-| Shrink the native library if the size gate is read as the APK file | E13 | §3, item 1 |
+| Keep the APK file and the download within 40 MB as Phase 1 adds code (CI checks it) | E13 | §3, item 1 |
 | Signing: the release APK in M7 was signed with the debug key for testing only | E13 | M7 |
 
 ---

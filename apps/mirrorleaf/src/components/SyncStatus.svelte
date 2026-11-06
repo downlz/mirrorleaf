@@ -2,6 +2,9 @@
   import { app } from '../lib/state.svelte';
 
   // Honest sync status (assessment §5): who this device is connected to now.
+  // Shown in Settings, not on the main screen (owner, 6 Nov 2026): the main
+  // screen stays clean and only speaks up when the user has to act (the
+  // fallback banner, or a dot on the Settings button while sync isn't set up).
   const summary = $derived.by(() => {
     const status = app.status;
     if (!status) return { tone: 'idle', text: 'Starting…' };
@@ -14,7 +17,7 @@
   });
 </script>
 
-<button class="sync-status" title="Sync settings" onclick={() => app.openSettings()}>
+<p class="sync-status" role="status">
   <span class="dot {summary.tone}"></span>
-  <span class="sync-text">{summary.text}</span>
-</button>
+  <span>{summary.text}</span>
+</p>

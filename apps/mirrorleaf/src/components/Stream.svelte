@@ -9,7 +9,6 @@
   import { displayTitle, highlight, type View } from '../lib/notes';
   import { app } from '../lib/state.svelte';
   import Icon from './Icon.svelte';
-  import SyncStatus from './SyncStatus.svelte';
 
   let { leading = false }: { leading?: boolean } = $props();
 
@@ -167,8 +166,12 @@
 <section class="pane stream" class:leading aria-label="Notes">
   <header class="pane-header" data-tauri-drag-region>
     <span class="grow" data-tauri-drag-region></span>
-    <SyncStatus />
-    <button class="icon-button" title="Settings" onclick={() => app.openSettings()}>
+    <button
+      class="icon-button"
+      class:attention={app.status !== null && !app.status.account}
+      title={app.status !== null && !app.status.account ? 'Settings: sync not set up' : 'Settings'}
+      onclick={() => app.openSettings()}
+    >
       <Icon name="settings" />
     </button>
     <button class="icon-button" title="New note" onclick={() => void app.newNote()}>
