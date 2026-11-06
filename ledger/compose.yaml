@@ -1,5 +1,7 @@
-# The Phase 0 ledger and its Postgres on the Ubuntu machine (implementation
-# plan §3.4, M3). From this folder: `docker compose up -d --build`.
+# The ledger and its Postgres (implementation plan §3.4, M3; HTTPS and limits
+# from E0). From this folder: `docker compose up -d --build`, which publishes
+# the ledger on this machine only (127.0.0.1:8080). Add `--profile https` to
+# put Caddy in front of it with HTTPS on ports 80 and 443.
 # Settings come from `.env` in this folder; see `env.example`.
 name: mirrorleaf-ledger
 
@@ -34,12 +36,41 @@ services:
     environment:
       DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD}@db:5432/ledger
       FCM_SERVICE_ACCOUNT: ${FCM_SERVICE_ACCOUNT:-}
+      LEDGER_DEVICE_REQUESTS_PER_MINUTE: ${LEDGER_DEVICE_REQUESTS_PER_MINUTE:-}
+      LEDGER_NEW_ACCOUNTS_PER_MINUTE: ${LEDGER_NEW_ACCOUNTS_PER_MINUTE:-}
       RUST_LOG: info,sqlx=warn
     volumes:
       # The Firebase service-account key, when there is one. Never committed.
       - ./secrets:/secrets:ro
     ports:
-      - '8080:8080'
+      # This machine only by default. For a phone on the same Wi-Fi during
+      # development, set LEDGER_PUBLISH=8080 in `.env` (every interface).
+      - '${LEDGER_PUBLISH:-127.0.0.1:8080}:8080'
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: '3'
+
+  # HTTPS in front of the ledger (E0), only with `--profile https`. Caddy gets
+  # and renews the certificate for LEDGER_DOMAIN itself; with `localhost` it
+  # uses its own local certificate authority instead.
+  caddy:
+    image: caddy:2.11.7
+    profiles: [https]
+    restart: unless-stopped
+    depends_on:
+      - ledger
+    environment:
+      LEDGER_DOMAIN: ${LEDGER_DOMAIN:-localhost}
+    ports:
+      - '80:80'
+      - '443:443'
+      - '443:443/udp'
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
     logging:
       driver: local
       options:
@@ -48,3 +79,5 @@ services:
 
 volumes:
   db:
+  caddy-data:
+  caddy-config:

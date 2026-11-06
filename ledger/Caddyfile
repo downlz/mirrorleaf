@@ -1,0 +1,24 @@
+# HTTPS in front of the ledger (E0), started with `docker compose --profile
+# https up -d`. Caddy gets and renews the certificate for LEDGER_DOMAIN.
+{
+	# Nothing reconfigures Caddy while it runs.
+	admin off
+
+	# No IP addresses in the logs (plan §5.8). Caddy logs no requests unless a
+	# site asks for it, and none does here; but its error logs and Go's TLS
+	# handshake errors name the client's address, so every `http` logger is
+	# dropped. Certificate messages (`tls`) stay.
+	log default {
+		output stderr
+		exclude http
+	}
+}
+
+{$LEDGER_DOMAIN} {
+	# The ledger refuses larger bodies too.
+	request_body {
+		max_size 64KB
+	}
+	reverse_proxy ledger:8080
+	header -Server
+}

@@ -6,10 +6,12 @@
 //! request logging stays off.
 
 pub mod db;
+pub mod limits;
 pub mod push;
 pub mod rules;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{FromRequest, Path, Request, State};
@@ -24,6 +26,7 @@ use mirrorleaf_proto::ledger::{
 use mirrorleaf_proto::{AccountId, DeviceId};
 use sqlx_postgres::PgPool;
 
+use crate::limits::Limits;
 use crate::push::{PushError, Pusher};
 use crate::rules::{Device, Push, WakeDecision};
 
@@ -42,17 +45,21 @@ pub fn system_clock() -> Clock {
 /// Largest request body accepted.
 const MAX_BODY: usize = 64 * 1024;
 
+/// How long `/health` waits for the database.
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
+
 #[derive(Clone)]
 pub struct Ledger {
     pub db: PgPool,
     pub pusher: Pusher,
     pub clock: Clock,
+    pub limits: Arc<Limits>,
 }
 
 impl Ledger {
     pub fn router(self) -> Router {
         Router::new()
-            .route("/health", get(|| async { "ok" }))
+            .route("/health", get(health))
             .route("/v1/accounts", post(create_account))
             .route("/v1/accounts/me", delete(delete_account))
             .route("/v1/devices", post(add_device))
@@ -149,6 +156,14 @@ impl ApiError {
         Self::new(StatusCode::BAD_REQUEST, "bad_request", message)
     }
 
+    fn rate_limited(message: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            ledger::error_code::RATE_LIMITED,
+            message,
+        )
+    }
+
     fn unknown_device() -> Self {
         Self::new(
             StatusCode::NOT_FOUND,
@@ -232,7 +247,30 @@ impl FromRequest<Ledger> for Signed {
             .map_err(|_| ApiError::bad_request("body too large"))?;
         ledger::verify_request(&device, &method, &path, time, &body, &signature)
             .map_err(|_| ApiError::unauthorised("the signature doesn't match"))?;
+        // Counted only once the signature checks out, so nobody can use up
+        // another device's allowance.
+        if !ledger.limits.device_request(&device) {
+            return Err(ApiError::rate_limited(
+                "too many requests from this device; try again in a minute",
+            ));
+        }
         Ok(Signed { device, body })
+    }
+}
+
+/// `GET /health`: "ok" while the database answers, 503 otherwise. Unsigned,
+/// for uptime monitors and the reverse proxy.
+async fn health(State(l): State<Ledger>) -> (StatusCode, &'static str) {
+    match tokio::time::timeout(HEALTH_TIMEOUT, db::ping(&l.db)).await {
+        Ok(Ok(())) => (StatusCode::OK, "ok"),
+        Ok(Err(e)) => {
+            tracing::warn!("health check: the database didn't answer: {e:#}");
+            (StatusCode::SERVICE_UNAVAILABLE, "database unavailable")
+        }
+        Err(_) => {
+            tracing::warn!("health check: the database took over {HEALTH_TIMEOUT:?}");
+            (StatusCode::SERVICE_UNAVAILABLE, "database unavailable")
+        }
     }
 }
 
@@ -253,21 +291,43 @@ async fn register(l: &Ledger, req: Signed, create: bool) -> Result<StatusCode, A
         .map_err(|_| ApiError::unauthorised("the account key didn't approve this device"))?;
     let mut tx = l.db.begin().await?;
     let now = l.now();
-    if create {
-        db::create_account(&mut tx, &body.account, now).await?;
-    } else if !db::account_exists(&mut tx, &body.account).await? {
+    let exists = db::account_exists(&mut tx, &body.account).await?;
+    if !exists && !create {
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,
             ledger::error_code::UNKNOWN_ACCOUNT,
             "no such account",
         ));
     }
-    if !db::upsert_device(&mut tx, &body.account, &req.device, body.platform, now).await? {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "other_account",
-            "this device belongs to another account",
-        ));
+    if !exists {
+        // Only accounts the ledger doesn't hold yet count: devices repeat
+        // this request harmlessly, for example after the database was replaced.
+        if !l.limits.new_account() {
+            return Err(ApiError::rate_limited(
+                "too many new accounts right now; try again in a minute",
+            ));
+        }
+        db::create_account(&mut tx, &body.account, now).await?;
+    }
+    match db::upsert_device(&mut tx, &body.account, &req.device, body.platform, now).await? {
+        db::Upsert::Added | db::Upsert::Refreshed => {}
+        db::Upsert::OtherAccount => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "other_account",
+                "this device belongs to another account",
+            ));
+        }
+        db::Upsert::AccountFull => {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                ledger::error_code::TOO_MANY_DEVICES,
+                format!(
+                    "this account already has {} devices; remove one first",
+                    ledger::MAX_DEVICES_PER_ACCOUNT
+                ),
+            ));
+        }
     }
     tx.commit().await?;
     tracing::info!("device {} registered", req.device.short());

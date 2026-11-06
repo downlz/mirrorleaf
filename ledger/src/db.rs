@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
-use mirrorleaf_proto::ledger::Platform;
+use mirrorleaf_proto::ledger::{MAX_DEVICES_PER_ACCOUNT, Platform};
 use mirrorleaf_proto::{AccountId, DeviceId, VersionVector};
 use sqlx_core::query::query;
 use sqlx_core::query_scalar::query_scalar;
@@ -55,6 +55,12 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
+/// Checks the database answers (`/health`).
+pub async fn ping(pool: &PgPool) -> Result<()> {
+    query("SELECT 1").execute(pool).await?;
+    Ok(())
+}
+
 /// The account a device belongs to, if it is registered.
 pub async fn account_of(pool: &PgPool, device: &DeviceId) -> Result<Option<AccountId>> {
     let row: Option<Vec<u8>> = query_scalar("SELECT account_id FROM devices WHERE device_id = $1")
@@ -92,22 +98,33 @@ pub async fn create_account(
     Ok(())
 }
 
-/// Adds a device to an account, or refreshes it if it is already there.
-/// Returns `false` if the device belongs to another account.
+/// What [`upsert_device`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Upsert {
+    Added,
+    Refreshed,
+    /// The device is registered to another account; nothing changed.
+    OtherAccount,
+    /// The account already has [`MAX_DEVICES_PER_ACCOUNT`] devices; nothing changed.
+    AccountFull,
+}
+
+/// Adds a device to an account, or refreshes it if it is already there. The
+/// account must exist.
 pub async fn upsert_device(
     tx: &mut Transaction<'_, Postgres>,
     account: &AccountId,
     device: &DeviceId,
     platform: Platform,
     now: i64,
-) -> Result<bool> {
+) -> Result<Upsert> {
     let existing: Option<Vec<u8>> =
         query_scalar("SELECT account_id FROM devices WHERE device_id = $1 FOR UPDATE")
             .bind(&device.0[..])
             .fetch_optional(&mut **tx)
             .await?;
     match existing {
-        Some(other) if other != account.0 => return Ok(false),
+        Some(other) if other != account.0 => Ok(Upsert::OtherAccount),
         Some(_) => {
             query("UPDATE devices SET platform = $2, last_seen = $3 WHERE device_id = $1")
                 .bind(&device.0[..])
@@ -115,8 +132,22 @@ pub async fn upsert_device(
                 .bind(to_minute(now))
                 .execute(&mut **tx)
                 .await?;
+            Ok(Upsert::Refreshed)
         }
         None => {
+            // Locking the account's row makes two devices joining at once
+            // count one after the other, so neither can pass the cap.
+            query("SELECT 1 FROM accounts WHERE account_id = $1 FOR UPDATE")
+                .bind(&account.0[..])
+                .execute(&mut **tx)
+                .await?;
+            let count: i64 = query_scalar("SELECT count(*) FROM devices WHERE account_id = $1")
+                .bind(&account.0[..])
+                .fetch_one(&mut **tx)
+                .await?;
+            if count >= MAX_DEVICES_PER_ACCOUNT {
+                return Ok(Upsert::AccountFull);
+            }
             query(
                 "INSERT INTO devices (device_id, account_id, platform, last_seen)
                  VALUES ($1, $2, $3, $4)",
@@ -127,9 +158,9 @@ pub async fn upsert_device(
             .bind(to_minute(now))
             .execute(&mut **tx)
             .await?;
+            Ok(Upsert::Added)
         }
     }
-    Ok(true)
 }
 
 /// A device row with what the rules don't need.

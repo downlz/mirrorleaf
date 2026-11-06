@@ -10,14 +10,21 @@
 //! | `LEDGER_LISTEN` | Address to listen on (default `0.0.0.0:8080`) |
 //! | `FCM_SERVICE_ACCOUNT` | Path to a Firebase service-account key file. Without one, pushes are only logged. |
 //! | `FCM_API` | Replaces FCM's address (for a fake FCM in tests) |
+//! | `LEDGER_DEVICE_REQUESTS_PER_MINUTE` | Signed requests allowed per device per minute (default 30; 0 for no limit) |
+//! | `LEDGER_NEW_ACCOUNTS_PER_MINUTE` | New accounts allowed per minute across the ledger (default 20; 0 for no limit) |
 //! | `RUST_LOG` | Log filter (default `info`) |
 //!
 //! `mirrorleaf-ledger test-push <device ID prefix> <normal|high>` sends one test
 //! push instead of starting the service (see [`test_push`]).
+//!
+//! It stops cleanly on SIGTERM (what `docker stop` sends) or Ctrl-C: it stops
+//! accepting connections and lets requests in progress finish.
 
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
+use mirrorleaf_ledger::limits::{self, Limits, Rate};
 use mirrorleaf_ledger::push::{Fcm, Pusher, test_message};
 use mirrorleaf_ledger::rules::{Priority, Push, PushKind};
 use mirrorleaf_ledger::{Ledger, db, system_clock};
@@ -64,10 +71,21 @@ async fn main() -> Result<()> {
         .await
         .context("can't connect to the database")?;
     db::migrate(&pool).await?;
+    let limits = Limits::new(
+        rate_from_env(
+            "LEDGER_DEVICE_REQUESTS_PER_MINUTE",
+            limits::DEFAULT_DEVICE_REQUESTS_PER_MINUTE,
+        )?,
+        rate_from_env(
+            "LEDGER_NEW_ACCOUNTS_PER_MINUTE",
+            limits::DEFAULT_NEW_ACCOUNTS_PER_MINUTE,
+        )?,
+    );
     let ledger = Ledger {
         db: pool,
         pusher,
         clock: system_clock(),
+        limits: Arc::new(limits),
     };
 
     let background = ledger.clone();
@@ -79,6 +97,7 @@ async fn main() -> Result<()> {
             if let Err(e) = background.tick().await {
                 tracing::warn!("checking wake-ups failed: {e:#}");
             }
+            background.limits.forget_idle();
             if last_prune.is_none_or(|t| t.elapsed() >= PRUNE_EVERY) {
                 last_prune = Some(tokio::time::Instant::now());
                 match background.prune().await {
@@ -98,11 +117,52 @@ async fn main() -> Result<()> {
         env!("CARGO_PKG_VERSION")
     );
     axum::serve(listener, ledger.router())
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .with_graceful_shutdown(shutdown_signal())
         .await?;
+    tracing::info!("stopped");
     Ok(())
+}
+
+/// Resolves on Ctrl-C or SIGTERM.
+async fn shutdown_signal() {
+    let interrupt = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!("can't listen for SIGTERM: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = interrupt => {}
+        () = terminate => {}
+    }
+    tracing::info!("shutting down: finishing requests in progress");
+}
+
+/// A per-minute rate from the environment: unset or empty gives `default`.
+fn rate_from_env(name: &str, default: u32) -> Result<Rate> {
+    let per_minute = match std::env::var(name) {
+        Ok(value) if !value.trim().is_empty() => value
+            .trim()
+            .parse()
+            .with_context(|| format!("{name} must be a whole number, not {value:?}"))?,
+        _ => default,
+    };
+    if per_minute == 0 {
+        tracing::warn!("{name} is 0: that limit is off");
+    }
+    Ok(Rate::per_minute(per_minute))
 }
 
 /// `test-push <device ID prefix> <normal|high>`: sends one `pull` push to a

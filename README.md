@@ -155,6 +155,14 @@ docker compose up -d --build
 
 Set `POSTGRES_PASSWORD` in `.env` first. Without a Firebase service-account key (`FCM_SERVICE_ACCOUNT`), the ledger decides pushes and only logs them.
 
+The ledger is published on this machine only (`127.0.0.1:8080`). For a phone on the same Wi-Fi during development, set `LEDGER_PUBLISH=8080` in `.env`. To serve it over HTTPS, set `LEDGER_DOMAIN` to a domain whose DNS points at the machine (ports 80 and 443 open) and start Caddy with it:
+
+```bash
+docker compose --profile https up -d --build
+```
+
+Caddy gets and renews the certificate itself (with `LEDGER_DOMAIN=localhost` it uses its own local certificate authority, for testing on this machine) and logs no IP addresses. The ledger limits each device to 30 signed requests a minute and new accounts to 20 a minute across the ledger, and an account to 10 devices. The two rates can be changed in `.env`; 0 turns a limit off, for example while every device registers again after the database was replaced. `GET /health` answers `ok` only while the database does, for an uptime monitor. `docker compose stop` lets requests in progress finish.
+
 Then register each device:
 
 ```bash

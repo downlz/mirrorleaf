@@ -11,10 +11,11 @@ use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
+use mirrorleaf_ledger::limits::{Limits, Rate};
 use mirrorleaf_ledger::push::{FALLBACK_BODY_KEY, Fcm, Pusher, http_client};
 use mirrorleaf_ledger::rules::{Priority, Push, PushKind, WAKE_INTERVAL_SECS};
 use mirrorleaf_ledger::{Ledger, db};
-use mirrorleaf_proto::ledger::{Approval, DeviceKey, Platform};
+use mirrorleaf_proto::ledger::{Approval, DeviceKey, MAX_DEVICES_PER_ACCOUNT, Platform};
 use mirrorleaf_proto::{AccountKey, DeviceId};
 use serde_json::{Value, json};
 use sqlx_core::query::query;
@@ -37,10 +38,10 @@ impl TestLedger {
     /// Starts a ledger in a fresh schema, or returns `None` if no test
     /// database is configured.
     async fn start() -> Option<Self> {
-        Self::start_with(None).await
+        Self::start_with(None, Limits::unlimited()).await
     }
 
-    async fn start_with(pusher: Option<Pusher>) -> Option<Self> {
+    async fn start_with(pusher: Option<Pusher>, limits: Limits) -> Option<Self> {
         let Ok(url) = std::env::var("MIRRORLEAF_TEST_DATABASE_URL") else {
             eprintln!(
                 "skipped: set MIRRORLEAF_TEST_DATABASE_URL to run the ledger's database tests"
@@ -78,6 +79,7 @@ impl TestLedger {
                 let clock = clock.clone();
                 Arc::new(move || clock.load(Ordering::SeqCst))
             },
+            limits: Arc::new(limits),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -685,7 +687,8 @@ async fn the_fcm_client_sends_http_v1_messages_and_drops_dead_tokens() {
     });
     let fcm = Fcm::new(&key_file.to_string(), Some(api)).unwrap();
 
-    let Some(t) = TestLedger::start_with(Some(Pusher::Fcm(fcm.into()))).await else {
+    let Some(t) = TestLedger::start_with(Some(Pusher::Fcm(fcm.into())), Limits::unlimited()).await
+    else {
         return;
     };
     let (laptop, _desktop, mut phone) = account(&t).await;
@@ -802,6 +805,148 @@ fn test_rsa_key() -> Option<String> {
 
 /// The device side: `mirrorleaf-net`'s ledger client and `watch` reporting,
 /// against the real ledger, on the real clock.
+#[tokio::test]
+async fn health_answers_only_while_the_database_does() {
+    let Some(t) = TestLedger::start().await else {
+        return;
+    };
+    let health = || async {
+        let response = http_client()
+            .unwrap()
+            .get(format!("{}/health", t.url))
+            .send()
+            .await
+            .unwrap();
+        (response.status().as_u16(), response.text().await.unwrap())
+    };
+    assert_eq!(health().await, (200, "ok".to_owned()));
+    // A closed pool stands in for a database that stopped.
+    t.ledger.db.close().await;
+    assert_eq!(health().await, (503, "database unavailable".to_owned()));
+    t.finish().await;
+}
+
+#[tokio::test]
+async fn an_account_holds_at_most_ten_devices() {
+    let Some(t) = TestLedger::start().await else {
+        return;
+    };
+    let key = Arc::new(AccountKey::generate());
+    let devices: Vec<Dev> = (0..MAX_DEVICES_PER_ACCOUNT)
+        .map(|_| Dev::new(&key, Platform::Linux))
+        .collect();
+    assert_eq!(
+        devices[0].register(&t, "/v1/accounts").await.0,
+        StatusCode::NO_CONTENT
+    );
+    for d in &devices[1..] {
+        assert_eq!(
+            d.register(&t, "/v1/devices").await.0,
+            StatusCode::NO_CONTENT
+        );
+    }
+
+    let extra = Dev::new(&key, Platform::Android);
+    for path in ["/v1/devices", "/v1/accounts"] {
+        let (status, body) = extra.register(&t, path).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::FORBIDDEN, Some("too_many_devices")),
+            "{path}"
+        );
+    }
+    // Devices already registered can still register again.
+    assert_eq!(
+        devices[3].register(&t, "/v1/devices").await.0,
+        StatusCode::NO_CONTENT
+    );
+
+    // Removing one frees its place.
+    let path = format!("/v1/devices/{}", devices[9].id());
+    assert_eq!(
+        devices[9].call(&t, "DELETE", &path, json!({})).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        extra.register(&t, "/v1/devices").await.0,
+        StatusCode::NO_CONTENT
+    );
+    let count: i64 = query_scalar("SELECT count(*) FROM devices")
+        .fetch_one(&t.ledger.db)
+        .await
+        .unwrap();
+    assert_eq!(count, MAX_DEVICES_PER_ACCOUNT);
+    t.finish().await;
+}
+
+#[tokio::test]
+async fn requests_are_limited_per_device_and_new_accounts_per_ledger() {
+    let limits = Limits::new(Rate::per_minute(4), Rate::per_minute(2));
+    let Some(t) = TestLedger::start_with(None, limits).await else {
+        return;
+    };
+    // Two new accounts, then the ledger-wide limit.
+    let first = Dev::new(&Arc::new(AccountKey::generate()), Platform::Macos);
+    let second = Dev::new(&Arc::new(AccountKey::generate()), Platform::Macos);
+    let third = Dev::new(&Arc::new(AccountKey::generate()), Platform::Macos);
+    assert_eq!(
+        first.register(&t, "/v1/accounts").await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        second.register(&t, "/v1/accounts").await.0,
+        StatusCode::NO_CONTENT
+    );
+    let (status, body) = third.register(&t, "/v1/accounts").await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::TOO_MANY_REQUESTS, Some("rate_limited"))
+    );
+    // Registering again with an account the ledger already holds isn't a new
+    // account, so it still works.
+    assert_eq!(
+        first.register(&t, "/v1/accounts").await.0,
+        StatusCode::NO_CONTENT
+    );
+
+    // `first` has used 2 of its 4 requests; another device's count is its own.
+    assert_eq!(wake_status(&first, &t).await, StatusCode::OK);
+    assert_eq!(wake_status(&first, &t).await, StatusCode::OK);
+    assert_eq!(wake_status(&first, &t).await, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(wake_status(&second, &t).await, StatusCode::OK);
+
+    // Requests in `second`'s name but signed with another key are refused and
+    // don't use up its allowance: it has 2 of its 4 left.
+    for _ in 0..5 {
+        let (time, body) = (t.now(), b"{}".to_vec());
+        let response = http_client()
+            .unwrap()
+            .post(format!("{}/v1/wake", t.url))
+            .header("x-mirrorleaf-device", second.id().to_string())
+            .header("x-mirrorleaf-time", time.to_string())
+            .header(
+                "x-mirrorleaf-signature",
+                first.key.sign_request("POST", "/v1/wake", time, &body),
+            )
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 401);
+    }
+    assert_eq!(wake_status(&second, &t).await, StatusCode::OK);
+    assert_eq!(wake_status(&second, &t).await, StatusCode::OK);
+    assert_eq!(
+        wake_status(&second, &t).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    t.finish().await;
+}
+
+async fn wake_status(d: &Dev, t: &TestLedger) -> StatusCode {
+    d.call(t, "POST", "/v1/wake", json!({})).await.0
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn devices_register_report_and_go_offline_through_the_client() {
     use mirrorleaf_core::Replica;

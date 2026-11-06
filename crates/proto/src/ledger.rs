@@ -27,6 +27,10 @@ pub const MAX_CLOCK_SKEW_SECS: i64 = 5 * 60;
 /// minutes and each one keeps the device online for 6 (ADR-004, gap 1).
 pub const MAX_ONLINE_SECS: u32 = 10 * 60;
 
+/// Most devices one account may register (E0). A device removed with
+/// `DELETE /v1/devices/{id}`, or pruned after 90 days unseen, frees its place.
+pub const MAX_DEVICES_PER_ACCOUNT: i64 = 10;
+
 const REQUEST_CONTEXT: &[u8] = b"mirrorleaf/ledger-request/1";
 const ADD_DEVICE_CONTEXT: &[u8] = b"mirrorleaf/approve-device/1";
 const REMOVE_DEVICE_CONTEXT: &[u8] = b"mirrorleaf/remove-device/1";
@@ -285,6 +289,12 @@ pub mod error_code {
     pub const UNKNOWN_DEVICE: &str = "unknown_device";
     /// The account doesn't exist yet: create it with `POST /v1/accounts`.
     pub const UNKNOWN_ACCOUNT: &str = "unknown_account";
+    /// The account already has [`super::MAX_DEVICES_PER_ACCOUNT`] devices:
+    /// remove one first.
+    pub const TOO_MANY_DEVICES: &str = "too_many_devices";
+    /// Too many requests: try again later (the app's reports are spaced far
+    /// enough apart never to hit this).
+    pub const RATE_LIMITED: &str = "rate_limited";
 }
 
 /// Keys as hex strings in JSON. (Their serde form elsewhere is the raw bytes
