@@ -26,12 +26,16 @@ Standard library only. Run from the repository root, for example:
 
   tools/push-matrix.py --device d57d4595 --states background,doze --trials 20
 
-Writes every trial to a CSV file and prints a summary table for the test record.
+Writes every trial to a CSV file as soon as it finishes, and prints a summary
+table for the test record. `--resume <csv>` carries on an interrupted run,
+skipping the trials already in the file. Stopping it (Ctrl-C or SIGTERM) still
+puts the phone back as it was.
 """
 
 import argparse
 import csv
 import re
+import signal
 import statistics
 import subprocess
 import sys
@@ -293,6 +297,37 @@ def summary(trials):
     return "\n".join(rows)
 
 
+CSV_HEADER = [
+    "state",
+    "priority",
+    "trial",
+    "sent_unix_ms",
+    "message_id",
+    "delivered",
+    "arrived_as",
+    "delivery_ms",
+    "job_start_ms",
+    "sync_ms",
+    "outcome",
+]
+
+
+def csv_row(t):
+    return [
+        t.state,
+        t.priority,
+        t.number,
+        t.sent_ms,
+        t.message_id,
+        t.delivered,
+        t.arrived_as,
+        t.delivery_ms,
+        t.job_start_ms,
+        t.sync_ms,
+        t.outcome,
+    ]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--device", required=True, help="the phone's device ID (8+ hex digits)")
@@ -310,6 +345,9 @@ def main():
     parser.add_argument(
         "--out", help="CSV file (default: tools/push-matrix-results/<date and time>.csv)"
     )
+    parser.add_argument(
+        "--resume", help="a CSV file from an interrupted run: skip its trials and append to it"
+    )
     args = parser.parse_args()
 
     states = [s.strip() for s in args.states.split(",") if s.strip()]
@@ -322,8 +360,18 @@ def main():
     compose = Path(args.compose)
     if not compose.exists():
         sys.exit(f"{compose} not found: run from the repository root, or pass --compose")
-    out = Path(args.out or f"tools/push-matrix-results/{datetime.now():%Y%m%d-%H%M}.csv")
+    out = Path(
+        args.resume or args.out or f"tools/push-matrix-results/{datetime.now():%Y%m%d-%H%M}.csv"
+    )
     out.parent.mkdir(parents=True, exist_ok=True)
+    done = set()
+    if args.resume:
+        with out.open(newline="") as f:
+            for row in csv.DictReader(f):
+                done.add((row["state"], row["priority"], int(row["trial"])))
+        print(f"Resuming: {len(done)} trials already in {out}.")
+    # A stop signal (from a wrapper or `kill`) cleans up like Ctrl-C.
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
 
     phone = Phone(args.serial)
     if phone.shell("pm path " + APP) == "":
@@ -334,6 +382,12 @@ def main():
     print(f"Phone: {model}, Android {android}. Results go to {out}.")
 
     trials = []
+    new_file = not out.exists() or out.stat().st_size == 0
+    results = out.open("a", newline="")
+    writer = csv.writer(results)
+    if new_file:
+        writer.writerow(CSV_HEADER)
+        results.flush()
     try:
         for state_key in states:
             state = STATES[state_key]
@@ -353,10 +407,14 @@ def main():
             try:
                 for priority in priorities:
                     for number in range(1, args.trials + 1):
+                        if (state_key, priority, number) in done:
+                            continue
                         trial = run_trial(
                             phone, compose, args.device, state_key, state, priority, number
                         )
                         trials.append(trial)
+                        writer.writerow(csv_row(trial))
+                        results.flush()
                         timing = (
                             f"delivery {trial.delivery_ms} ms, job start {trial.job_start_ms} ms, "
                             f"sync {trial.sync_ms} ms"
@@ -372,40 +430,10 @@ def main():
     except KeyboardInterrupt:
         print("\nStopped. Writing the trials so far.")
     finally:
+        phone.shell("dumpsys battery reset")
+        phone.shell("dumpsys deviceidle unforce")
         phone.shell(f"settings put global stay_on_while_plugged_in {stay_on}")
-        with out.open("w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(
-                [
-                    "state",
-                    "priority",
-                    "trial",
-                    "sent_unix_ms",
-                    "message_id",
-                    "delivered",
-                    "arrived_as",
-                    "delivery_ms",
-                    "job_start_ms",
-                    "sync_ms",
-                    "outcome",
-                ]
-            )
-            for t in trials:
-                writer.writerow(
-                    [
-                        t.state,
-                        t.priority,
-                        t.number,
-                        t.sent_ms,
-                        t.message_id,
-                        t.delivered,
-                        t.arrived_as,
-                        t.delivery_ms,
-                        t.job_start_ms,
-                        t.sync_ms,
-                        t.outcome,
-                    ]
-                )
+        results.close()
     print(f"\n{len(trials)} trials written to {out}.\n")
     print(f"Phone: {model}, Android {android}\n")
     print(summary(trials))

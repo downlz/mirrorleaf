@@ -129,13 +129,23 @@ for (profile in listOf("Debug", "Release")) {
         description = "Generates the engine's Kotlin bindings from the $profile native library"
         dependsOn("rustBuildUniversal$profile")
         workingDir = workspaceDir
+        // The bindings are the same for every CPU type: read the library built last, which
+        // is the one this build has just made (a build may be for one CPU type only).
+        val jniLibs = layout.projectDirectory.dir("src/main/jniLibs").asFile
         commandLine(
             "cargo", "run", "--quiet", "-p", "uniffi-bindgen", "--",
             "generate", "--no-format",
-            "--library", file("src/main/jniLibs/arm64-v8a/libmirrorleaf_app_lib.so").path,
             "--language", "kotlin",
             "--out-dir", engineBindingsDir.path,
         )
+        argumentProviders.add(CommandLineArgumentProvider {
+            val library = (jniLibs.listFiles() ?: emptyArray())
+                .map { File(it, "libmirrorleaf_app_lib.so") }
+                .filter { it.isFile }
+                .maxByOrNull { it.lastModified() }
+                ?: throw GradleException("no libmirrorleaf_app_lib.so in ${jniLibs.path}")
+            listOf("--library", library.path)
+        })
     }
 }
 tasks.matching { it.name.startsWith("compile") && it.name.endsWith("Kotlin") }.configureEach {

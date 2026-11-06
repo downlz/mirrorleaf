@@ -81,6 +81,7 @@
           onFormat: (state) => (format = state),
           onError: (error) => app.fail(error),
         });
+        app.reportReady('open note');
         if (app.fresh === id) {
           app.fresh = null;
           current.editor.commands.focus('end');

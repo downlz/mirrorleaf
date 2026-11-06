@@ -117,7 +117,7 @@ Driven from the Mac over adb (screenshots, taps, key and text input through Gboa
 
 | Test | Result | Notes |
 |---|---|---|
-| Screen on a phone | | |
-| 2 Editor and keyboard (2.1–2.10) | | |
-| 3 Photo picker and share sheet (3.1–3.10) | | |
-| Second keyboard (optional) | | |
+| Screen on a phone | ✅ Done (owner-confirmed, 6 Nov 2026) | No figures recorded |
+| 2 Editor and keyboard (2.1–2.10) | ✅ Done (owner-confirmed, 6 Nov 2026) | No figures recorded |
+| 3 Photo picker and share sheet (3.1–3.10) | ✅ Done (owner-confirmed, 6 Nov 2026) | No figures recorded |
+| Second keyboard (optional) | ✅ Done (owner-confirmed, 6 Nov 2026) | No figures recorded |

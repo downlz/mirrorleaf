@@ -13,6 +13,7 @@ mod photos;
 mod picker;
 #[cfg(target_os = "macos")]
 mod power;
+mod startup;
 mod window;
 
 use mirrorleaf_ffi::Engine;
@@ -66,6 +67,7 @@ pub fn run() {
             commands::import_photo,
             commands::pick_photos,
             commands::take_pending_open,
+            commands::startup_done,
             commands::autostart,
             commands::set_autostart,
         ])

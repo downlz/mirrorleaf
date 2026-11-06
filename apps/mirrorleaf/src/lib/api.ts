@@ -75,6 +75,7 @@ export const api = {
   flushEdits: () => invoke<void>('flush_edits'),
   closeWindow: () => invoke<void>('close_window'),
   takePendingOpen: () => invoke<string | null>('take_pending_open'),
+  startupDone: (what: string) => invoke<void>('startup_done', { what }),
   autostart: () => invoke<boolean>('autostart'),
   setAutostart: (enabled: boolean) => invoke<void>('set_autostart', { enabled }),
 };

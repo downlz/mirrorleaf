@@ -3524,6 +3524,7 @@ name = "mirrorleaf-app"
 version = "0.0.0"
 dependencies = [
  "block2",
+ "libc",
  "mirrorleaf-ffi",
  "objc2-app-kit",
  "objc2-foundation",

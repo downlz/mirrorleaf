@@ -191,6 +191,12 @@ pub fn take_pending_open() -> Option<String> {
     Engine::get()?.take_pending_open()
 }
 
+/// The screen is ready to use: logs the cold start once (`startup`).
+#[tauri::command]
+pub fn startup_done(what: String) {
+    crate::startup::report(&what);
+}
+
 #[tauri::command]
 pub fn flush_edits() -> Result<()> {
     engine()?.flush_edits().map_err(text)

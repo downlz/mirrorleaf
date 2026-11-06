@@ -78,7 +78,7 @@ mod logcat {
     pub(super) fn install() {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(EnvFilter::new(
-                "warn,mirrorleaf_ffi=info,mirrorleaf_net=info,iroh::net_report=error",
+                "warn,mirrorleaf_ffi=info,mirrorleaf_net=info,mirrorleaf_app_lib=info,iroh::net_report=error",
             ))
             .with_ansi(false)
             .without_time()

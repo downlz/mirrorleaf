@@ -17,6 +17,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build.workspace = true
 
 [dependencies]
+# Process start time for the cold start log (startup.rs).
+libc.workspace = true
 mirrorleaf-ffi.workspace = true
 serde.workspace = true
 serde_json.workspace = true

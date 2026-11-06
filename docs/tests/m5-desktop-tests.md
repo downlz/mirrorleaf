@@ -152,12 +152,12 @@ No screen access was available to Claude, so the window itself wasn't driven; ev
 
 | Test | Result | Notes |
 |---|---|---|
-| 1 Rich text, LAN | | |
-| 2 Photo, LAN | | |
-| 3 Across networks (row 2, row 3) | | |
-| 4 Concurrent offline edit | | |
-| 5 Flush-on-close | | |
-| 6 Agent memory, window closed | | |
-| 7 Agent | | |
-| 8 Notes, folders, search | | |
-| 9 Layouts | | |
+| 1 Rich text, LAN | ✅ Done (owner-confirmed, 6 Nov 2026) | No figures recorded |
+| 2 Photo, LAN | ✅ Done (owner-confirmed, 6 Nov 2026) | No figures recorded |
+| 3 Across networks (row 2, row 3) | ✅ Done (owner-confirmed, 6 Nov 2026) | No figures recorded |
+| 4 Concurrent offline edit | ✅ Done (owner-confirmed, 6 Nov 2026) | No figures recorded |
+| 5 Flush-on-close | ✅ Done (owner-confirmed, 6 Nov 2026) | No figures recorded |
+| 6 Agent memory, window closed | ✅ Done (owner-confirmed, 6 Nov 2026) | No figures recorded |
+| 7 Agent | ✅ Done (owner-confirmed, 6 Nov 2026) | No figures recorded |
+| 8 Notes, folders, search | ✅ Done (owner-confirmed, 6 Nov 2026) | No figures recorded |
+| 9 Layouts | ✅ Done (owner-confirmed, 6 Nov 2026) | No figures recorded |

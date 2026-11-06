@@ -171,7 +171,7 @@ Run by Claude over adb on the owner's Motorola Edge 60 Pro (Android 17, API 37),
 | 3 — Rule 4 | ✅ | Fallback push 74 s after the wake; the system showed "Mirrorleaf — You have changes waiting to sync. Open Mirrorleaf to send them." on the `fallback` channel, from the app's strings; the Mac's prompt at 90 s |
 | 4 — Prompt on the phone | ✅ | `NoWakeableHolder` → "Open Mirrorleaf on mac to sync." at once; cleared when the Mac came online and sent the 2 changes (892 ms, direct) |
 | 5 — No push token | ✅ Pass (owner-confirmed, 4 Nov 2026) | Run by the owner; no figures were recorded |
-| 6 — Push-to-wake matrix | Script checked (run 2); the first state run 3 and 4 times; the full matrix not yet run | |
+| 6 — Push-to-wake matrix | ✅ All eight states run on 5–6 November (run 5), 182 trials | Run 5 |
 
 ### Run 2 — 4 November 2026: checking the matrix script
 
@@ -232,6 +232,41 @@ The same state and trial count as run 3, with the fixes installed (test pushes w
 
 **Memory, first reading (debug build, not the M7 measurement):** the push-started process, cached after its job, held 11.8 MB of private memory (`RssAnon`). Resident memory was 112 MB (peak 160 MB), most of it shared file mappings, including the 191 MB debug native library. The ≤ 50 MB target is checked in M7 on a release build, during the job.
 
+### Run 5 — 5–6 November 2026: the full matrix (M7)
+
+Run by Claude overnight: `tools/push-matrix.py` from 23:02 on 5 November, with the phone locked, unplugged as far as Android could tell (`dumpsys battery unplug`, so Doze applied) but charging, the owner's VPN off, and the Mac running `mirrorleaf-cli sync --watch` under `caffeinate`. Debug build; nothing new to sync, so the sync column times the wake-up and the ledger report. Each trial waited up to 10 minutes (5 minutes for the morning's Doze trials, 2 for force-stopped).
+
+At 08:12 the run was on its fourth state, because every normal-priority push held back by Android used the whole 10 minutes. At the owner's request it was stopped there, and the remaining states were run with fewer trials: restricted at high priority (10), Doze (10 high, 3 normal) and force-stopped (2 each), finishing at 08:51. 162 trials in all; results in `tools/push-matrix-results/m7-matrix-20261105-2302.csv` (gitignored).
+
+| State | Priority | Delivered | Synced | Arrived as high | Delivery | Job start | Sync |
+|---|---|---|---|---|---|---|---|
+| Screen on, app in the background | normal | 20/20 | 20/20 | – | 0.1 s (max 0.2) | 0.1 s (max 0.1) | 1.2 s (max 2.8) |
+| Screen on, app in the background | high | 20/20 | 20/20 | 20/20 | 0.1 s (max 0.2) | 0.1 s (max 0.1) | 1.2 s (max 2.0) |
+| Screen off (locked overnight, in real Doze) | normal | 2/20 | **0/20** | – | 457 s (max 570) | – | – |
+| Screen off (locked overnight, in real Doze) | high | 20/20 | 20/20 | 20/20 | 0.5 s (max 0.7) | 0.1 s (max 0.2) | 1.2 s (max 1.9) |
+| Battery saver on | normal | 5/20 | 3/20 | – | 0.5 s (max 592) | 0.5 s (max 13.6) | 1.2 s (max 8.6) |
+| Battery saver on | high | 20/20 | 20/20 | 20/20 | 0.2 s (max 0.5) | 0.1 s (max 0.2) | 0.2 s (max 9.1) |
+| App set to "restricted" battery use | normal | 4/15 | 3/15 | – | 0.3 s (max 478) | 0.1 s (max 0.2) | 1.2 s (max 1.6) |
+| App set to "restricted" battery use | high | 10/10 | 10/10 | 10/10 | 0.2 s (max 0.7) | 0.1 s (max 0.7) | 1.2 s (max 2.0) |
+| Deep Doze (forced) | normal | 0/3 | 0/3 | – | – | – | – |
+| Deep Doze (forced) | high | 10/10 | 10/10 | 10/10 | 0.3 s (max 0.6) | 0.1 s (max 0.1) | 1.2 s (max 1.7) |
+| App force-stopped | normal | 0/2 | 0/2 | – | – | – | – |
+| App force-stopped | high | 0/2 | 0/2 | – | – | – | – |
+| App swiped out of recents | normal | 5/5 | 5/5 | – | 0.4 s (max 0.4) | 0.1 s (max 0.1) | 1.2 s (max 1.3) |
+| App swiped out of recents | high | 5/5 | 5/5 | 5/5 | 0.1 s (max 0.1) | 0.1 s (max 0.1) | 1.2 s (max 2.9) |
+| After a reboot, app not opened | normal | 5/5 | 5/5 | – | first 10.4 s, then under 0.1 s* | 0.1 s (max 0.2) | 1.3 s (max 4.5) |
+| After a reboot, app not opened | high | 5/5 | 5/5 | 5/5 | under 0.1 s* | 0.0 s (max 0.0) | 1.1 s (max 1.2) |
+
+The last two states need the owner, so they were run on 6 November around 10:25–10:40 with the owner present: the owner restarted the phone and unlocked it without opening Mirrorleaf, then later opened it and swiped it away from recents. Both ran on the **release build** (M7), with the phone awake and unlocked, which is why normal priority did well here; later trials in each state follow the first (the script stands in for later swipes by killing the process, as Android does). *Just after the restart the phone's clock was slightly ahead of the Mac's, so delivery times read as 0; the job and sync columns are timed on the phone alone. A system component (most likely WorkManager rescheduling its jobs) started the app's process about a minute after boot, without the app being opened and without a sync.
+
+**What it shows:**
+
+1. **Every high-priority push woke the closed app and it synced: 90 of 90** in the seven states a user can be in (all but force-stopped), none downgraded to normal, delivered in under 0.7 s.
+2. **Normal-priority pushes are reliable only while the phone is awake.** Once it is locked and still, Android holds them for its Doze maintenance windows. The few that arrived late (6–10 minutes) mostly didn't get to run a job ("delivered, but no job started": Android doesn't let a normal-priority message start an expedited job in Doze). The normal pushes that synced in battery saver and restricted mode were the first few, before the phone dozed off.
+3. **A force-stopped app receives nothing,** as Android intends, until the user opens it again. Only the other device's "Open Mirrorleaf on your phone" prompt helps then.
+
+This confirms the push rules (plan §5.9): a high-priority push with a visible notification whenever someone is waiting for the edit; normal priority only as a cheap nudge, which a sleeping phone may not act on until it is next opened or gets a high-priority push. Finding 7.
+
 ### Findings
 
 1. **The local network permission applied only after the app restarted.** It was granted while the app was running; until the app was restarted, its connections to the Mac's LAN address were reset and Iroh used a relay. After the restart, LAN connections worked and were direct. Phase 1's onboarding should ask before the first sync, or restart networking after the grant.
@@ -240,11 +275,12 @@ The same state and trial count as run 3, with the fixes installed (test pushes w
 4. **Local network access can stop working while the permission still shows as granted.** After the APK was reinstalled (`adb install -r`), the app's connections to the LAN were reset: the ledger was unreachable, and Iroh reached the Mac only through a relay. The phone's shell reached the ledger, the app-op showed `ACCESS_LOCAL_NETWORK: allow`, and a force-stop didn't help. Revoking and granting the permission again (`pm revoke`, then `pm grant`) fixed it at once. A second reinstall straight afterwards didn't reproduce it, so it is intermittent. With finding 1, this suggests Android 17 (or Motorola's build) doesn't always apply the permission to the app's network access. Effects: without the LAN, sync falls back to the internet or a relay (assessment risk #9), but a ledger on the LAN becomes unreachable, and a job that can't reach the ledger dials every device, waiting 20 s for each offline one. Follow-ups: watch for it after Play Store updates in the beta; in Phase 1, check LAN reachability after an update and show the user how to fix it; the job could stop dialling devices the ledger last saw offline even when the ledger can't be reached.
 5. **FCM throttles collapsible messages: a burst of 20 per app per device, then one every 3 minutes** ([FCM throttling and quotas](https://firebase.google.com/docs/cloud-messaging/throttling-and-quotas)). The ledger's pushes all use the collapse key `sync`, so the matrix's 20 normal trials used up the burst: the 20th was 10.8 s late, and 2 of the following 4 high-priority pushes didn't arrive within 120 s. Real use stays far below the limit (at most one ordinary push per device every 2 minutes). **Fixed:** `test-push` now sends without a collapse key; the rules' pushes keep it, so an unreachable phone is still sent only the latest wake-up.
 6. **A thread leaked with every push-woken job.** Over 22 jobs the process went from 103 to 130 threads, and the `iroh-blob-store` threads from 3 to 25. Each job opened the photo store and closed it at the end; iroh-blobs' file store runs its own thread pool, and closing it leaves one thread behind (it drops the pool from one of the pool's own threads). On a phone woken all day this would grow without limit. **Fixed:** the engine opens the photo store once per process and every job's node shares it (`PhotoStore`, `SyncNode::bind_with_store`); a new loopback test checks that a shared store keeps working after the nodes using it close. Confirmed on the phone in run 4.
+7. **Normal-priority pushes don't reach a dozing phone in useful time** (run 5). Locked overnight, 0 of 20 led to a sync within 10 minutes; 2 arrived after 7–10 minutes and ran no job. This is Android's documented behaviour ([FCM message priority](https://firebase.google.com/docs/cloud-messaging/android-message-priority)), not a fault. Nothing to fix in M4; for Phase 1 (E6, E8): the "behind" status and the fallback prompt must not assume a normal-priority push has been acted on, and the proposed periodic catch-up job (E8) would be held in Doze too.
 
 ### Pass or fail
 
 | M4 "done when" | Result | Evidence |
 |---|---|---|
 | Android test 1 passes: a push wakes the closed app and sync finishes with no screen open | ✅ Pass (4 Nov 2026) | Test 1 |
-| The matrix results are recorded | ⏳ Script checked (run 2); the full matrix not yet run | Test 6 |
+| The matrix results are recorded | ✅ Recorded for all eight states (run 5, 5–6 Nov 2026) on one stock-like phone; no Samsung or Xiaomi phone was available | Test 6, run 5 |
 | With no push token, opening the app syncs with every reachable device, and a device that is behind shows the fallback prompt naming the holder | ✅ Pass (4 Nov 2026; test 5 owner-confirmed) | Tests 4 and 5 |

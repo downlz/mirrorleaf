@@ -68,6 +68,12 @@ abstract class BuildTask : DefaultTask() {
             }
             if (release) {
                 args("--release")
+                // Mirrorleaf (M7): the workspace's release profile strips symbols, but the
+                // engine's Kotlin bindings are generated from the library's uniffi metadata
+                // symbols. Keep the symbol table on Android; the app's build.rs drops its local
+                // symbols. Set the same variable around `cargo tauri android build` (CI does),
+                // or this step links the library a second time.
+                environment("CARGO_PROFILE_RELEASE_STRIP", "debuginfo")
             }
             args(listOf("--target", target))
         }.assertNormalExitValue()

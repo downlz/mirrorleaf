@@ -23,6 +23,8 @@ Mirrorleaf keeps notes only on the user's own devices and syncs them device to d
 | Types / tests | `pnpm -r typecheck`, `pnpm -r test` (the editor's tests include the Yjs ↔ yrs fixture check; `UPDATE_FIXTURES=1` rewrites the fixtures after a deliberate change) |
 | Mac app | in `apps/mirrorleaf/src-tauri`: `cargo tauri dev`; a release `.app` with `cargo tauri build --bundles app` (slow; CI builds the `.dmg`) |
 | Android APK (arm64, debug) | in `apps/mirrorleaf/src-tauri`: `cargo tauri android build --debug --target aarch64 --apk --ci` |
+| Android APK (arm64, release, for measuring) | in `apps/mirrorleaf/src-tauri`: `CARGO_PROFILE_RELEASE_STRIP=debuginfo cargo tauri android build --target aarch64 --apk --ci` (the bindings step needs the library's symbol table; `build.rs` keeps only its global symbols). The APK is unsigned: sign it with the debug key (`apksigner`, `~/.android/debug.keystore`) to install it over a debug build and keep the app's data. Release builds aren't debuggable, so `tools/mem-trace.py` and the web view debugger need the debug build |
+| Cold start | the app logs `cold start: N ms from process start to …` once per run (`startup.rs`); on the Mac run the binary in `Mirrorleaf.app/Contents/MacOS` from a terminal to see it |
 | Rust lint for Android | `cargo clippy --target aarch64-linux-android -p mirrorleaf-ffi -p mirrorleaf-app -- -D warnings`, with `CC_aarch64_linux_android` and `AR_aarch64_linux_android` pointing at the NDK's `aarch64-linux-android24-clang` and `llvm-ar` |
 | Phone logs | `adb logcat -s mirrorleaf` (the engine logs there; the push-woken job has no screen) |
 

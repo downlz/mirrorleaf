@@ -28,6 +28,7 @@ image = { version = "0.25.10", default-features = false, features = ["jpeg", "pn
 # Android only: the app's startup code hands the JVM and the application context
 # to Iroh's network code and to HTTPS certificate checks (ADR-005).
 jni = "0.22.4"
+libc = "0.2.191"
 ndk-context = "0.1.1"
 rustls-platform-verifier = "0.7.1"
 iroh = "=1.4.1"

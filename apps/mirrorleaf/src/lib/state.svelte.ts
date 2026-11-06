@@ -71,12 +71,25 @@ class AppState {
   focusSearch?: (selectAll?: boolean) => void;
 
   private messageTimer: ReturnType<typeof setTimeout> | undefined;
+  private readyReported = false;
 
   async start() {
     this.platform = await api.platform();
     await Promise.all([this.refresh(), this.loadStatus()]);
     if (this.layout !== 'narrow') this.selectFirst();
     await this.openShared();
+    // With a note beside the stream, the note view reports once its editor is open.
+    if (this.layout === 'narrow' || !this.selectedId) this.reportReady('note list');
+  }
+
+  /**
+   * The screen is ready to use: the engine logs the cold start once (plan §7.3,
+   * "first note editable"). Reported after the next paint, so drawing counts.
+   */
+  reportReady(what: 'note list' | 'open note') {
+    if (this.readyReported) return;
+    this.readyReported = true;
+    requestAnimationFrame(() => setTimeout(() => void api.startupDone(what).catch(() => {}), 0));
   }
 
   async refresh() {

@@ -112,8 +112,7 @@ jobs:
       - run: pnpm --filter @mirrorleaf/app build
 
   # M4: the Android app for arm64, with the engine and the Kotlin background
-  # code (ADR-005). Release builds for every CPU type and their size checks
-  # come with the M7 measurements.
+  # code (ADR-005). Release builds for every CPU type are `android-release`.
   android:
     name: Android app (arm64 debug APK)
     runs-on: ubuntu-24.04
@@ -141,38 +140,11 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Install the Tauri CLI
         run: cargo install tauri-cli --version 2.12.4 --locked
-      # The real google-services.json stays out of the public repo. With the
-      # GOOGLE_SERVICES_JSON secret set, CI uses it; without it (forks, or
-      # before the secret exists), a placeholder lets the app build, though it
-      # can't receive pushes.
+      # The real google-services.json is a secret; without it, a placeholder.
       - name: Firebase configuration
         env:
           GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
-        run: |
-          target=apps/mirrorleaf/src-tauri/gen/android/app/google-services.json
-          if [ -n "$GOOGLE_SERVICES_JSON" ]; then
-            printf '%s' "$GOOGLE_SERVICES_JSON" > "$target"
-          else
-            cat > "$target" <<'JSON'
-          {
-            "project_info": {
-              "project_number": "000000000000",
-              "project_id": "mirrorleaf-ci",
-              "storage_bucket": "mirrorleaf-ci.appspot.com"
-            },
-            "client": [
-              {
-                "client_info": {
-                  "mobilesdk_app_id": "1:000000000000:android:0000000000000000",
-                  "android_client_info": { "package_name": "app.mirrorleaf" }
-                },
-                "api_key": [{ "current_key": "ci-placeholder" }]
-              }
-            ],
-            "configuration_version": "1"
-          }
-          JSON
-          fi
+        run: .github/scripts/google-services.sh
       - name: Clippy for Android (engine startup code and app)
         run: |
           tc=$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
@@ -186,6 +158,74 @@ jobs:
         with:
           name: mirrorleaf-android-arm64-debug
           path: apps/mirrorleaf/src-tauri/gen/android/app/build/outputs/apk/universal/debug/*.apk
+          if-no-files-found: error
+
+  # M7: release APKs, one per CPU type, with the download size gate (plan §7.3:
+  # ≤ 25 MB per CPU type). Unsigned: signing comes with the store release (E13).
+  android-release:
+    name: Android release APK (${{ matrix.target }}) and size check
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64
+            rust: aarch64-linux-android
+          - target: armv7
+            rust: armv7-linux-androideabi
+          - target: x86_64
+            rust: x86_64-linux-android
+    env:
+      NDK_HOME: /usr/local/lib/android/sdk/ndk/29.0.14206865
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-release-${{ matrix.target }}
+      - uses: gradle/actions/setup-gradle@v6
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Install the Tauri CLI
+        run: cargo install tauri-cli --version 2.12.4 --locked
+      - name: Firebase configuration
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: .github/scripts/google-services.sh
+      # The bindings step needs the library's symbols (gen/android's BuildTask.kt sets the
+      # same for its own cargo run); packaging strips the library afterwards.
+      - name: Build the APK
+        working-directory: apps/mirrorleaf/src-tauri
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: debuginfo
+        run: cargo tauri android build --target ${{ matrix.target }} --apk --split-per-abi --ci
+      # The APK stores the native library uncompressed (Android maps it straight from
+      # the APK), so the file is about twice what a store download sends. The gate
+      # applies to the download, estimated as the APK compressed with gzip -9.
+      - name: Download size (gate ≤ 25 MB)
+        run: |
+          apk=$(find apps/mirrorleaf/src-tauri/gen/android/app/build/outputs/apk -name '*release*.apk' | head -n 1)
+          test -n "$apk"
+          size=$(stat -c %s "$apk")
+          download=$(gzip -9 -c "$apk" | wc -c)
+          echo "APK: $apk, $size bytes; compressed (download estimate): $download bytes"
+          unzip -lv "$apk" | sort -k1 -n -r | head -n 12
+          echo "### Android ${{ matrix.target }}: download about $((download / 1024)) KB (gate 25 MB), APK file $((size / 1024)) KB" >> "$GITHUB_STEP_SUMMARY"
+          test "$download" -le $((25 * 1024 * 1024))
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mirrorleaf-android-${{ matrix.target }}-release-unsigned
+          path: apps/mirrorleaf/src-tauri/gen/android/app/build/outputs/apk/**/release/*.apk
           if-no-files-found: error
 
   # M5: the macOS app for Apple silicon, unsigned (signing and notarising are
