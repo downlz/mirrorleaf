@@ -1,0 +1,4 @@
+<!-- Mirrorleaf icon: Resting leaf (notepad centred), Oat & Moss. Regenerate the icons with: cargo tauri icon icon-source/icon-manifest.json (run in src-tauri). -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="1080" viewBox="0 0 1080 1080">
+  <rect width="1080" height="1080" fill="#DFCFAE"/>
+</svg>
