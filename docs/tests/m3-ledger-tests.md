@@ -394,5 +394,14 @@ Owner-approved changes after M3 closed: pushes carry only their type (no device 
 |---|---|
 | Automated tests (5) | ✅ 10 rule and 9 integration tests pass against Postgres 18 (a throwaway container on the Mac); the three new `mirrorleaf-net` tests pass; clippy, fmt and `cargo deny` clean |
 | Ledger image rebuilt on the Mac | ✅ `docker compose build ledger`, 16 s with cached dependencies; not started (the ledger wasn't running) |
-| Test 6 A–C | Not yet run |
+| Test 6 A–C | ✅ Pass (7 Nov 2026, Claude; run below) |
+
+**Test 6, run 1 — 7 November 2026 (Claude, Phase 1 M8).** On the Mac only: the ledger (with the M8 FCM fix) in log-only mode on a throwaway Compose project (`docker compose -p m8test`, own database volume, `127.0.0.1:18080`, `FCM_SERVICE_ACCOUNT` empty), so the owner's ledger and data were untouched. Two CLI devices in their own data folders (`MIRRORLEAF_DIR`) on a throwaway developer account: "mac", and "ubuntu" registered with `--platform android` to stand in for a phone. Removed afterwards.
+
+| Part | Expected | Result |
+|---|---|---|
+| A, wake | `ubuntu holds the changes but can't be woken: …`, then `Open Mirrorleaf on ubuntu to sync.`; no push | ✅ Exactly that; no push in the ledger's log |
+| A, both open | The changes arrive with no push | ✅ "Test 6A" reached the Mac about 2 s after both watchers started: 3 changes, 763 bytes, direct; no push logged |
+| B | `Woke ubuntu (high priority) …`, `Waiting up to 90 s …`; rule 4's fallback about 60 s later; the prompt at 90 s | ✅ Rule 2's normal-priority deliver push when the Mac came online behind, then the high-priority wake; `push 333d7b6e high: fallback notification` 62 s after the wake; `Open Mirrorleaf on ubuntu to sync.` at +90 s |
+| C | `ubuntu's changes have arrived.`, no prompt | ✅ At +10 s, 2 s after "ubuntu" started watching; no prompt, and no fallback push in the 92 s after the wake |
 - The ledger is plain HTTP on the LAN; reaching it from mobile data (a tunnel with HTTPS) is decided in M4.

@@ -35,8 +35,9 @@ const DEFAULT_FCM_API: &str = "https://fcm.googleapis.com";
 /// Why a push wasn't sent.
 #[derive(Debug, thiserror::Error)]
 pub enum PushError {
-    /// FCM no longer knows the token (the app was uninstalled or its data
-    /// cleared): the ledger forgets it.
+    /// FCM won't take the token: it no longer knows it (the app was
+    /// uninstalled or its data cleared), or it was never a valid token. The
+    /// ledger forgets it.
     #[error("the push token is no longer valid")]
     Unregistered,
     #[error(transparent)]
@@ -206,6 +207,9 @@ impl Fcm {
             404 => Err(PushError::Unregistered),
             status => {
                 let text = response.text().await.unwrap_or_default();
+                if token_rejected(status, &text) {
+                    return Err(PushError::Unregistered);
+                }
                 Err(anyhow::anyhow!("FCM answered {status}: {text}").into())
             }
         }
@@ -283,6 +287,39 @@ impl Fcm {
     }
 }
 
+/// Whether an FCM error answer (other than 404) says the token itself is bad.
+///
+/// FCM answers 400 `INVALID_ARGUMENT` for a token that was never valid (M4
+/// finding 2). A 400 can also mean a fault in the message, which would hit
+/// every token, so only a 400 that names the token counts: a field violation
+/// on `message.token`, or FCM's "not a valid FCM registration token" message.
+/// An `UNREGISTERED` error code counts whatever the status.
+fn token_rejected(status: u16, body: &str) -> bool {
+    let Ok(answer) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    let error = &answer["error"];
+    let details = error["details"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if details.iter().any(|d| d["errorCode"] == "UNREGISTERED") {
+        return true;
+    }
+    if status != 400 || error["status"] != "INVALID_ARGUMENT" {
+        return false;
+    }
+    let names_the_token = details.iter().any(|d| {
+        d["fieldViolations"]
+            .as_array()
+            .is_some_and(|v| v.iter().any(|f| f["field"] == "message.token"))
+    });
+    names_the_token
+        || error["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("registration token"))
+}
+
 /// An HTTPS client using the ring crypto provider and the system's trust store.
 pub fn http_client() -> Result<reqwest::Client> {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -328,6 +365,51 @@ mod tests {
         assert_eq!(test["android"]["priority"], "HIGH");
         assert_eq!(test["data"], rule["data"]);
         assert_eq!(test["token"], "tok");
+    }
+
+    #[test]
+    fn only_answers_naming_the_token_reject_it() {
+        // FCM's answer for a malformed token (M4 finding 2).
+        let bad_token = json!({ "error": {
+            "code": 400,
+            "message": "The registration token is not a valid FCM registration token",
+            "status": "INVALID_ARGUMENT",
+            "details": [
+                { "@type": "type.googleapis.com/google.firebase.fcm.v1.FcmError",
+                  "errorCode": "INVALID_ARGUMENT" },
+                { "@type": "type.googleapis.com/google.rpc.BadRequest",
+                  "fieldViolations": [{ "field": "message.token",
+                    "description": "The registration token is not a valid FCM registration token" }] },
+            ],
+        }});
+        assert!(token_rejected(400, &bad_token.to_string()));
+        // The field violation alone is enough, and so is the message alone.
+        let mut violation_only = bad_token.clone();
+        violation_only["error"]["message"] = json!("Request contains an invalid argument.");
+        assert!(token_rejected(400, &violation_only.to_string()));
+        let mut message_only = bad_token.clone();
+        message_only["error"]["details"] = json!([]);
+        assert!(token_rejected(400, &message_only.to_string()));
+
+        // A fault in the message itself would hit every token: keep it.
+        let bad_message = json!({ "error": {
+            "code": 400,
+            "message": "Invalid value at 'message.android.priority'",
+            "status": "INVALID_ARGUMENT",
+            "details": [{ "@type": "type.googleapis.com/google.rpc.BadRequest",
+              "fieldViolations": [{ "field": "message.android.priority" }] }],
+        }});
+        assert!(!token_rejected(400, &bad_message.to_string()));
+
+        // UNREGISTERED in the details counts whatever the status.
+        let unregistered = json!({ "error": { "code": 400, "status": "INVALID_ARGUMENT",
+            "details": [{ "errorCode": "UNREGISTERED" }] }});
+        assert!(token_rejected(400, &unregistered.to_string()));
+
+        // Other statuses and unreadable answers keep the token.
+        assert!(!token_rejected(500, &bad_token.to_string()));
+        assert!(!token_rejected(429, "{}"));
+        assert!(!token_rejected(400, "<html>Bad Request</html>"));
     }
 
     #[test]

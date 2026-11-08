@@ -88,7 +88,7 @@ impl Ledger {
             Ok(()) => true,
             Err(PushError::Unregistered) => {
                 tracing::info!(
-                    "forgetting {}'s push token: FCM no longer knows it",
+                    "forgetting {}'s push token: FCM refuses it",
                     push.to.short()
                 );
                 if let Err(e) = db::forget_token(&self.db, &push.to, &push.token).await {

@@ -2,12 +2,12 @@
 
 | | |
 |---|---|
-| **Work** | E0 — Ledger readiness (proposed in `Ledger-Resilience-and-Hosting-Discussion.md`, 6 November 2026; **not yet in the implementation plan**) |
+| **Work** | E0 — Ledger readiness (proposed in `Ledger-Resilience-and-Hosting-Discussion.md`, 6 November 2026). Phase 1 milestone **M8** (ledger ready and reachable), which also adds the FCM 400 fix; this is M8's test record |
 | **Machines** | The Mac (OrbStack) for everything below; the phone for test 5 |
 | **Covers** | HTTPS through Caddy with no IP addresses logged (H1), request limits and the device cap (H2), a clean stop on SIGTERM (H3), a health check that asks the database (H4) |
-| **Date written** | 6 November 2026 |
+| **Date written** | 6 November 2026; M8 results 7 November 2026 |
 
-Left for the owner, outside this record: delete the old FCM key (H5), run M3 Test 6 A–C (H6, in [m3-ledger-tests.md](m3-ledger-tests.md)), deploy off the Mac (H7), and set up an uptime monitor on `/health`.
+Left for the owner, outside this record: delete the old FCM key (H5), deploy off the Mac (H7), and set up an uptime monitor on `/health`. M3 Test 6 A–C (H6) was run on 7 November 2026 (results in [m3-ledger-tests.md](m3-ledger-tests.md)).
 
 ---
 
@@ -19,6 +19,7 @@ Left for the owner, outside this record: delete the old FCM key (H5), run M3 Tes
 | H2 | `ledger/src/limits.rs`: limits that need no IP address. Each signing device gets 30 requests a minute, counted only after its signature checks out, so nobody can use up another device's allowance. New accounts are limited to 20 a minute across the ledger, counting only accounts it doesn't hold yet. Both rates can be set in `.env`, and 0 turns a limit off. An account holds at most 10 devices (`MAX_DEVICES_PER_ACCOUNT` in `mirrorleaf-proto`), checked under a lock on the account's row. New error codes: `rate_limited` (429) and `too_many_devices` (403). |
 | H3 | `main.rs` stops on SIGTERM as well as Ctrl-C and lets requests in progress finish. |
 | H4 | `GET /health` runs `SELECT 1`, waiting up to 3 s: it answers `ok` (200) or `database unavailable` (503). |
+| FCM 400 (M8; M4 finding 2) | FCM answers 400 `INVALID_ARGUMENT` for a token that was never valid, and the ledger used to forget a token only on 404, so it kept pushing to it. It now forgets a token on a 400 that **names the token**: a field violation on `message.token`, or FCM's "not a valid FCM registration token" message (`token_rejected` in `ledger/src/push.rs`). Any other 400 is a fault in the message and would hit every token, so the token is kept and the failure logged, as before. An `UNREGISTERED` error code counts whatever the status. The 400 that FCM sent the running ledger on 7 November 2026 for the made-up token of a stand-in device has exactly this shape. |
 
 **Not done as the discussion record proposed:** Caddy has no rate limiting without a custom build with a third-party plugin, so the limits live in the ledger and are keyed by device keys, not IP addresses. Per-IP limits at the edge stay an option for E10.
 
@@ -37,6 +38,15 @@ Left for the owner, outside this record: delete the old FCM key (H5), run M3 Tes
 | SIGTERM | ✅ The ledger logged "shutting down", then "stopped", and exited with status 0 within 0.04 s |
 | `docker compose build ledger` | ✅ Built (74 s); not started |
 | `docker compose config` | ✅ The default stack is `db` and `ledger` on `127.0.0.1:8080`; `--profile https` adds `caddy` |
+
+## Automated checks for M8 (Claude, 7 November 2026)
+
+| Check | Result |
+|---|---|
+| `cargo fmt`, `cargo clippy -p mirrorleaf-ledger --all-targets -D warnings` | ✅ Clean |
+| Unit tests | ✅ 16 pass. New: `only_answers_naming_the_token_reject_it` (FCM's malformed-token answer, the field violation or the message alone, a 400 for a fault in the message, `UNREGISTERED`, other statuses, an answer that isn't JSON) |
+| Integration tests against Postgres 18.6 (a throwaway container on the Mac) | ✅ 12 pass. `the_fcm_client_sends_http_v1_messages_and_drops_dead_tokens` now also has the fake FCM answer 400 for a malformed token: the token is forgotten and the device in use hears "no wakeable holder" at once. The 500 case still keeps its token |
+| Ledger image | ✅ Rebuilt with the fix (22 s with cached dependencies) |
 
 ---
 
@@ -108,9 +118,13 @@ Turn it off afterwards with `tailscale funnel reset`.
 
 | Test | Result |
 |---|---|
-| Automated checks | ✅ Pass (6 Nov 2026, Claude) |
-| 1. New ledger, clean stop | Not yet run |
-| 2. Health check | Not yet run |
-| 3. HTTPS on the Mac | Not yet run |
-| 4. Device cap by hand | Optional |
-| 5. Phone over mobile data | Not yet run |
+| Automated checks | ✅ Pass (6 Nov 2026, Claude; M8 additions 7 Nov 2026) |
+| 1. New ledger, clean stop | ✅ Pass (7 Nov 2026, Claude): `/health` answered `ok`; `docker compose stop ledger` took 0.32 s; the log ended with `shutting down: finishing requests in progress` and `stopped`; exit status 0 |
+| 2. Health check | ✅ Pass (7 Nov 2026, Claude): `database unavailable 503` while Postgres was stopped (answered in 0.26 s), `ok 200` one second after it started again |
+| 3. HTTPS on the Mac | ✅ Pass (7 Nov 2026, Claude): `ok` over HTTPS (HTTP/2, no `Server` header); an unsigned request reached the ledger and got its own 401; Caddy's 19 log lines (start-up and certificate messages) name no address, including after a TLS handshake with the wrong name |
+| 4. Device cap by hand | Not run (optional; `an_account_holds_at_most_ten_devices` covers it) |
+| 5. Phone over mobile data | Not yet run (owner: needs Tailscale Funnel on the Mac and the phone off Wi-Fi) |
+
+**How Claude ran tests 1–3 (7 November 2026).** Not on the owner's ledger: on a throwaway Compose project (`docker compose -p m8test`, its own database volume) published on `127.0.0.1:18080`, with `FCM_SERVICE_ACCOUNT` left empty (log-only), so the owner's database, Firebase key and `.env` were untouched. The commands are the ones above with `-p m8test` and port 18080. The throwaway project was removed afterwards (`down -v`).
+
+**Seen on the owner's ledger while starting OrbStack (7 November 2026).** It was still running the image from before E0 (container from 6 November, 18:50) and logged `FCM answered 400` for device `28460260`, the M3 stand-in "ubuntu" device with a made-up token: the case the M8 fix handles. Claude then rebuilt the owner's image and restarted the ledger on it (`docker compose up -d`; `.env`, the Firebase key and the database unchanged): `/health` answered `ok`, FCM on, still published on port 8080. The ledger forgets that token at its next push to it.

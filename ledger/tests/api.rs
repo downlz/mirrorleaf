@@ -666,9 +666,24 @@ async fn the_fcm_client_sends_http_v1_messages_and_drops_dead_tokens() {
                     assert_eq!(headers["authorization"], "Bearer fake-access");
                     let message = body["message"].clone();
                     let answer = match message["token"].as_str() {
-                        Some("gone") => StatusCode::NOT_FOUND,
-                        Some("broken") => StatusCode::INTERNAL_SERVER_ERROR,
-                        _ => StatusCode::OK,
+                        Some("gone") => (StatusCode::NOT_FOUND, String::new()),
+                        // FCM's answer for a token that was never valid
+                        // (M4 finding 2).
+                        Some("malformed") => (
+                            StatusCode::BAD_REQUEST,
+                            json!({ "error": {
+                                "code": 400,
+                                "message": "The registration token is not a valid FCM registration token",
+                                "status": "INVALID_ARGUMENT",
+                                "details": [{
+                                    "@type": "type.googleapis.com/google.rpc.BadRequest",
+                                    "fieldViolations": [{ "field": "message.token" }],
+                                }],
+                            }})
+                            .to_string(),
+                        ),
+                        Some("broken") => (StatusCode::INTERNAL_SERVER_ERROR, String::new()),
+                        _ => (StatusCode::OK, String::new()),
                     };
                     f.lock().unwrap().messages.push((project, message));
                     answer
@@ -753,11 +768,33 @@ async fn the_fcm_client_sends_http_v1_messages_and_drops_dead_tokens() {
         .unwrap();
     assert_eq!(token, None);
 
+    // FCM answers 400 naming the token for one that was never valid: the
+    // same as 404 (M4 finding 2).
+    phone.token = Some("malformed".into());
+    phone
+        .report(&t, &[(&laptop, 5), (&phone, 5)], Some(0))
+        .await;
+    t.advance(WAKE_INTERVAL_SECS);
+    let response = laptop.wake(&t).await;
+    assert_eq!(
+        (response["result"].as_str(), response["device"].as_str()),
+        (
+            Some("no_wakeable_holder"),
+            Some(phone.id().to_string().as_str())
+        )
+    );
+    let token: Option<String> = query_scalar("SELECT push_token FROM devices WHERE device_id = $1")
+        .bind(&phone.id().0[..])
+        .fetch_one(&t.ledger.db)
+        .await
+        .unwrap();
+    assert_eq!(token, None);
+
     // Any other failure (here a 500): the same answer, the token is kept, and
     // no fallback notification follows, because nothing is on its way.
     phone.token = Some("broken".into());
     phone
-        .report(&t, &[(&laptop, 5), (&phone, 5)], Some(0))
+        .report(&t, &[(&laptop, 5), (&phone, 6)], Some(0))
         .await;
     t.advance(WAKE_INTERVAL_SECS);
     let response = laptop.wake(&t).await;
