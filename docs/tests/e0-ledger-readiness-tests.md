@@ -7,7 +7,7 @@
 | **Covers** | HTTPS through Caddy with no IP addresses logged (H1), request limits and the device cap (H2), a clean stop on SIGTERM (H3), a health check that asks the database (H4) |
 | **Date written** | 6 November 2026; M8 results 7–8 November 2026 |
 
-Left for the owner, outside this record: deploy off the Mac (H7), and set up an uptime monitor on `/health`. **H5 done (owner, 8 November 2026):** the old service-account key was deleted in the Google Cloud console and `ledger/secrets/fcm-service-account-old.json` removed; the ledger uses `fcm-service-account.json`, which delivered the test 5 push. M3 Test 6 A–C (H6) was run on 7 November 2026 (results in [m3-ledger-tests.md](m3-ledger-tests.md)).
+Deploying off the Mac (H7) and an uptime monitor on `/health` moved to Phase 1 M13 (E10, production hosting; owner, 8 November 2026): until then the ledger stays on the Mac, started by hand for tests. **H5 done (owner, 8 November 2026):** the old service-account key was deleted in the Google Cloud console and `ledger/secrets/fcm-service-account-old.json` removed; the ledger uses `fcm-service-account.json`, which delivered the test 5 push. M3 Test 6 A–C (H6) was run on 7 November 2026 (results in [m3-ledger-tests.md](m3-ledger-tests.md)).
 
 ---
 

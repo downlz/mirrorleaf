@@ -11,6 +11,8 @@
 
   --bg: #fdfdfc;
   --list: #f5f6f3;
+  /* The stream beside a note: --list, but letting the glow through. */
+  --list-wash: rgba(240, 243, 237, 0.62);
   --card: #ffffff;
   --popover: #ffffff;
   --field: rgba(0, 0, 0, 0.06);
@@ -21,7 +23,8 @@
   --text: #1c211e;
   --muted: #6f7872;
   --faint: #a6aea8;
-  --line: #e6e9e4;
+  /* Translucent, so lines take on the glow behind them. */
+  --line: rgba(28, 46, 33, 0.1);
   --accent: #3b8f5c;
   --accent-text: #ffffff;
   --accent-soft: #e5f1e8;
@@ -34,12 +37,30 @@
   --tap: 30px;
   --row: 30px;
   color-scheme: light dark;
+
+  /* The glow behind the screen (owner, 8 Nov 2026). lib/aura.ts sets --aura
+     to three radial gradients coloured for the time of day; these are their
+     shapes: size, then centre. Beside the stream, the glow sits on the note. */
+  --aura: none;
+  --aura-core: 30% 36% at 57% 54%;
+  --aura-side: 28% 40% at 71% 44%;
+  --aura-halo: 50% 60% at 63% 50%;
+}
+
+/* Phone-sized: the glow sits on the stream, or on the note's sheet. */
+@media (max-width: 639px) {
+  :root {
+    --aura-core: 64% 26% at 40% 50%;
+    --aura-side: 56% 30% at 72% 42%;
+    --aura-halo: 100% 44% at 55% 47%;
+  }
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #161917;
     --list: #1c201d;
+    --list-wash: rgba(32, 37, 33, 0.6);
     --card: #222724;
     --popover: #262b28;
     --field: rgba(255, 255, 255, 0.08);
@@ -50,7 +71,7 @@
     --text: #e6eae6;
     --muted: #8e978f;
     --faint: #5f6862;
-    --line: #2b312d;
+    --line: rgba(220, 255, 230, 0.1);
     --accent: #62c98c;
     --accent-text: #08150d;
     --accent-soft: #1e3326;
@@ -86,7 +107,8 @@ body,
 body {
   font: 14px/1.4 var(--font);
   color: var(--text);
-  background: var(--bg);
+  background-color: var(--bg);
+  background-image: var(--aura);
   -webkit-font-smoothing: antialiased;
   overflow: hidden;
   /* The app's chrome isn't text to select; the editor is. */
@@ -149,7 +171,7 @@ h3 {
 .stream {
   width: 340px;
   flex: none;
-  background: var(--list);
+  background: var(--list-wash);
   border-right: 1px solid var(--line);
 }
 
@@ -157,9 +179,9 @@ h3 {
   width: 300px;
 }
 
+/* The note lies on the glow itself. */
 .note {
   flex: 1;
-  background: var(--bg);
   position: relative;
 }
 
@@ -167,6 +189,11 @@ h3 {
   width: 100%;
   flex: 1;
   border-right: 0;
+}
+
+/* On a phone the stream is the whole screen: no wash over the glow. */
+.layout-narrow .stream {
+  background: none;
 }
 
 .pane-header {
@@ -203,7 +230,8 @@ h3 {
   position: fixed;
   z-index: 25;
   inset: calc(env(safe-area-inset-top) + 18px) 0 0 0;
-  background: var(--bg);
+  background-color: var(--bg);
+  background-image: var(--aura);
   border-radius: 14px 14px 0 0;
   box-shadow: var(--shadow);
   overflow: hidden;
@@ -216,6 +244,18 @@ h3 {
 
 .note-sheet .pane {
   width: 100%;
+}
+
+/* More contrast asked for: plain colours, no glow. */
+@media (prefers-contrast: more) {
+  body,
+  .note-sheet {
+    background-image: none;
+  }
+
+  .stream {
+    background: var(--list);
+  }
 }
 
 .scrim {
@@ -915,6 +955,12 @@ kbd {
   border-radius: 0;
   padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom)
     env(safe-area-inset-left);
+}
+
+/* A narrow Mac window: below the window buttons, like the note's sheet. */
+:root[data-platform='macos'] .layout-narrow .sheet {
+  top: var(--header);
+  border-radius: 14px 14px 0 0;
 }
 
 .sheet-header {

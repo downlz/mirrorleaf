@@ -104,25 +104,28 @@
 
 <svelte:window onkeydown={keydown} />
 
+<!-- The overlays sit inside .app too (they are all fixed), so the layout
+     class reaches them: on phones Settings fills the screen and the note's
+     sheet gets the narrow margins. -->
 <div class="app layout-{app.layout}">
   <Stream leading />
   {#if !sheet}
     <NoteView />
   {/if}
+
+  {#if sheet && app.pane === 'note'}
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div class="scrim" onpointerdown={() => app.back()}></div>
+    <div class="note-sheet"><NoteView sheet /></div>
+  {/if}
+
+  {#if app.settings}
+    <Settings />
+  {/if}
+  {#if app.menu}
+    <Menu {...app.menu} onclose={() => (app.menu = null)} />
+  {/if}
+  {#if app.message}
+    <div class="toast" role="status">{app.message}</div>
+  {/if}
 </div>
-
-{#if sheet && app.pane === 'note'}
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="scrim" onpointerdown={() => app.back()}></div>
-  <div class="note-sheet"><NoteView sheet /></div>
-{/if}
-
-{#if app.settings}
-  <Settings />
-{/if}
-{#if app.menu}
-  <Menu {...app.menu} onclose={() => (app.menu = null)} />
-{/if}
-{#if app.message}
-  <div class="toast" role="status">{app.message}</div>
-{/if}
