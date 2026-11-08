@@ -634,10 +634,14 @@ async fn devices_can_be_removed_and_unseen_ones_are_pruned() {
 struct FakeFcm {
     tokens_issued: usize,
     messages: Vec<(String, Value)>,
+    /// An access token the fake refuses with 401, as Google does once one
+    /// has expired.
+    refuse: Option<String>,
 }
 
 /// The real FCM client against a fake FCM: the service-account token exchange,
-/// the message format, and forgetting a token FCM no longer knows.
+/// the message format, forgetting a token FCM no longer knows, and getting a
+/// new access token when FCM refuses the old one.
 #[tokio::test]
 async fn the_fcm_client_sends_http_v1_messages_and_drops_dead_tokens() {
     let Some(pem) = test_rsa_key() else {
@@ -651,8 +655,10 @@ async fn the_fcm_client_sends_http_v1_messages_and_drops_dead_tokens() {
             post(|State(f): State<Arc<Mutex<FakeFcm>>>, body: String| async move {
                 assert!(body.starts_with("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion="));
                 assert_eq!(body.rsplit('=').next().unwrap().split('.').count(), 3, "a signed JWT");
-                f.lock().unwrap().tokens_issued += 1;
-                axum::Json(json!({ "access_token": "fake-access", "expires_in": 3600 }))
+                let mut f = f.lock().unwrap();
+                f.tokens_issued += 1;
+                let token = format!("fake-access-{}", f.tokens_issued);
+                axum::Json(json!({ "access_token": token, "expires_in": 3600 }))
             }),
         )
         .route(
@@ -663,7 +669,16 @@ async fn the_fcm_client_sends_http_v1_messages_and_drops_dead_tokens() {
                  headers: HeaderMap,
                  axum::Json(body): axum::Json<Value>| async move {
                     assert_eq!(project, "mirrorleaf-test");
-                    assert_eq!(headers["authorization"], "Bearer fake-access");
+                    let bearer = headers["authorization"].to_str().unwrap().to_owned();
+                    assert!(bearer.starts_with("Bearer fake-access-"), "{bearer}");
+                    if f.lock().unwrap().refuse.as_deref() == Some(&bearer[7..]) {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            json!({ "error": { "code": 401, "status": "UNAUTHENTICATED",
+                                "details": [{ "reason": "ACCESS_TOKEN_EXPIRED" }] }})
+                            .to_string(),
+                        );
+                    }
                     let message = body["message"].clone();
                     let answer = match message["token"].as_str() {
                         Some("gone") => (StatusCode::NOT_FOUND, String::new()),
@@ -700,9 +715,9 @@ async fn the_fcm_client_sends_http_v1_messages_and_drops_dead_tokens() {
         "private_key": pem,
         "token_uri": format!("{api}/token"),
     });
-    let fcm = Fcm::new(&key_file.to_string(), Some(api)).unwrap();
+    let fcm = Arc::new(Fcm::new(&key_file.to_string(), Some(api)).unwrap());
 
-    let Some(t) = TestLedger::start_with(Some(Pusher::Fcm(fcm.into())), Limits::unlimited()).await
+    let Some(t) = TestLedger::start_with(Some(Pusher::Fcm(fcm.clone())), Limits::unlimited()).await
     else {
         return;
     };
@@ -817,6 +832,29 @@ async fn the_fcm_client_sends_http_v1_messages_and_drops_dead_tokens() {
     .await
     .unwrap();
     assert_eq!((token.as_deref(), wake_at), (Some("broken"), None));
+
+    // FCM refuses the access token (it expired while the machine slept, as on
+    // 8 November 2026, or was revoked): the client gets a new one and sends
+    // the push on the second try.
+    let refused = format!("fake-access-{}", fake.lock().unwrap().tokens_issued);
+    fake.lock().unwrap().refuse = Some(refused);
+    let sent = fake.lock().unwrap().messages.len();
+    let push = Push {
+        to: phone.id(),
+        token: "fine".into(),
+        priority: Priority::Normal,
+        kind: PushKind::Pull { from: laptop.id() },
+    };
+    assert!(fcm.send(&push).await.is_ok());
+    {
+        let fake = fake.lock().unwrap();
+        assert_eq!(fake.tokens_issued, 2, "a new access token after the 401");
+        assert_eq!(
+            fake.messages.len(),
+            sent + 1,
+            "sent once, on the second try"
+        );
+    }
     t.finish().await;
 }
 

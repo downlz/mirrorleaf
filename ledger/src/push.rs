@@ -9,7 +9,7 @@
 //! ledger's own log keeps the details, because it never leaves our server.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use data_encoding::{BASE64, BASE64URL_NOPAD};
@@ -148,7 +148,10 @@ pub struct Fcm {
     api: String,
     account: ServiceAccount,
     key: RsaKeyPair,
-    token: tokio::sync::Mutex<Option<(String, std::time::Instant)>>,
+    /// The access token and when to stop using it, by the wall clock: a
+    /// monotonic clock stops while the machine sleeps (a Mac, or a Docker VM
+    /// on one), and would keep a token Google has long since expired.
+    token: tokio::sync::Mutex<Option<(String, SystemTime)>>,
 }
 
 impl Fcm {
@@ -180,22 +183,16 @@ impl Fcm {
 
     /// Sends one message in FCM's HTTP v1 format (as [`message`] builds).
     pub async fn send_message(&self, message: Value) -> Result<String, PushError> {
-        let token = self.access_token().await?;
-        let url = format!(
-            "{}/v1/projects/{}/messages:send",
-            self.api, self.account.project_id
-        );
         let body =
             serde_json::to_vec(&json!({ "message": message })).map_err(anyhow::Error::from)?;
-        let response = self
-            .http
-            .post(url)
-            .bearer_auth(token)
-            .header("content-type", "application/json")
-            .body(body)
-            .send()
-            .await
-            .map_err(anyhow::Error::from)?;
+        let mut response = self.post_message(&body).await?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            // FCM refused the access token (expired early or revoked): get a
+            // new one and try once more.
+            tracing::info!("FCM refused the access token: getting a new one");
+            *self.token.lock().await = None;
+            response = self.post_message(&body).await?;
+        }
         match response.status().as_u16() {
             200..=299 => {
                 let body = response.bytes().await.map_err(anyhow::Error::from)?;
@@ -215,12 +212,30 @@ impl Fcm {
         }
     }
 
+    /// Posts one message, with the current access token.
+    async fn post_message(&self, body: &[u8]) -> Result<reqwest::Response, PushError> {
+        let token = self.access_token().await?;
+        let url = format!(
+            "{}/v1/projects/{}/messages:send",
+            self.api, self.account.project_id
+        );
+        Ok(self
+            .http
+            .post(url)
+            .bearer_auth(token)
+            .header("content-type", "application/json")
+            .body(body.to_vec())
+            .send()
+            .await
+            .map_err(anyhow::Error::from)?)
+    }
+
     /// An OAuth access token, from Google's token endpoint with a signed JWT
-    /// (the service-account flow), reused until shortly before it expires.
+    /// (the service-account flow), reused until 5 minutes before it expires.
     async fn access_token(&self) -> Result<String> {
         let mut cached = self.token.lock().await;
         if let Some((token, expires)) = cached.as_ref()
-            && *expires > std::time::Instant::now()
+            && *expires > SystemTime::now()
         {
             return Ok(token.clone());
         }
@@ -249,16 +264,13 @@ impl Fcm {
         }
         let token: Token = serde_json::from_slice(&response.bytes().await?)?;
         let lifetime = Duration::from_secs(token.expires_in.saturating_sub(300));
-        *cached = Some((
-            token.access_token.clone(),
-            std::time::Instant::now() + lifetime,
-        ));
+        *cached = Some((token.access_token.clone(), SystemTime::now() + lifetime));
         Ok(token.access_token)
     }
 
     /// The JWT asking for an FCM access token, signed RS256 with the key.
     fn jwt(&self) -> Result<String> {
-        let now = std::time::SystemTime::now()
+        let now = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
         let header = json!({ "alg": "RS256", "typ": "JWT" });
