@@ -17,7 +17,14 @@ use sqlx_postgres::{PgPool, PgRow, Postgres};
 use crate::rules::{Device, Wake};
 
 /// The migrations, in order. Each runs once, in a transaction.
-const MIGRATIONS: &[(i32, &str)] = &[(1, include_str!("../migrations/0001_init.sql"))];
+const MIGRATIONS: &[(i32, &str)] = &[
+    (1, include_str!("../migrations/0001_init.sql")),
+    (2, include_str!("../migrations/0002_pairing.sql")),
+];
+
+/// The highest pairing number handed out. Numbers are reused once free, so
+/// they stay short; this many devices pairing at once fills them.
+const MAX_NAMEPLATE: i32 = 9999;
 
 /// An arbitrary constant for Postgres' advisory lock, so two ledgers starting
 /// at once don't both migrate.
@@ -356,10 +363,82 @@ pub async fn delete_account(pool: &PgPool, account: &AccountId) -> Result<()> {
     Ok(())
 }
 
-/// Removes devices not seen for 90 days, and accounts left with none. Returns
-/// how many devices went.
+/// Gives `device` a pairing number valid until `expires_at` (E1): the lowest
+/// one free, so word codes stay short. Replaces the device's earlier number.
+/// `None` if every number is taken.
+pub async fn offer_pairing(
+    pool: &PgPool,
+    device: &DeviceId,
+    now: i64,
+    expires_at: i64,
+) -> Result<Option<u32>> {
+    // Two devices asking at once may pick the same number; the loser tries again.
+    for _ in 0..5 {
+        let mut tx = pool.begin().await?;
+        query("DELETE FROM pairing WHERE device_id = $1 OR expires_at <= $2")
+            .bind(&device.0[..])
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        let inserted: Result<Option<i32>, sqlx_core::Error> = query_scalar(
+            "INSERT INTO pairing (nameplate, device_id, expires_at)
+             SELECT n, $1, $2 FROM generate_series(1, $3) AS n
+             WHERE NOT EXISTS (SELECT 1 FROM pairing p WHERE p.nameplate = n)
+             ORDER BY n LIMIT 1
+             RETURNING nameplate",
+        )
+        .bind(&device.0[..])
+        .bind(expires_at)
+        .bind(MAX_NAMEPLATE)
+        .fetch_optional(&mut *tx)
+        .await;
+        match inserted {
+            Ok(nameplate) => {
+                tx.commit().await?;
+                return Ok(nameplate.map(|n| n as u32));
+            }
+            Err(e) if is_unique_violation(&e) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    anyhow::bail!("couldn't find a free pairing number")
+}
+
+/// The device a pairing number points to, unless it ran out.
+pub async fn lookup_pairing(pool: &PgPool, nameplate: u32, now: i64) -> Result<Option<DeviceId>> {
+    let row: Option<Vec<u8>> =
+        query_scalar("SELECT device_id FROM pairing WHERE nameplate = $1 AND expires_at > $2")
+            .bind(nameplate as i32)
+            .bind(now)
+            .fetch_optional(pool)
+            .await?;
+    row.map(|bytes| key(bytes).map(DeviceId)).transpose()
+}
+
+/// Withdraws `device`'s pairing number. Harmless if it is already gone.
+pub async fn cancel_pairing(pool: &PgPool, device: &DeviceId, nameplate: u32) -> Result<()> {
+    query("DELETE FROM pairing WHERE nameplate = $1 AND device_id = $2")
+        .bind(nameplate as i32)
+        .bind(&device.0[..])
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+fn is_unique_violation(e: &sqlx_core::Error) -> bool {
+    e.as_database_error()
+        .and_then(|d| d.code())
+        .is_some_and(|code| code == "23505")
+}
+
+/// Removes devices not seen for 90 days, accounts left with none, and pairing
+/// numbers that ran out. Returns how many devices went.
 pub async fn prune(pool: &PgPool, now: i64) -> Result<u64> {
     let mut tx = pool.begin().await?;
+    query("DELETE FROM pairing WHERE expires_at <= $1")
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
     let pruned = query("DELETE FROM devices WHERE last_seen < $1")
         .bind(now - PRUNE_AFTER_SECS)
         .execute(&mut *tx)

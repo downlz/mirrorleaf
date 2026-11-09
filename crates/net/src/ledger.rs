@@ -3,8 +3,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use iroh::SecretKey;
 use mirrorleaf_proto::ledger::{
-    Approval, DEVICE_HEADER, DeviceKey, LedgerError, Platform, Register, SIGNATURE_HEADER,
-    StatusResponse, StatusUpdate, TIME_HEADER, WakeResponse, error_code,
+    Approval, DEVICE_HEADER, DeviceKey, LedgerError, PairingLookup, PairingOffer, Platform,
+    Register, SIGNATURE_HEADER, StatusResponse, StatusUpdate, TIME_HEADER, WakeResponse,
+    error_code,
 };
 use mirrorleaf_proto::{AccountId, DeviceId, VersionVector};
 
@@ -44,9 +45,9 @@ pub struct LedgerClient {
 }
 
 impl LedgerClient {
-    /// A client for the ledger at `url`. In Phase 0 every device of a developer
-    /// account holds the account key, so the device approves itself; real
-    /// pairing (E1) hands the new device an approval instead.
+    /// A client for the ledger at `url`. The device registers with the
+    /// account key's approval: the one pairing handed over (E1), or one the
+    /// device signs itself with the account key it holds.
     pub fn new(
         url: &str,
         secret: &SecretKey,
@@ -54,15 +55,14 @@ impl LedgerClient {
         profile: DeviceProfile,
     ) -> Result<Self> {
         let key = DeviceKey::from_bytes(secret.to_bytes());
-        let account_key = account
-            .key
-            .as_ref()
-            .context("this device doesn't hold the account key, so it can't register itself")?;
-        let approval = Approval::AddDevice.sign(account_key, &key.id());
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()?;
+        let approval = match (&account.approval, &account.key) {
+            (Some(approval), _) => approval.clone(),
+            (None, Some(account_key)) => Approval::AddDevice.sign(account_key, &key.id()),
+            (None, None) => bail!(
+                "this device has neither the account key nor its approval, so it can't register"
+            ),
+        };
+        let http = http_client()?;
         Ok(Self {
             base: url.trim_end_matches('/').to_owned(),
             http,
@@ -140,32 +140,82 @@ impl LedgerClient {
         self.send("DELETE", &path, b"{}".to_vec()).await.map(drop)
     }
 
-    /// Sends a signed request and returns the response body.
+    /// Asks for a short number pointing to this device for the next 10
+    /// minutes, to start a word code with (E1). Replaces this device's earlier
+    /// number, if any.
+    pub async fn offer_pairing(&self) -> Result<PairingOffer> {
+        let response = self.send("POST", "/v1/pairing", b"{}".to_vec()).await?;
+        Ok(serde_json::from_slice(&response)?)
+    }
+
+    /// Withdraws this device's pairing number once it has been used or
+    /// cancelled.
+    pub async fn cancel_pairing(&self, nameplate: u32) -> Result<()> {
+        let path = format!("/v1/pairing/{nameplate}");
+        self.send("DELETE", &path, b"{}".to_vec()).await.map(drop)
+    }
+
     async fn send(&self, method: &str, path: &str, body: Vec<u8>) -> Result<Vec<u8>> {
-        let time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs() as i64;
-        let signature = self.key.sign_request(method, path, time, &body);
-        let response = self
-            .http
-            .request(method.parse()?, format!("{}{path}", self.base))
-            .header(DEVICE_HEADER, self.key.id().to_string())
-            .header(TIME_HEADER, time.to_string())
-            .header(SIGNATURE_HEADER, signature)
-            .header("content-type", "application/json")
-            .body(body)
-            .send()
-            .await
-            .with_context(|| format!("can't reach the ledger at {}", self.base))?;
-        let status = response.status();
-        let bytes = response.bytes().await?.to_vec();
-        if status.is_success() {
-            return Ok(bytes);
+        send(&self.http, &self.base, &self.key, method, path, body).await
+    }
+}
+
+/// Which device a word code's number points to (E1). A new device asks this
+/// before it belongs to any account: the request is signed with its own key,
+/// which the ledger needn't know.
+pub async fn lookup_pairing(url: &str, secret: &SecretKey, nameplate: u32) -> Result<DeviceId> {
+    let key = DeviceKey::from_bytes(secret.to_bytes());
+    let base = url.trim_end_matches('/');
+    let path = format!("/v1/pairing/{nameplate}");
+    match send(&http_client()?, base, &key, "GET", &path, Vec::new()).await {
+        Ok(body) => Ok(serde_json::from_slice::<PairingLookup>(&body)?.device),
+        Err(e) if is(&e, error_code::NOT_FOUND) => {
+            bail!(
+                "no device is showing a code starting with {nameplate}: check the number, or make a new code"
+            )
         }
-        match serde_json::from_slice::<LedgerError>(&bytes) {
-            Ok(error) => Err(Refused(error).into()),
-            Err(_) => bail!("the ledger answered {status}"),
-        }
+        Err(e) => Err(e),
+    }
+}
+
+fn http_client() -> Result<reqwest::Client> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    Ok(reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()?)
+}
+
+/// Sends a request signed with `key` and returns the response body.
+async fn send(
+    http: &reqwest::Client,
+    base: &str,
+    key: &DeviceKey,
+    method: &str,
+    path: &str,
+    body: Vec<u8>,
+) -> Result<Vec<u8>> {
+    let time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+    let signature = key.sign_request(method, path, time, &body);
+    let response = http
+        .request(method.parse()?, format!("{base}{path}"))
+        .header(DEVICE_HEADER, key.id().to_string())
+        .header(TIME_HEADER, time.to_string())
+        .header(SIGNATURE_HEADER, signature)
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .with_context(|| format!("can't reach the ledger at {base}"))?;
+    let status = response.status();
+    let bytes = response.bytes().await?.to_vec();
+    if status.is_success() {
+        return Ok(bytes);
+    }
+    match serde_json::from_slice::<LedgerError>(&bytes) {
+        Ok(error) => Err(Refused(error).into()),
+        Err(_) => bail!("the ledger answered {status}"),
     }
 }
 

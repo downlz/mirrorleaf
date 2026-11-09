@@ -47,6 +47,7 @@ pub fn plugins(builder: tauri::Builder<Wry>) -> tauri::Builder<Wry> {
 pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     init_logging();
     let dir = app.path().app_data_dir()?;
+    mirrorleaf_ffi::set_app_version(app.package_info().version.to_string());
     let engine = Engine::open(dir.to_string_lossy().into_owned(), device_name())?;
 
     #[cfg(target_os = "macos")]

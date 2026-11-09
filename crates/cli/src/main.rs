@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand};
 use mirrorleaf_core::{BlobHash, BlobKind, Block, PhotoRef, Replica, photos};
 use mirrorleaf_net::device::{self, DeviceDir, device_names, device_of, ledger_client, me};
 use mirrorleaf_net::ledger::{DeviceProfile, Fallback, LedgerClient, PROMPT_AFTER};
+use mirrorleaf_net::pair::{self, JoinRequest, PairingCode, PairingEvent, WordCode};
 use mirrorleaf_net::{
     Account, BlobStorage, DevTicket, Event, Network, SecretKey, State, SyncNode, describe,
 };
@@ -19,7 +20,7 @@ use mirrorleaf_proto::ledger::{Platform, StatusResponse, WakeResponse};
 const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Parser)]
-#[command(version, about = "Mirrorleaf headless peer (Phase 0)")]
+#[command(version, about = "Mirrorleaf headless peer")]
 struct Cli {
     /// This device's data folder [default: $MIRRORLEAF_DIR, or ~/.mirrorleaf-dev]
     #[arg(long, global = true)]
@@ -36,9 +37,14 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
-    /// Developer accounts for Phase 0 (real pairing comes in Phase 1)
+    /// Developer accounts: `new` starts an account; `ticket` and `join` are
+    /// Phase 0's way to add a device, kept for tests (use `pair` instead)
     #[command(name = "dev-account", subcommand)]
     DevAccount(DevAccount),
+    /// Add a device to the account with a QR or word code, a four-digit check
+    /// and approval (E1)
+    #[command(subcommand)]
+    Pair(PairCmd),
     #[command(subcommand)]
     Note(Note),
     #[command(subcommand)]
@@ -68,6 +74,26 @@ enum DevAccount {
     Ticket,
     /// Join an account from a ticket, then sync with the inviting device
     Join { ticket: String },
+}
+
+#[derive(Subcommand)]
+enum PairCmd {
+    /// Show a code for a new device, ask before letting it in, and keep syncing
+    /// until Ctrl-C. Stop any other `sync --watch` for this device first.
+    Invite {
+        /// Let in whichever device proves it knows the code, without asking
+        /// (for scripted tests)
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Join an account with a code from one of its devices: the QR code's
+    /// text (MLP1…) or the word code (7-acoustic-planet-river)
+    Join {
+        code: String,
+        /// The ledger to look a word code up on, if this device has none yet
+        #[arg(long)]
+        ledger: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -182,6 +208,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Init { name } => init(&dir, name),
         Command::DevAccount(cmd) => dev_account(&dir, cmd).await,
+        Command::Pair(cmd) => pair_cmd(&dir, cmd).await,
         Command::Note(cmd) => note(&dir, cmd),
         Command::Photo(cmd) => photo(&dir, cmd).await,
         Command::Ledger(cmd) => ledger(&dir, cmd).await,
@@ -206,7 +233,9 @@ fn init(dir: &Path, name: Option<String>) -> Result<()> {
         device_of(&secret),
         dir.display()
     );
-    println!("Next: `dev-account new` here, or `dev-account join <ticket>` from another device.");
+    println!(
+        "Next: `dev-account new` to start an account here, or `pair join <code>` with a code from a device already on one."
+    );
     Ok(())
 }
 
@@ -292,6 +321,217 @@ async fn dev_account(dir: &Path, cmd: DevAccount) -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn pair_cmd(dir: &Path, cmd: PairCmd) -> Result<()> {
+    match cmd {
+        PairCmd::Invite { yes } => invite(dir, yes).await,
+        PairCmd::Join { code, ledger } => join(dir, &code, ledger).await,
+    }
+}
+
+/// The inviting device: live sync plus an invitation (E1).
+async fn invite(dir: &Path, yes: bool) -> Result<()> {
+    let (secret, replica) = open(dir)?;
+    let account =
+        Account::load(&replica)?.context("no account yet: run `dev-account new` first")?;
+    let ledger = ledger_client(&replica, &secret, &account)?;
+    let node = SyncNode::bind(
+        State { replica, account },
+        secret,
+        Network::Internet,
+        DeviceDir::new(dir).blob_storage(),
+    )
+    .await?;
+    if let Some(ledger) = ledger {
+        node.use_ledger(ledger);
+    }
+    let (events, mut log) = tokio::sync::mpsc::unbounded_channel();
+    let watching = {
+        let node = node.clone();
+        tokio::spawn(async move { node.watch(events).await })
+    };
+    if tokio::time::timeout(Duration::from_secs(15), node.online())
+        .await
+        .is_err()
+    {
+        eprintln!("warning: no relay connection yet; the QR code holds direct addresses only");
+    }
+    // A word code needs the ledger to turn its number into this device.
+    let words = match node.ledger() {
+        Some(ledger) => match ledger.offer_pairing().await {
+            Ok(offer) => Some(WordCode::generate(offer.nameplate)),
+            Err(e) => {
+                eprintln!(
+                    "no word code: the ledger didn't give a number ({})",
+                    describe(&e)
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    let (tx, mut pairing) = tokio::sync::mpsc::unbounded_channel();
+    let invitation = node.invite(words, tx);
+    let qr = invitation.qr.to_string();
+    println!("Scan this on the new device:\n");
+    println!("{}", terminal_qr(&qr)?);
+    println!("or give it this text:\n{qr}\n");
+    if let Some(words) = &invitation.words {
+        println!("or type this code on it:  {words}\n");
+    }
+    println!("It works once, for 10 minutes. Ctrl-C to stop.");
+
+    let label = |id: DeviceId| {
+        let state = node.state().lock().unwrap();
+        state
+            .account
+            .devices
+            .list
+            .entry(&id)
+            .map_or_else(|| id.short(), |d| d.name.clone())
+    };
+    // The pairing events end once the code is used; syncing carries on.
+    let mut pairing_open = true;
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                node.cancel_invitation();
+                break;
+            }
+            event = pairing.recv(), if pairing_open => match event {
+                Some(PairingEvent::Request { name, platform, number, answer }) => {
+                    println!("\n“{name}” ({platform}) wants to join. Check that it shows {number}.");
+                    let allow = yes || tokio::task::spawn_blocking(|| {
+                        eprint!("Allow it? [y/N] ");
+                        let mut line = String::new();
+                        std::io::stdin().read_line(&mut line).map(|_| line.trim().eq_ignore_ascii_case("y"))
+                    }).await?.unwrap_or(false);
+                    if allow { answer.allow() } else { answer.deny() }
+                }
+                Some(PairingEvent::Joined { device, name }) => {
+                    println!("{name} ({}) joined the account. Syncing; Ctrl-C to stop.", device.short());
+                }
+                Some(PairingEvent::Ended(reason)) => {
+                    println!("The code stopped working: {reason}.");
+                    break;
+                }
+                None => pairing_open = false,
+            },
+            event = log.recv() => match event {
+                Some(Event::Synced { peer, path, report, .. }) if report.sent_changes + report.received_changes > 0 => {
+                    println!(
+                        "{} via {path}: sent {}, received {} changes",
+                        label(peer), report.sent_changes, report.received_changes
+                    );
+                }
+                Some(Event::Connected { peer, path, incoming }) => {
+                    let how = if incoming { "connected from" } else { "connected to" };
+                    println!("{how} {} via {path}", label(peer));
+                }
+                Some(_) => {}
+                None => break,
+            },
+        }
+    }
+    watching.abort();
+    if node.ledger().is_some() {
+        let _ = node.go_offline().await;
+    }
+    node.close().await;
+    Ok(())
+}
+
+/// The new device's side (E1).
+async fn join(dir: &Path, code: &str, ledger: Option<String>) -> Result<()> {
+    let (secret, mut replica) = open(dir)?;
+    if Account::load(&replica)?.is_some() {
+        bail!("this device already belongs to an account");
+    }
+    let code: PairingCode = code.parse()?;
+    let lookup = ledger.clone().or_else(|| {
+        device::ledger_settings(&replica)
+            .ok()
+            .flatten()
+            .map(|(url, _)| url)
+    });
+    let target = code.resolve(&secret, lookup.as_deref()).await?;
+    let request = JoinRequest {
+        name: device::device_name(&replica)?,
+        platform: Platform::this(),
+        app_version: format!("cli {}", mirrorleaf_net::app_version()),
+    };
+    println!("Connecting to your other device…");
+    let welcome = pair::join(
+        secret.clone(),
+        Network::Internet,
+        &target,
+        request,
+        |number| {
+            println!("Check that your other device shows {number}, and allow this one there.");
+        },
+    )
+    .await?;
+    let me = device_of(&secret);
+    let account = Account::from_pairing(
+        welcome.account_secret,
+        welcome.devices,
+        welcome.approval,
+        &me,
+    )?;
+    account.save(&mut replica)?;
+    println!("Joined account {}", account.id());
+
+    // Use the account's ledger too, unless this device already has one.
+    if let Some(url) = welcome.ledger.or(target.ledger).or(ledger)
+        && device::ledger_settings(&replica)?.is_none()
+    {
+        let profile = DeviceProfile {
+            platform: Platform::this(),
+            push_token: None,
+            notifications: false,
+        };
+        device::save_ledger(&mut replica, &url, &profile)?;
+        match LedgerClient::new(&url, &secret, &account, profile)?
+            .register()
+            .await
+        {
+            Ok(()) => println!("Registered with the ledger at {url}."),
+            Err(e) => println!(
+                "Couldn't register with the ledger yet ({}); `sync` tries again.",
+                describe(&e)
+            ),
+        }
+    }
+
+    let node = SyncNode::bind(
+        State { replica, account },
+        secret,
+        Network::Internet,
+        BlobStorage::Memory,
+    )
+    .await?;
+    let started = Instant::now();
+    match tokio::time::timeout(DIAL_TIMEOUT, node.sync_once(target.inviter)).await {
+        Ok(Ok((path, report))) => println!(
+            "Synced with your other device via {path}: received {} changes in {:.1} s",
+            report.received_changes,
+            started.elapsed().as_secs_f64()
+        ),
+        Ok(Err(e)) => println!("Couldn't sync yet ({}); run `sync` later.", describe(&e)),
+        Err(_) => println!("Your other device didn't answer; run `sync` later."),
+    }
+    node.close().await;
+    Ok(())
+}
+
+/// A QR code drawn with half-height blocks, two rows of modules per line.
+fn terminal_qr(text: &str) -> Result<String> {
+    let code = qrcode::QrCode::new(text.as_bytes())?;
+    Ok(code
+        .render::<qrcode::render::unicode::Dense1x2>()
+        .quiet_zone(true)
+        .build())
 }
 
 fn note(dir: &Path, cmd: Note) -> Result<()> {

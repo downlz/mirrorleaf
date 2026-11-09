@@ -18,9 +18,11 @@ use tokio::runtime::Runtime;
 use tracing::{info, warn};
 
 mod native;
+mod pairing;
 mod screen;
 
 pub use native::{DecodedPixels, PhotoDecoder};
+pub use pairing::{Invitation, PairingStatus};
 use screen::OpenNote;
 pub use screen::{FolderItem, NoteItem, NoteList, PhotoInfo, UiEvent};
 
@@ -150,6 +152,8 @@ pub struct Engine {
     decoder: Mutex<Option<Arc<dyn mirrorleaf_core::photos::PlatformDecoder>>>,
     /// A note the screen should open when it can (one shared from another app).
     pending_open: Mutex<Option<String>>,
+    /// Adding a device, on either side (E1).
+    pairing: Mutex<pairing::Pairing>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -328,6 +332,7 @@ impl Engine {
             ui: Mutex::default(),
             decoder: Mutex::default(),
             pending_open: Mutex::default(),
+            pairing: Mutex::default(),
         })
     }
 
@@ -382,19 +387,6 @@ impl Engine {
             *lock(&self.node) = None;
             node.close().await;
         }
-    }
-
-    async fn begin_job(&self) -> anyhow::Result<SyncNode> {
-        let mut slot = self.slot.lock().await;
-        let node = self.bind(&mut slot).await?;
-        slot.jobs += 1;
-        Ok(node)
-    }
-
-    async fn end_job(&self) {
-        let mut slot = self.slot.lock().await;
-        slot.jobs = slot.jobs.saturating_sub(1);
-        self.release_if_idle(&mut slot).await;
     }
 
     /// Gives the bound node a ledger client with the current settings (a new

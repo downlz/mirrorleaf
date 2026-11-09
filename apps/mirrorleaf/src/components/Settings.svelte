@@ -1,24 +1,26 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api } from '../lib/api';
+  import { api, type Permissions } from '../lib/api';
   import { app } from '../lib/state.svelte';
+  import AddDevice from './AddDevice.svelte';
   import Icon from './Icon.svelte';
   import SyncStatus from './SyncStatus.svelte';
 
-  // Phase 0's developer account (plan §5.4). Real pairing with QR codes, the
-  // recovery kit and app lock replace this in Phase 1 (E1–E4).
-  let ticketIn = $state('');
-  let ticketOut = $state('');
   let ledgerUrl = $state('');
   let note = $state('');
   let busy = $state(false);
   let autostart = $state<boolean | null>(null);
+  /** Android's sync permissions (E1): asked when adding a device, changeable here. */
+  let permissions = $state<Permissions | null>(null);
+  /** Settings itself, or adding a device (E1, direction A). */
+  let view = $state<'settings' | 'add'>('settings');
 
   const status = $derived(app.status);
 
   onMount(async () => {
     ledgerUrl = app.status?.ledger_url ?? '';
     if (app.isDesktop) autostart = (await app.run(api.autostart)) ?? null;
+    if (app.platform === 'android') permissions = (await app.run(api.permissions)) ?? null;
   });
 
   async function act(action: () => Promise<string>) {
@@ -31,22 +33,8 @@
     await app.refresh();
   }
 
-  async function showTicket() {
-    busy = true;
-    ticketOut = (await app.run(api.ticket)) ?? '';
-    busy = false;
-  }
-
-  async function copyTicket(event: MouseEvent) {
-    const field = (event.currentTarget as HTMLElement)
-      .previousElementSibling as HTMLTextAreaElement;
-    field.select();
-    try {
-      await navigator.clipboard.writeText(ticketOut);
-      note = 'Ticket copied.';
-    } catch {
-      note = 'Selected: press ⌘C to copy.';
-    }
+  async function allow(which: 'notifications' | 'nearby') {
+    permissions = (await app.run(() => api.requestPermissions([which]))) ?? permissions;
   }
 
   async function setAutostart(enabled: boolean) {
@@ -54,8 +42,15 @@
     autostart = (await app.run(api.autostart)) ?? autostart;
   }
 
+  async function leaveAdding() {
+    view = 'settings';
+    await app.loadStatus();
+  }
+
   function keydown(event: KeyboardEvent) {
-    if (event.key === 'Escape') app.closeSettings();
+    if (event.key !== 'Escape') return;
+    if (view === 'add') void leaveAdding();
+    else app.closeSettings();
   }
 </script>
 
@@ -63,55 +58,36 @@
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div class="scrim" onpointerdown={() => app.closeSettings()}></div>
-<div class="sheet" role="dialog" aria-modal="true" aria-label="Settings">
+<div
+  class="sheet"
+  role="dialog"
+  aria-modal="true"
+  aria-label={view === 'add' ? 'Add a device' : 'Settings'}
+>
   <header class="sheet-header">
-    <h1 class="grow">Settings</h1>
+    {#if view === 'add'}
+      <button class="icon-button" title="Back to Settings" onclick={leaveAdding}>
+        <Icon name="back" />
+      </button>
+    {/if}
+    <h1 class="grow">{view === 'add' ? 'Add a device' : 'Settings'}</h1>
     <button class="icon-button" title="Close" onclick={() => app.closeSettings()}>
       <Icon name="close" />
     </button>
   </header>
 
   <div class="sheet-body">
-    {#if status}
+    {#if view === 'add'}
+      <section><AddDevice /></section>
+    {:else if status}
       <section>
         <h2>Sync</h2>
         <SyncStatus />
-        {#if !status.account}
-          <p class="hint">
-            Notes sync only between your own devices. Start an account on your first device, then
-            join it from the others with a ticket.
-          </p>
-          <div class="actions">
-            <button class="primary" disabled={busy} onclick={() => act(api.createAccount)}
-              >Start a new account</button
-            >
-          </div>
-          <label class="field">
-            <span>Join with a ticket from another device</span>
-            <textarea rows="3" bind:value={ticketIn} placeholder="mlt1…"></textarea>
-          </label>
-          <div class="actions">
-            <button
-              disabled={busy || !ticketIn.trim()}
-              onclick={() => act(() => api.join(ticketIn))}>Join</button
-            >
-          </div>
-        {:else}
+        {#if status.account}
           <p class="hint">Account {status.account.slice(0, 8)}</p>
-          {#if ticketOut}
-            <label class="field">
-              <span
-                >Ticket for a new device. It holds the account key: share it only with your own
-                devices.</span
-              >
-              <textarea rows="4" readonly value={ticketOut}></textarea>
-              <button onclick={copyTicket}>Copy</button>
-            </label>
-          {:else}
-            <div class="actions">
-              <button disabled={busy} onclick={showTicket}>Add a device…</button>
-            </div>
-          {/if}
+          <div class="actions">
+            <button onclick={() => (view = 'add')}>Add a device…</button>
+          </div>
 
           <h3>Devices</h3>
           <ul class="devices">
@@ -141,6 +117,30 @@
         {#if note}<p class="result">{note}</p>{/if}
       </section>
 
+      {#if permissions && (!permissions.notifications || !permissions.nearby)}
+        <section>
+          <h2>This {app.deviceWord}</h2>
+          {#if !permissions.notifications}
+            <div class="permission-row">
+              <span class="grow">
+                <b>Notifications are off</b>
+                <small>Your other devices can't wake this {app.deviceWord} to sync.</small>
+              </span>
+              <button onclick={() => allow('notifications')}>Allow</button>
+            </div>
+          {/if}
+          {#if !permissions.nearby}
+            <div class="permission-row">
+              <span class="grow">
+                <b>Nearby devices are off</b>
+                <small>Sync goes over the internet, even on the same Wi-Fi.</small>
+              </span>
+              <button onclick={() => allow('nearby')}>Allow</button>
+            </div>
+          {/if}
+        </section>
+      {/if}
+
       {#if status.account}
         <section>
           <h2>Ledger</h2>
@@ -150,7 +150,12 @@
           </p>
           <label class="field">
             <span>Address</span>
-            <input type="url" bind:value={ledgerUrl} placeholder="http://192.168.1.20:8080" />
+            <input
+              id="ledger-url"
+              type="url"
+              bind:value={ledgerUrl}
+              placeholder="http://192.168.1.20:8080"
+            />
           </label>
           <div class="actions">
             <button

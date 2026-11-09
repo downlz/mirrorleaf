@@ -9,6 +9,7 @@
 mod commands;
 #[cfg(desktop)]
 mod desktop;
+mod device;
 mod photos;
 mod picker;
 #[cfg(target_os = "macos")]
@@ -30,7 +31,7 @@ pub fn run() {
         .on_menu_event(desktop::on_menu_event)
         .on_window_event(desktop::on_window_event);
     #[cfg(target_os = "android")]
-    let builder = builder.plugin(picker::init());
+    let builder = builder.plugin(picker::init()).plugin(device::init());
     let app = builder
         .register_asynchronous_uri_scheme_protocol(photos::SCHEME, photos::handle)
         .setup(|app| {
@@ -45,9 +46,16 @@ pub fn run() {
             commands::platform,
             commands::status,
             commands::create_account,
-            commands::ticket,
-            commands::join,
             commands::use_ledger,
+            commands::set_device_name,
+            commands::invite,
+            commands::answer_pairing,
+            commands::cancel_pairing,
+            commands::pairing_status,
+            commands::join_with_code,
+            commands::scan_code,
+            commands::permissions,
+            commands::request_permissions,
             commands::fallback_prompt,
             commands::note_list,
             commands::create_note,

@@ -1,5 +1,6 @@
 use anyhow::{Result, bail};
 use iroh::endpoint::{RecvStream, SendStream};
+use mirrorleaf_proto::ledger::Platform;
 use mirrorleaf_proto::{
     DeviceId, DeviceListMerge, Hello, Message, PROTOCOL_VERSIONS, VersionVector, choose_version,
 };
@@ -38,11 +39,18 @@ pub(crate) async fn handshake(
             device: state.replica.device(),
             account: state.account.id(),
             device_list: state.account.devices.clone(),
+            app_version: crate::app_version().to_owned(),
+            platform: Platform::this(),
         }
     };
-    write(send, &Message::Hello(ours.clone()), &mut traffic.sent).await?;
+    write(
+        send,
+        &Message::Hello(Box::new(ours.clone())),
+        &mut traffic.sent,
+    )
+    .await?;
     let theirs = match read(recv, &mut traffic.received).await? {
-        Message::Hello(hello) => hello,
+        Message::Hello(hello) => *hello,
         other => bail!("expected Hello, got {other:?}"),
     };
 

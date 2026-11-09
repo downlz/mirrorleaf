@@ -6,10 +6,12 @@
 
 import type { NoteMeta } from '@mirrorleaf/editor';
 import type { MenuItem } from '../components/Menu.svelte';
-import { api, type EngineStatus, type FolderItem, type NoteItem } from './api';
+import { api, type EngineStatus, type FolderItem, type NoteItem, type PairingStatus } from './api';
 import { counts, hasTitle, visibleNotes, viewTitle, type View } from './notes';
 
 export type Layout = 'wide' | 'medium' | 'narrow';
+/** What Android's back gesture closes, newest first. */
+type Overlay = 'note' | 'settings' | 'welcome';
 /** What a phone-sized screen shows: the stream, or a note as a sheet over it. */
 export type Pane = 'list' | 'note';
 
@@ -42,6 +44,10 @@ class AppState {
   fresh = $state<string | null>(null);
   /** The open popover menu, if any. */
   menu = $state<{ items: MenuItem[]; x: number; y: number } | null>(null);
+  /** Adding a device, on either side (E1). */
+  pairing = $state<PairingStatus>({ state: 'idle' });
+  /** On first run, the sheet over the welcome page, if one is open. */
+  welcomeSheet = $state<'create' | 'join' | null>(null);
 
   layout = $derived(layoutFor(this.width));
   visible = $derived(visibleNotes(this.notes, this.view, this.search));
@@ -55,6 +61,18 @@ class AppState {
   /** Primitive, so the editor reopens only when this actually changes. */
   selectedTrashed = $derived(this.selected?.trashed ?? false);
   isDesktop = $derived(['macos', 'linux', 'windows'].includes(this.platform));
+  /** No account yet: the welcome page instead of the stream (direction A, owner, 9 Nov 2026). */
+  needsAccount = $derived(this.status !== null && !this.status.account);
+  /** What to call this device in sentences: "Add this phone to my account". */
+  deviceWord = $derived(
+    this.platform === 'android'
+      ? this.layout === 'narrow'
+        ? 'phone'
+        : 'tablet'
+      : this.platform === 'macos'
+        ? 'Mac'
+        : 'computer',
+  );
 
   /** Set by the note view while an editor is open (not reactive). */
   editorHooks: {
@@ -106,6 +124,14 @@ class AppState {
     }
   }
 
+  async loadPairing() {
+    try {
+      this.pairing = await api.pairingStatus();
+    } catch (error) {
+      this.fail(error);
+    }
+  }
+
   async loadStatus() {
     try {
       this.status = await api.status();
@@ -115,10 +141,15 @@ class AppState {
     }
   }
 
-  fail(error: unknown) {
-    this.message = error instanceof Error ? error.message : String(error);
+  /** Shows a short message for a few seconds. */
+  notify(message: string) {
+    this.message = message;
     clearTimeout(this.messageTimer);
     this.messageTimer = setTimeout(() => (this.message = null), MESSAGE_FOR_MS);
+  }
+
+  fail(error: unknown) {
+    this.notify(error instanceof Error ? error.message : String(error));
   }
 
   /** Runs an action, showing its error if it fails. */
@@ -150,9 +181,9 @@ class AppState {
   // The note sheet and Settings each add a history entry, so Android's back
   // gesture (which goes back in the web view) closes the newest one (M6).
   // Closing them from the screen goes back through history too.
-  private overlays: ('note' | 'settings')[] = [];
+  private overlays: Overlay[] = [];
 
-  private pushOverlay(kind: 'note' | 'settings') {
+  private pushOverlay(kind: Overlay) {
     if (this.overlays.includes(kind)) return;
     this.overlays.push(kind);
     history.pushState({ mirrorleaf: kind }, '');
@@ -177,7 +208,16 @@ class AppState {
     this.closeOverlay('note');
   }
 
-  private closeOverlay(kind: 'note' | 'settings') {
+  openWelcomeSheet(kind: 'create' | 'join') {
+    this.welcomeSheet = kind;
+    this.pushOverlay('welcome');
+  }
+
+  closeWelcomeSheet() {
+    this.closeOverlay('welcome');
+  }
+
+  private closeOverlay(kind: Overlay) {
     if (this.overlays.at(-1) === kind) {
       history.back();
     } else {
@@ -186,9 +226,10 @@ class AppState {
     }
   }
 
-  private close(kind: 'note' | 'settings') {
+  private close(kind: Overlay) {
     if (kind === 'note') this.pane = 'list';
-    else this.settings = false;
+    else if (kind === 'settings') this.settings = false;
+    else this.welcomeSheet = null;
   }
 
   /** The back gesture, or a close that went through history. */

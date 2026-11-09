@@ -6,6 +6,7 @@
   import NoteView from './components/NoteView.svelte';
   import Settings from './components/Settings.svelte';
   import Stream from './components/Stream.svelte';
+  import Welcome from './components/Welcome.svelte';
 
   // How often the status and the fallback prompt are checked while open. The
   // prompt is time-based (plan §5.9: 90 s after a wake), so it needs a timer.
@@ -35,6 +36,7 @@
         if (event.kind === 'notes_changed') refreshSoon();
         else if (event.kind === 'status_changed') void app.loadStatus();
         else if (event.kind === 'open_note') void app.openShared();
+        else if (event.kind === 'pairing_changed') void app.loadPairing();
         else app.editorHooks.photo?.(event.hash);
       }),
       // The window is closing: send the editor's last edits first.
@@ -67,7 +69,7 @@
     (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName));
 
   function keydown(event: KeyboardEvent) {
-    if (event.defaultPrevented || app.settings || app.menu) return;
+    if (event.defaultPrevented || app.settings || app.menu || app.needsAccount) return;
     const mod = event.metaKey || event.ctrlKey;
     if (mod && !event.altKey && !event.shiftKey) {
       if (event.key === 'k' || event.key === 'f') {
@@ -108,19 +110,24 @@
      class reaches them: on phones Settings fills the screen and the note's
      sheet gets the narrow margins. -->
 <div class="app layout-{app.layout}">
-  <Stream leading />
-  {#if !sheet}
-    <NoteView />
-  {/if}
+  {#if app.needsAccount}
+    <!-- First run: no account yet (E1, direction A). -->
+    <Welcome />
+  {:else}
+    <Stream leading />
+    {#if !sheet}
+      <NoteView />
+    {/if}
 
-  {#if sheet && app.pane === 'note'}
-    <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div class="scrim" onpointerdown={() => app.back()}></div>
-    <div class="note-sheet"><NoteView sheet /></div>
-  {/if}
+    {#if sheet && app.pane === 'note'}
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <div class="scrim" onpointerdown={() => app.back()}></div>
+      <div class="note-sheet"><NoteView sheet /></div>
+    {/if}
 
-  {#if app.settings}
-    <Settings />
+    {#if app.settings}
+      <Settings />
+    {/if}
   {/if}
   {#if app.menu}
     <Menu {...app.menu} onclose={() => (app.menu = null)} />

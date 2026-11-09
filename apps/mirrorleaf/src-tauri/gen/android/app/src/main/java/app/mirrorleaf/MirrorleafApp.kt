@@ -7,6 +7,7 @@ import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import app.mirrorleaf.engine.Engine
+import app.mirrorleaf.engine.setAppVersion
 import com.google.firebase.messaging.FirebaseMessaging
 import java.io.File
 import kotlinx.coroutines.CoroutineScope
@@ -25,6 +26,8 @@ class MirrorleafApp : Application() {
         super.onCreate()
         System.loadLibrary("mirrorleaf_app_lib")
         MirrorleafNative.init(this)
+        // Devices tell each other their version when they connect and pair.
+        setAppVersion(packageManager.getPackageInfo(packageName, 0).versionName ?: "unknown")
         engine = Engine.open(File(filesDir, "mirrorleaf").path, deviceName())
         // HEIC and AVIF photos are decoded by Android (plan §5.5, M6).
         engine.setPhotoDecoder(PhotoDecoding)

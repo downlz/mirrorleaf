@@ -19,6 +19,9 @@ mirrorleaf-proto = { path = "crates/proto" }
 anyhow = "1.0.104"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
 blake3 = "1.8.7"
+# The English word list for pairing codes (E1) and the recovery kit's 12 words
+# (E2). Only the list and its checksum: no wallet code. CC0-1.0.
+bip39 = { version = "3.0.0", default-features = false }
 clap = { version = "4.6.7", features = ["derive"] }
 core-foundation = "0.10.1"
 data-encoding = "2.11.1"
@@ -41,6 +44,12 @@ rand = "0.10.3"
 # HTTPS to the ledger and to FCM, through the rustls and ring Iroh already uses.
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider"] }
 ring = "0.17.14"
+# The PAKE behind pairing codes (E1). A pre-release, pinned exactly: 0.5 uses the
+# curve25519-dalek 5, sha2 0.11, hkdf 0.13 and rand_core 0.10 already in the tree,
+# where the stable 0.4 would add older copies of each (owner, 8 Nov 2026).
+spake2 = { version = "=0.5.0-pre.0", default-features = false, features = ["getrandom"] }
+# QR codes for pairing (E1), drawn as SVG.
+qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }

@@ -70,21 +70,64 @@ pub fn create_account() -> Result<String> {
 }
 
 #[tauri::command]
-pub async fn ticket() -> Result<String> {
-    engine()?.ticket().await.map_err(text)
-}
-
-#[tauri::command]
-pub async fn join(ticket: String) -> Result<String> {
-    let engine = engine()?;
-    let joined = engine.clone().join(ticket).await.map_err(text)?;
-    go_live(engine);
-    Ok(joined)
-}
-
-#[tauri::command]
 pub async fn use_ledger(url: String) -> Result<String> {
     engine()?.use_ledger(url).await.map_err(text)
+}
+
+// --- Adding a device (E1) ---
+
+#[tauri::command]
+pub fn set_device_name(name: String) -> Result<()> {
+    engine()?.set_device_name(name).map_err(text)
+}
+
+/// Shows a QR code and a word code for a new device.
+#[tauri::command]
+pub async fn invite() -> Result<mirrorleaf_ffi::Invitation> {
+    engine()?.invite().await.map_err(text)
+}
+
+#[tauri::command]
+pub fn answer_pairing(allow: bool) -> Result<()> {
+    engine()?.answer_pairing(allow).map_err(text)
+}
+
+#[tauri::command]
+pub fn cancel_pairing() -> Result<()> {
+    engine()?.cancel_pairing();
+    Ok(())
+}
+
+#[tauri::command]
+pub fn pairing_status() -> Result<mirrorleaf_ffi::PairingStatus> {
+    Ok(engine()?.pairing_status())
+}
+
+/// Joins an account with a code from one of its devices.
+#[tauri::command]
+pub async fn join_with_code(code: String, ledger: Option<String>) -> Result<String> {
+    engine()?.join_with_code(code, ledger).await.map_err(text)
+}
+
+/// Scans another device's QR code (Android). `None` if cancelled.
+#[tauri::command]
+pub async fn scan_code(app: tauri::AppHandle) -> Result<Option<String>> {
+    crate::device::scan(&app).await
+}
+
+/// Whether notifications and nearby devices are allowed (always on the desktop).
+#[tauri::command]
+pub async fn permissions(app: tauri::AppHandle) -> Result<crate::device::Permissions> {
+    crate::device::permissions(&app).await
+}
+
+/// Asks Android for "notifications" and/or "nearby", where not granted yet.
+#[tauri::command]
+pub async fn request_permissions(
+    app: tauri::AppHandle,
+    which: Vec<String>,
+) -> Result<crate::device::Permissions> {
+    crate::device::request_permissions(&app, which).await
 }
 
 /// The device to name in "Open Mirrorleaf on <name> to sync", once due.

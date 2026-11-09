@@ -20,9 +20,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use mirrorleaf_proto::ledger::{
-    self, Approval, DeviceStatus, LedgerError, Register, RemoveDevice, StatusResponse,
-    StatusUpdate, WakeResponse,
+    self, Approval, DeviceStatus, LedgerError, PairingLookup, PairingOffer, Register, RemoveDevice,
+    StatusResponse, StatusUpdate, WakeResponse,
 };
+use mirrorleaf_proto::pair::CODE_LIFETIME_SECS;
 use mirrorleaf_proto::{AccountId, DeviceId};
 use sqlx_postgres::PgPool;
 
@@ -66,6 +67,11 @@ impl Ledger {
             .route("/v1/devices/me/status", put(status))
             .route("/v1/devices/{id}", delete(remove_device))
             .route("/v1/wake", post(wake))
+            .route("/v1/pairing", post(offer_pairing))
+            .route(
+                "/v1/pairing/{nameplate}",
+                get(lookup_pairing).delete(cancel_pairing),
+            )
             .with_state(self)
     }
 
@@ -256,6 +262,60 @@ impl FromRequest<Ledger> for Signed {
         }
         Ok(Signed { device, body })
     }
+}
+
+/// `POST /v1/pairing` (E1): a number pointing to the signer for 10 minutes, to
+/// start a word code with. Only a registered device may ask: it is already on
+/// an account.
+async fn offer_pairing(
+    State(l): State<Ledger>,
+    req: Signed,
+) -> Result<Json<PairingOffer>, ApiError> {
+    if db::account_of(&l.db, &req.device).await?.is_none() {
+        return Err(ApiError::unknown_device());
+    }
+    let now = l.now();
+    let expires_at = now + CODE_LIFETIME_SECS as i64;
+    match db::offer_pairing(&l.db, &req.device, now, expires_at).await? {
+        Some(nameplate) => Ok(Json(PairingOffer {
+            nameplate,
+            expires_at,
+        })),
+        None => Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "busy",
+            "too many devices are pairing right now; try again in a few minutes",
+        )),
+    }
+}
+
+/// `GET /v1/pairing/{nameplate}` (E1): the device a number points to. Any
+/// signer may ask, registered or not: the new device hasn't joined yet. The
+/// answer is a device ID only; the word code's words, the PAKE password, never
+/// reach the ledger.
+async fn lookup_pairing(
+    State(l): State<Ledger>,
+    Path(nameplate): Path<u32>,
+    _req: Signed,
+) -> Result<Json<PairingLookup>, ApiError> {
+    match db::lookup_pairing(&l.db, nameplate, l.now()).await? {
+        Some(device) => Ok(Json(PairingLookup { device })),
+        None => Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            ledger::error_code::NOT_FOUND,
+            "no device is showing a code with that number",
+        )),
+    }
+}
+
+/// `DELETE /v1/pairing/{nameplate}` (E1): the signer withdraws its number.
+async fn cancel_pairing(
+    State(l): State<Ledger>,
+    Path(nameplate): Path<u32>,
+    req: Signed,
+) -> Result<StatusCode, ApiError> {
+    db::cancel_pairing(&l.db, &req.device, nameplate).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `GET /health`: "ok" while the database answers, 503 otherwise. Unsigned,

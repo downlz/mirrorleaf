@@ -17,6 +17,8 @@ async fn node(name: &str, account: impl FnOnce(DeviceEntry) -> Account) -> SyncN
     let account = account(DeviceEntry {
         id: device,
         name: name.into(),
+        platform: None,
+        added_at: 0,
     });
     SyncNode::bind(
         State { replica, account },
@@ -434,6 +436,8 @@ async fn a_shared_photo_store_outlives_the_nodes_using_it() {
         let account = Account::create(DeviceEntry {
             id: device,
             name: "phone".into(),
+            platform: None,
+            added_at: 0,
         });
         let node = SyncNode::bind_with_store(
             State { replica, account },

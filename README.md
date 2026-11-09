@@ -51,11 +51,11 @@ You need a physical Android phone with USB debugging on; Android 17 is the targe
 
    ```bash
    cd apps/mirrorleaf/src-tauri
-   cargo tauri android build --debug --target aarch64 --apk --ci
+   MIRRORLEAF_DEFAULT_LEDGER=http://<mac address>:8080 cargo tauri android build --debug --target aarch64 --apk --ci
    adb install -r gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
    ```
 
-The build bundles the notes screen first (`pnpm build`), so run `pnpm install` once beforehand. In Settings the app joins a developer account from a ticket, registers with a ledger, and shows the device's sync status. Pushes from the ledger wake the app in the background; follow it with `adb logcat -s mirrorleaf`. The step-by-step test is in [docs/tests/m4-android-tests.md](docs/tests/m4-android-tests.md). The full Android screen is M6.
+The build bundles the notes screen first (`pnpm build`), so run `pnpm install` once beforehand. `MIRRORLEAF_DEFAULT_LEDGER` is the ledger a new phone asks about a word code before it belongs to an account (optional: a scanned QR code carries the ledger's address, and the joining sheet has a **Ledger…** field). On first start the app offers **Start a new account**, **Add this phone to my account** (scan the other device's code, or type its words) and **Recover my account** (from M10). Settings shows the devices, adds new ones, and sets the ledger. Pushes from the ledger wake the app in the background; follow it with `adb logcat -s mirrorleaf`. The step-by-step test is in [docs/tests/m4-android-tests.md](docs/tests/m4-android-tests.md). The full Android screen is M6.
 
 ## Run the Mac app
 
@@ -67,7 +67,7 @@ cargo tauri dev            # development: the screen reloads from Vite
 cargo tauri build --bundles app   # a release .app in target/release/bundle/macos/
 ```
 
-- **First start:** open Settings (⌘, or the sliders button above the search field) and either start a new account or join one with a ticket from another device (`mirrorleaf-cli dev-account ticket` on the CLI, or Settings → Add a device… in another app).
+- **First start:** choose **Start a new account**, or **Add this Mac to my account** and type the words another device shows under Settings → Devices → Add a device (or paste its code as text). Both devices show the same four-digit number, and the other device asks before letting this one in. The step-by-step test is in [docs/tests/m9-identity-tests.md](docs/tests/m9-identity-tests.md).
 - **Finding and creating:** just start typing: the search field filters the notes, Enter opens the top match, and if no note has that title Enter creates one. ⌘K (Ctrl+K) goes back to the search field from anywhere; Esc in a note does too. Folders are the chips under the search field (+ adds one).
 - **Notes:** the first line of a note is its title. Type `/` for headings, lists, checklists, quotes, dividers and photos; **Aa** in the toolbar for paragraph styles and bold, italic, underline and strikethrough. Drop or paste photos into a note, including HEIC. Right-click a note or a folder chip (long-press on a touch screen) for pin, move, rename and delete.
 - **The agent:** closing the window leaves Mirrorleaf syncing from the menu bar (the leaf icon); its menu shows who it is syncing with and has **Quit Mirrorleaf**. "Open at login" is off until you turn it on in Settings → This computer (it stays off by default until the app has proved reliable). The Mac going to sleep tells the ledger this device is offline; waking it reconnects.
@@ -84,24 +84,25 @@ On the first device:
 
 ```bash
 mirrorleaf-cli init --name laptop
-mirrorleaf-cli dev-account new
+mirrorleaf-cli dev-account new         # starts an account
 mirrorleaf-cli note new "Groceries" --text "milk"
-mirrorleaf-cli dev-account ticket      # prints a join ticket
-mirrorleaf-cli sync --watch            # keep this running
+mirrorleaf-cli pair invite             # shows a QR code, its text, and words; keep it running
 ```
 
-On the second device, paste the ticket:
+On the second device, use the words (with a ledger) or the QR code's text (`MLP1…`):
 
 ```bash
 mirrorleaf-cli init --name ubuntu
-mirrorleaf-cli dev-account join <ticket>
+mirrorleaf-cli pair join 7-acoustic-planet-river --ledger http://<ledger>:8080
 mirrorleaf-cli note list
 mirrorleaf-cli sync --watch
 ```
 
+Both print the same four-digit number, and `pair invite` asks before letting the device in (`--yes` lets it in without asking, for scripts). A code works once, for 10 minutes. `pair invite` keeps syncing until Ctrl-C, so stop any other `sync --watch` for that device first. A phone or a Mac app can join a CLI device's account the same way, or show a code for a CLI device to join.
+
 Edits made in another terminal (`note edit <id> --append "eggs"`) reach the other device within seconds. `sync --watch` reports each connection as **direct** or **relay**, with the time and bytes each sync took. `status` shows the devices and how many changes this device holds from each.
 
-> The join ticket contains the account key. Share it only with your own devices. Phase 0 developer accounts are for testing; real pairing comes later.
+> Phase 0's `dev-account ticket` and `dev-account join` still work between CLI devices, for tests. A ticket contains the account key: share it only with your own devices.
 
 ### Photos
 

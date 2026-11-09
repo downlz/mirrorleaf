@@ -9,6 +9,7 @@ use anyhow::{Result, ensure};
 use iroh::endpoint::{Connection, Incoming, presets};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMode, SecretKey};
 use mirrorleaf_core::{BlobKind, Replica};
+use mirrorleaf_proto::pair::PAIR_ALPN;
 use mirrorleaf_proto::{ALPN, BlobHash, DeviceId, VersionVector};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -16,6 +17,7 @@ use crate::account::Account;
 use crate::blobs::{BlobStorage, Blobs, PhotoStore};
 use crate::frame::Traffic;
 use crate::ledger::{HEARTBEAT, LedgerClient, MIN_REPORT_INTERVAL, ONLINE_FOR_SECS};
+use crate::pair::{self, Invitation, OfferSlot, PairingEvent, WordCode};
 use crate::session::{Role, RoundReport, handshake, round};
 use crate::{AuthError, describe};
 
@@ -170,6 +172,8 @@ struct Inner {
     /// Whether this node opened its photo store, and so closes it.
     owns_store: bool,
     ledger: Mutex<Option<Arc<LedgerClient>>>,
+    /// The invitation to join the account this node is showing, if any (E1).
+    offer: OfferSlot,
 }
 
 /// What `watch` last told the ledger.
@@ -237,7 +241,11 @@ impl SyncNode {
         };
         let endpoint = builder
             .secret_key(secret)
-            .alpns(vec![ALPN.to_vec(), iroh_blobs::ALPN.to_vec()])
+            .alpns(vec![
+                ALPN.to_vec(),
+                PAIR_ALPN.to_vec(),
+                iroh_blobs::ALPN.to_vec(),
+            ])
             .bind()
             .await?;
         Ok(Self {
@@ -248,6 +256,7 @@ impl SyncNode {
                 blobs,
                 owns_store,
                 ledger: Mutex::default(),
+                offer: Arc::default(),
             }),
         })
     }
@@ -276,6 +285,32 @@ impl SyncNode {
 
     pub fn state(&self) -> &Arc<Mutex<State>> {
         &self.inner.state
+    }
+
+    /// Shows an invitation for a new device to join the account (E1): a QR
+    /// code, and `words` if the ledger gave this device a number. It works
+    /// once, for 10 minutes, and replaces any earlier invitation. What
+    /// happens arrives on `events`. Incoming pairing connections are served
+    /// by `accept` and `watch`, so one of them must be running.
+    pub fn invite(
+        &self,
+        words: Option<WordCode>,
+        events: UnboundedSender<PairingEvent>,
+    ) -> Invitation {
+        let ledger = self.ledger().map(|l| l.url().to_owned());
+        pair::invite(&self.inner.offer, self.addr(), words, ledger, events)
+    }
+
+    /// Stops showing the invitation, and withdraws its number from the ledger.
+    pub fn cancel_invitation(&self) {
+        let Some(offer) = self.inner.offer.lock().unwrap().take() else {
+            return;
+        };
+        if let (Some(ledger), Some(nameplate)) = (self.ledger(), offer.nameplate()) {
+            tokio::spawn(async move {
+                let _ = ledger.cancel_pairing(nameplate).await;
+            });
+        }
     }
 
     pub fn device(&self) -> DeviceId {
@@ -380,6 +415,20 @@ impl SyncNode {
         let conn = incoming.await?;
         if conn.alpn() == iroh_blobs::ALPN {
             self.serve_blobs(conn);
+            return Ok(None);
+        }
+        if conn.alpn() == PAIR_ALPN {
+            let (me, slot, state, ledger) = (
+                self.device(),
+                self.inner.offer.clone(),
+                self.inner.state.clone(),
+                self.ledger(),
+            );
+            tokio::spawn(async move {
+                if let Err(e) = pair::serve(conn, me, slot, state, ledger).await {
+                    tracing::warn!("pairing failed: {}", describe(&e));
+                }
+            });
             return Ok(None);
         }
         let (mut send, mut recv) = conn.accept_bi().await?;

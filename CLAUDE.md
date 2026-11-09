@@ -22,7 +22,7 @@ Mirrorleaf keeps notes only on the user's own devices and syncs them device to d
 | Lint / format | `pnpm lint`, `pnpm format` (CI runs `pnpm format:check`) |
 | Types / tests | `pnpm -r typecheck`, `pnpm -r test` (the editor's tests include the Yjs ↔ yrs fixture check; `UPDATE_FIXTURES=1` rewrites the fixtures after a deliberate change) |
 | Mac app | in `apps/mirrorleaf/src-tauri`: `cargo tauri dev`; a release `.app` with `cargo tauri build --bundles app` (slow; CI builds the `.dmg`) |
-| Android APK (arm64, debug) | in `apps/mirrorleaf/src-tauri`: `cargo tauri android build --debug --target aarch64 --apk --ci` |
+| Android APK (arm64, debug) | in `apps/mirrorleaf/src-tauri`: `cargo tauri android build --debug --target aarch64 --apk --ci`. Prefix `MIRRORLEAF_DEFAULT_LEDGER=http://192.168.1.13:8080` so a fresh phone can look up word codes on the Mac's ledger (M9) |
 | Android APK (arm64, release, for measuring) | in `apps/mirrorleaf/src-tauri`: `CARGO_PROFILE_RELEASE_STRIP=debuginfo cargo tauri android build --target aarch64 --apk --ci` (the bindings step needs the library's symbol table; `build.rs` keeps only its global symbols). The APK is unsigned: sign it with the debug key (`apksigner`, `~/.android/debug.keystore`) to install it over a debug build and keep the app's data. Release builds aren't debuggable, so `tools/mem-trace.py` and the web view debugger need the debug build |
 | Cold start | the app logs `cold start: N ms from process start to …` once per run (`startup.rs`); on the Mac run the binary in `Mirrorleaf.app/Contents/MacOS` from a terminal to see it |
 | Rust lint for Android | `cargo clippy --target aarch64-linux-android -p mirrorleaf-ffi -p mirrorleaf-app -- -D warnings`, with `CC_aarch64_linux_android` and `AR_aarch64_linux_android` pointing at the NDK's `aarch64-linux-android24-clang` and `llvm-ar` |
@@ -71,3 +71,12 @@ Mirrorleaf keeps notes only on the user's own devices and syncs them device to d
 - New Rust dependencies must pass `deny.toml` (permissive licences plus MPL-2.0, checked only for the platforms we build). Any advisory exception needs a reason naming the crate that pulls it in.
 - The change log is the source of truth: sync moves log rows and never loads Yjs documents. Keep it that way, so the Android background job stays small.
 - Formatters stay out of `docs/` and Markdown files.
+
+## Identity and pairing (M9, ADR-009)
+
+- Sync protocol 2 runs on the ALPN `mirrorleaf/sync/2`: builds before M9 (0.2.0) can't sync with M9 builds (0.2.5), so update every device together. One ALPN per protocol version; E11 can serve several.
+- Pairing is `crates/net/src/pair.rs` (ALPN `mirrorleaf/pair/1`, SPAKE2, one attempt per code), driven by the engine's `engine/pairing.rs` and the screen's `Welcome`, `JoinFlow` and `AddDevice` components. The CLI's `pair invite` and `pair join` exercise it without a screen.
+- The device list is version 2 (`device_list_v2` in `meta`); a Phase 0 list is converted on first open by any device holding the account key. Removed devices never come back: a removed device starts again with a new key.
+- A device's name can change only before it joins or starts an account: afterwards it is in the signed list.
+- Android asks for notifications and nearby devices in the joining sheet and in Settings (`PermissionsPlugin.kt`), never at app start. QR codes are scanned by `QrScannerPlugin.kt` (Google's code scanner, no camera permission).
+- Word codes need the ledger's pairing table (ledger migration 2): rebuild the ledger image after pulling M9.

@@ -75,7 +75,11 @@ impl DeviceDir {
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("{KEY_FILE} is corrupt"))?,
         );
-        let replica = Replica::open(self.path.join(DB_FILE), device_of(&secret))?;
+        let mut replica = Replica::open(self.path.join(DB_FILE), device_of(&secret))?;
+        // Phase 0's device list becomes version 2 the first time M9 opens it.
+        if Account::upgrade(&mut replica)? {
+            tracing::info!("converted the account's device list to version 2");
+        }
         Ok((secret, replica))
     }
 
@@ -110,6 +114,11 @@ pub fn me(replica: &Replica, secret: &SecretKey) -> Result<DeviceEntry> {
     Ok(DeviceEntry {
         id: device_of(secret),
         name: device_name(replica)?,
+        platform: Some(Platform::this()),
+        added_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
     })
 }
 

@@ -46,19 +46,57 @@ export interface NoteList {
   folders: FolderItem[];
 }
 
+/** What the inviting device shows (E1). */
+export interface Invitation {
+  /** The QR code as an SVG document, dark on white. */
+  qr_svg: string;
+  /** The text the QR code holds, for a device without a camera to paste. */
+  qr_text: string;
+  /** "7-acoustic-planet-river", when the device has a ledger. */
+  words: string | null;
+  expires_ms: number;
+}
+
+/** Where adding a device has got to, on either side (E1). */
+export type PairingStatus =
+  | { state: 'idle' }
+  | { state: 'inviting'; invitation: Invitation }
+  | { state: 'request'; name: string; platform: string; number: string }
+  | { state: 'connecting' }
+  | { state: 'confirm'; number: string }
+  | { state: 'joined'; name: string }
+  | { state: 'ended'; reason: string };
+
+/** Android's two sync permissions; always granted on the desktop. */
+export interface Permissions {
+  notifications: boolean;
+  nearby: boolean;
+}
+
 export type EngineEvent =
   | { kind: 'notes_changed' }
   | { kind: 'photo_arrived'; hash: string }
   | { kind: 'status_changed' }
-  | { kind: 'open_note'; id: string };
+  | { kind: 'open_note'; id: string }
+  | { kind: 'pairing_changed' };
 
 export const api = {
   platform: () => invoke<string>('platform'),
   status: () => invoke<EngineStatus>('status'),
   createAccount: () => invoke<string>('create_account'),
-  ticket: () => invoke<string>('ticket'),
-  join: (ticket: string) => invoke<string>('join', { ticket }),
   useLedger: (url: string) => invoke<string>('use_ledger', { url }),
+  setDeviceName: (name: string) => invoke<void>('set_device_name', { name }),
+  invite: () => invoke<Invitation>('invite'),
+  answerPairing: (allow: boolean) => invoke<void>('answer_pairing', { allow }),
+  cancelPairing: () => invoke<void>('cancel_pairing'),
+  pairingStatus: () => invoke<PairingStatus>('pairing_status'),
+  joinWithCode: (code: string, ledger: string | null) =>
+    invoke<string>('join_with_code', { code, ledger }),
+  /** Android's code scanner; null if cancelled. */
+  scanCode: () => invoke<string | null>('scan_code'),
+  permissions: () => invoke<Permissions>('permissions'),
+  requestPermissions: (which: ('notifications' | 'nearby')[]) =>
+    invoke<Permissions>('request_permissions', { which }),
   fallbackPrompt: () => invoke<string | null>('fallback_prompt'),
   noteList: () => invoke<NoteList>('note_list'),
   createNote: (folder: string | null, title: string | null = null) =>

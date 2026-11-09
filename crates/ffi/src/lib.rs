@@ -11,7 +11,14 @@ uniffi::setup_scaffolding!();
 mod android;
 mod engine;
 
+/// The app's version, which devices tell each other when they connect and
+/// when one joins the account. Call it once, before opening the engine.
+#[uniffi::export]
+pub fn set_app_version(version: String) {
+    mirrorleaf_net::set_app_version(&version);
+}
+
 pub use engine::{
-    DecodedPixels, DeviceSummary, Engine, EngineError, EngineStatus, FolderItem, NoteItem,
-    NoteList, PhotoDecoder, PhotoInfo, SyncListener, SyncSummary, UiEvent,
+    DecodedPixels, DeviceSummary, Engine, EngineError, EngineStatus, FolderItem, Invitation,
+    NoteItem, NoteList, PairingStatus, PhotoDecoder, PhotoInfo, SyncListener, SyncSummary, UiEvent,
 };

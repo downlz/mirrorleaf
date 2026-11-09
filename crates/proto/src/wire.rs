@@ -1,12 +1,17 @@
 use serde::{Deserialize, Serialize};
 
+use crate::ledger::Platform;
 use crate::{AccountId, Change, DeviceId, ProtoError, SignedDeviceList, VersionVector};
 
-/// The Iroh ALPN for device-to-device sync (plan §5.3).
-pub const ALPN: &[u8] = b"mirrorleaf/sync/1";
+/// The Iroh ALPN for device-to-device sync (plan §5.3). Each protocol version
+/// has its own ALPN, so devices that share none fail when the connection
+/// opens, before any message is misread. Version 2 (M9) added the device list
+/// v2, the change's content type, sync class and time, and the app version in
+/// `Hello`.
+pub const ALPN: &[u8] = b"mirrorleaf/sync/2";
 
 /// Protocol versions this build speaks, oldest first.
-pub const PROTOCOL_VERSIONS: &[u16] = &[1];
+pub const PROTOCOL_VERSIONS: &[u16] = &[2];
 
 /// Largest message accepted from a peer. Change batches stay well below this.
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
@@ -18,11 +23,15 @@ pub struct Hello {
     pub device: DeviceId,
     pub account: AccountId,
     pub device_list: SignedDeviceList,
+    /// The app's version, so a device can say which one needs updating.
+    pub app_version: String,
+    pub platform: Platform,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Message {
-    Hello(Hello),
+    /// Boxed: the device list makes it far larger than the other messages.
+    Hello(Box<Hello>),
     /// Opens a sync round: what the sender already holds.
     VersionVector(VersionVector),
     /// A batch of changes the receiver lacks, in the sender's log order.
@@ -61,19 +70,14 @@ mod tests {
 
     #[test]
     fn messages_round_trip() {
-        let change = Change {
-            origin: DeviceId([7; 32]),
-            seq: 3,
-            doc_id: "index".into(),
-            update: vec![1, 2, 3],
-        };
+        let change = Change::yjs(DeviceId([7; 32]), 3, "index", vec![1, 2, 3], 1_794_160_119);
         let msg = Message::Changes(vec![change]);
         assert_eq!(decode(&encode(&msg)).unwrap(), msg);
     }
 
     #[test]
     fn version_choice_needs_overlap() {
-        assert_eq!(choose_version(&[1, 2]), Some(1));
-        assert_eq!(choose_version(&[2]), None);
+        assert_eq!(choose_version(&[1, 2]), Some(2));
+        assert_eq!(choose_version(&[1]), None);
     }
 }

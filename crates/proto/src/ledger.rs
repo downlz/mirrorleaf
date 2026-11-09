@@ -133,7 +133,7 @@ fn verify(public_key: &[u8; 32], message: &[u8], signature_hex: &str) -> Result<
 }
 
 /// What kind of device this is: it decides how the ledger can wake it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Platform {
     Android,
@@ -276,6 +276,25 @@ pub struct RemoveDevice {
     pub approval: String,
 }
 
+/// The ledger's answer to `POST /v1/pairing` (E1): a short number that, for
+/// the next 10 minutes, points to the inviting device. The number starts a
+/// word code ("7-acoustic-planet-river"); the words are the pairing secret and
+/// never reach the ledger.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingOffer {
+    pub nameplate: u32,
+    /// Unix time when the number stops working.
+    pub expires_at: i64,
+}
+
+/// The ledger's answer to `GET /v1/pairing/{nameplate}`: which device to dial.
+/// The signer needn't be registered: a new device asks before it has joined.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingLookup {
+    #[serde(with = "hex_id")]
+    pub device: DeviceId,
+}
+
 /// An error from the ledger.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LedgerError {
@@ -295,6 +314,8 @@ pub mod error_code {
     /// Too many requests: try again later (the app's reports are spaced far
     /// enough apart never to hit this).
     pub const RATE_LIMITED: &str = "rate_limited";
+    /// No pairing offer has that number, or it ran out.
+    pub const NOT_FOUND: &str = "not_found";
 }
 
 /// Keys as hex strings in JSON. (Their serde form elsewhere is the raw bytes

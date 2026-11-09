@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use mirrorleaf_proto::{Change, DeviceId, VersionVector};
+use mirrorleaf_proto::{Change, ContentType, DeviceId, SyncClass, VersionVector};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use yrs::updates::decoder::Decode;
 use yrs::{Doc, ReadTxn, StateVector, Transact, Update};
@@ -65,6 +65,15 @@ const SCHEMA_V2: &str = "
     );
 ";
 
+/// Schema version 3 (Phase 1, M9): each change records what its bytes are, how
+/// soon it should travel, and when it was made (sync protocol 2). Changes
+/// stored before are Yjs updates of the normal class, made at an unknown time.
+const SCHEMA_V3: &str = "
+    ALTER TABLE changes ADD COLUMN content INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE changes ADD COLUMN class   INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE changes ADD COLUMN made_at INTEGER NOT NULL DEFAULT 0;
+";
+
 /// One device's copy of the account's notes.
 pub struct Replica {
     pub(crate) conn: Connection,
@@ -93,6 +102,9 @@ impl Replica {
         }
         if version < 2 {
             migrate_to_v2(&conn)?;
+        }
+        if version < 3 {
+            migrate_to_v3(&conn)?;
         }
         let mut replica = Self { conn, device };
         match replica.meta("device_id")? {
@@ -137,12 +149,7 @@ impl Replica {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let held = held_seq(&tx, &self.device)?;
-        let change = Change {
-            origin: self.device,
-            seq: held + 1,
-            doc_id: doc_id.to_owned(),
-            update,
-        };
+        let change = Change::yjs(self.device, held + 1, doc_id, update, unix_now());
         insert_change(&tx, &change)?;
         tx.commit()?;
         Ok(change)
@@ -174,7 +181,7 @@ impl Replica {
         max_bytes: usize,
     ) -> Result<(Vec<Change>, i64)> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT rowid, origin, seq, doc_id, update_v1 FROM changes
+            "SELECT rowid, origin, seq, doc_id, content, class, made_at, update_v1 FROM changes
              WHERE rowid > ?1 ORDER BY rowid",
         )?;
         let mut rows = stmt.query([after])?;
@@ -185,7 +192,10 @@ impl Replica {
                 origin: device_id(row.get(1)?)?,
                 seq: row.get::<_, i64>(2)? as u64,
                 doc_id: row.get(3)?,
-                update: row.get(4)?,
+                content: ContentType(row.get(4)?),
+                class: SyncClass(row.get(5)?),
+                made_at: row.get::<_, i64>(6)? as u64,
+                update: row.get(7)?,
             };
             if theirs.contains(&change) {
                 continue;
@@ -200,9 +210,11 @@ impl Replica {
     }
 
     /// Stores changes received from a peer, in one transaction. Changes already
-    /// held are skipped. Returns how many were new.
+    /// held are skipped. Returns how many were new. Yjs updates are checked
+    /// before they are stored; other content types are stored as they come,
+    /// so a newer device's changes can pass through this one.
     pub fn apply_remote(&mut self, changes: &[Change]) -> Result<usize> {
-        for change in changes {
+        for change in changes.iter().filter(|c| c.content == ContentType::YJS) {
             decode_update(&change.update)?;
         }
         let tx = self
@@ -245,9 +257,9 @@ impl Replica {
             if let Some(state) = snapshot {
                 apply(&mut txn, &state)?;
             }
-            let mut stmt = self
-                .conn
-                .prepare_cached("SELECT update_v1 FROM changes WHERE doc_id = ?1 ORDER BY rowid")?;
+            let mut stmt = self.conn.prepare_cached(
+                "SELECT update_v1 FROM changes WHERE doc_id = ?1 AND content = 0 ORDER BY rowid",
+            )?;
             let mut rows = stmt.query([doc_id])?;
             while let Some(row) = rows.next()? {
                 apply(&mut txn, &row.get::<_, Vec<u8>>(0)?)?;
@@ -281,7 +293,7 @@ impl Replica {
     pub fn doc_changes_after(&self, doc_id: &str, after: i64) -> Result<(Vec<Vec<u8>>, i64)> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT rowid, origin, update_v1 FROM changes
-             WHERE doc_id = ?1 AND rowid > ?2 ORDER BY rowid",
+             WHERE doc_id = ?1 AND rowid > ?2 AND content = 0 ORDER BY rowid",
         )?;
         let mut rows = stmt.query(params![doc_id, after])?;
         let (mut updates, mut cursor) = (Vec::new(), after);
@@ -316,11 +328,15 @@ fn held_seq(conn: &Connection, origin: &DeviceId) -> Result<u64> {
 
 fn insert_change(conn: &Connection, change: &Change) -> Result<()> {
     conn.execute(
-        "INSERT INTO changes (origin, seq, doc_id, update_v1) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO changes (origin, seq, doc_id, content, class, made_at, update_v1)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             &change.origin.0[..],
             change.seq as i64,
             change.doc_id,
+            change.content.0,
+            change.class.0,
+            change.made_at as i64,
             change.update
         ],
     )?;
@@ -329,7 +345,34 @@ fn insert_change(conn: &Connection, change: &Change) -> Result<()> {
          ON CONFLICT (origin) DO UPDATE SET seq = excluded.seq",
         params![&change.origin.0[..], change.seq as i64],
     )?;
-    record_refs(conn, &change.doc_id, &change.update)
+    if change.content == ContentType::YJS {
+        record_refs(conn, &change.doc_id, &change.update)?;
+    }
+    Ok(())
+}
+
+/// The time now, in Unix seconds.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Adds each change's content type, sync class and time (M9).
+fn migrate_to_v3(conn: &Connection) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let migrated = (|| {
+        conn.execute_batch(SCHEMA_V3)?;
+        conn.pragma_update(None, "user_version", 3)?;
+        Ok(())
+    })();
+    conn.execute_batch(if migrated.is_ok() {
+        "COMMIT"
+    } else {
+        "ROLLBACK"
+    })?;
+    migrated
 }
 
 /// Adds the photo tables, and finds the photos changes already in the log refer to.
@@ -441,6 +484,39 @@ mod tests {
     }
 
     #[test]
+    fn local_changes_carry_their_time_and_type() {
+        let mut replica = Replica::open_in_memory(DeviceId([1; 32])).unwrap();
+        let before = unix_now();
+        let change = replica.record_local("doc", text_update("a")).unwrap();
+        assert!(change.made_at >= before && change.made_at <= unix_now());
+        assert_eq!(
+            (change.content, change.class),
+            (ContentType::YJS, SyncClass::NORMAL)
+        );
+        let (page, _) = replica
+            .changes_since(&VersionVector::default(), 0, 1 << 20)
+            .unwrap();
+        assert_eq!(page, [change]);
+    }
+
+    #[test]
+    fn unknown_content_passes_through_without_touching_documents() {
+        let mut sink = Replica::open_in_memory(DeviceId([2; 32])).unwrap();
+        let mut future = Change::yjs(DeviceId([1; 32]), 1, "doc", b"not yjs at all".to_vec(), 7);
+        future.content = ContentType(9);
+        future.class = SyncClass::LAZY;
+        assert_eq!(sink.apply_remote(std::slice::from_ref(&future)).unwrap(), 1);
+        // Stored and passed on as it came...
+        let (page, _) = sink
+            .changes_since(&VersionVector::default(), 0, 1 << 20)
+            .unwrap();
+        assert_eq!(page, [future]);
+        // ...but never applied to a Yjs document.
+        let doc = sink.load_doc("doc").unwrap();
+        assert_eq!(doc.transact().get_text("t"), None);
+    }
+
+    #[test]
     fn documents_rebuild_from_the_log() {
         let mut replica = Replica::open_in_memory(DeviceId([1; 32])).unwrap();
         replica.record_local("doc", text_update("hello")).unwrap();
@@ -466,12 +542,7 @@ mod tests {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(SCHEMA_V1).unwrap();
             conn.pragma_update(None, "user_version", 1).unwrap();
-            let change = Change {
-                origin: DeviceId([1; 32]),
-                seq: 1,
-                doc_id: "note".into(),
-                update: photo.to_uri().into_bytes(),
-            };
+            let change = Change::yjs(DeviceId([1; 32]), 1, "note", photo.to_uri().into_bytes(), 0);
             conn.execute(
                 "INSERT INTO changes (origin, seq, doc_id, update_v1) VALUES (?1, ?2, ?3, ?4)",
                 params![&change.origin.0[..], 1, change.doc_id, change.update],
@@ -483,8 +554,17 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         assert_eq!(replica.photos().unwrap()[0].photo, photo);
+        // M9's columns: the old change reads as a Yjs update, normal class,
+        // made at an unknown time.
+        let (page, _) = replica
+            .changes_since(&VersionVector::default(), 0, 1 << 20)
+            .unwrap();
+        assert_eq!(
+            (page[0].content, page[0].class, page[0].made_at),
+            (ContentType::YJS, SyncClass::NORMAL, 0)
+        );
         drop(replica);
         std::fs::remove_dir_all(&dir).unwrap();
     }

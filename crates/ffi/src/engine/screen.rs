@@ -7,21 +7,18 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use mirrorleaf_core::photos;
 use mirrorleaf_core::yrs::Update;
 use mirrorleaf_core::yrs::updates::decoder::Decode;
 use mirrorleaf_net::device;
 use mirrorleaf_net::ledger::LedgerClient;
-use mirrorleaf_net::{Account, DevTicket, PhotoStore, describe};
+use mirrorleaf_net::{Account, PhotoStore};
 use mirrorleaf_proto::BlobHash;
 use tracing::warn;
 
-use super::{DIAL_TIMEOUT, Engine, EngineError, lock, profile};
+use super::{Engine, EngineError, lock, profile};
 
-/// How long a ticket waits for this device to reach a relay, so the ticket
-/// carries an address that works beyond the local network.
-const TICKET_WAIT: Duration = Duration::from_secs(10);
 /// How often a waiting edit batch is checked.
 const FLUSH_TICK: Duration = Duration::from_millis(250);
 
@@ -37,6 +34,8 @@ pub enum UiEvent {
     StatusChanged,
     /// A note was made outside the screen (shared from another app): open it.
     OpenNote { id: String },
+    /// Adding a device moved on a step: read `pairing_status` (E1).
+    PairingChanged,
 }
 
 pub(super) type Listener = Arc<dyn Fn(UiEvent) + Send + Sync>;
@@ -102,9 +101,10 @@ impl Engine {
         }
     }
 
-    // --- Accounts (Phase 0 developer accounts, plan §5.4) ---
+    // --- Accounts (adding devices is in `pairing`, E1) ---
 
-    /// Starts a developer account with this device as its first member.
+    /// Starts an account with this device as its first member. The recovery
+    /// kit joins this step in M10 (E2).
     pub fn create_account(&self) -> Result<String, EngineError> {
         let mut replica = lock(&self.replica);
         if Account::load(&replica)?.is_some() {
@@ -115,62 +115,6 @@ impl Engine {
         let account = Account::create(device::me(&replica, &self.secret)?);
         account.save(&mut replica)?;
         Ok(format!("Created account {}.", account.id().short()))
-    }
-
-    /// A ticket another device can join with. It carries the account key.
-    pub async fn ticket(self: Arc<Self>) -> Result<String, EngineError> {
-        let this = self.clone();
-        self.on_runtime(async move {
-            let node = this.begin_job().await?;
-            let _ = tokio::time::timeout(TICKET_WAIT, node.online()).await;
-            let ticket = {
-                let state = node.state().lock().unwrap();
-                let key = state
-                    .account
-                    .key
-                    .as_ref()
-                    .context("this device doesn't hold the account key")?;
-                DevTicket {
-                    account_secret: key.to_bytes(),
-                    devices: state.account.devices.clone(),
-                    inviter: node.addr(),
-                }
-            };
-            this.end_job().await;
-            Ok(ticket.to_string())
-        })
-        .await
-    }
-
-    /// Joins a developer account from a ticket, then syncs with the inviting
-    /// device.
-    pub async fn join(self: Arc<Self>, ticket: String) -> Result<String, EngineError> {
-        let this = self.clone();
-        self.on_runtime(async move {
-            let ticket: DevTicket = ticket.trim().parse()?;
-            {
-                let mut replica = lock(&this.replica);
-                if Account::load(&replica)?.is_some() {
-                    bail!("this device already belongs to an account");
-                }
-                let me = device::me(&replica, &this.secret)?;
-                Account::join(ticket.account_key(), &ticket.devices, me)?.save(&mut replica)?;
-            }
-            let node = this.begin_job().await?;
-            let outcome =
-                match tokio::time::timeout(DIAL_TIMEOUT, node.sync_once(ticket.inviter)).await {
-                    Ok(Ok((path, report))) => format!(
-                        "Joined. Synced with the inviting device via {path}: received {} changes.",
-                        report.received_changes
-                    ),
-                    Ok(Err(e)) => format!("Joined, but couldn't sync yet: {}", describe(&e)),
-                    Err(_) => "Joined, but the inviting device didn't answer yet.".to_owned(),
-                };
-            this.end_job().await;
-            this.notify(UiEvent::NotesChanged);
-            Ok(outcome)
-        })
-        .await
     }
 
     /// Registers this device with the ledger at `url` and reports to it from now on.

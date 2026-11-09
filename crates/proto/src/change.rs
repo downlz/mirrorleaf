@@ -4,14 +4,71 @@ use serde::{Deserialize, Serialize};
 
 use crate::DeviceId;
 
-/// One entry in the change log: a Yjs update made on `origin`, numbered `seq`
+/// What a change's bytes are, so each goes to the code that merges it
+/// (reuse assessment, change 1). A device stores and passes on content types it
+/// doesn't know, so a newer device's changes can hop through an older one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ContentType(pub u8);
+
+impl ContentType {
+    /// A Yjs update (`encode_update_v1`) to the document `doc_id`: every note
+    /// and the index.
+    pub const YJS: Self = Self(0);
+    /// Reserved: whole values that replace older ones field by field.
+    pub const FIELDS: Self = Self(1);
+    /// Reserved: the manifest of a file stored as blobs.
+    pub const MANIFEST: Self = Self(2);
+}
+
+/// How soon a change should reach the other devices (reuse assessment, change
+/// 2), for the push rules. Notes are all `NORMAL` for now.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SyncClass(pub u8);
+
+impl SyncClass {
+    pub const NORMAL: Self = Self(0);
+    /// Reserved: push at once.
+    pub const URGENT: Self = Self(1);
+    /// Reserved: no push; merged into the next change.
+    pub const LAZY: Self = Self(2);
+}
+
+/// One entry in the change log: an update made on `origin`, numbered `seq`
 /// (plan §5.2). Sequence numbers start at 1 and have no gaps per origin.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Change {
     pub origin: DeviceId,
     pub seq: u64,
     pub doc_id: String,
+    pub content: ContentType,
+    pub class: SyncClass,
+    /// When the change was made on its origin, in Unix seconds, so a device
+    /// receiving it can tell how long it took to arrive (E12). 0 for changes
+    /// made before this field existed. Travels only between the account's
+    /// devices, never to the ledger.
+    pub made_at: u64,
     pub update: Vec<u8>,
+}
+
+impl Change {
+    /// A note change as this version makes them: a Yjs update, normal class.
+    pub fn yjs(
+        origin: DeviceId,
+        seq: u64,
+        doc_id: impl Into<String>,
+        update: Vec<u8>,
+        made_at: u64,
+    ) -> Self {
+        Self {
+            origin,
+            seq,
+            doc_id: doc_id.into(),
+            content: ContentType::YJS,
+            class: SyncClass::NORMAL,
+            made_at,
+            update,
+        }
+    }
 }
 
 /// The highest sequence number held from each origin device. These are also the

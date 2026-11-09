@@ -1036,6 +1036,8 @@ async fn devices_register_report_and_go_offline_through_the_client() {
     let device = |secret: &SecretKey, name: &str| DeviceEntry {
         id: DeviceId(*secret.public().as_bytes()),
         name: name.into(),
+        platform: None,
+        added_at: 0,
     };
     let (laptop_key, phone_key) = (SecretKey::generate(), SecretKey::generate());
     let laptop_account = Account::create(device(&laptop_key, "laptop"));
@@ -1129,5 +1131,87 @@ async fn devices_register_report_and_go_offline_through_the_client() {
     assert!(response.devices.iter().all(|d| !d.online));
     phone.leave().await.unwrap();
     node.close().await;
+    t.finish().await;
+}
+
+/// Pairing numbers (E1): a registered device gets the lowest free number for 10
+/// minutes; anyone may look it up, even before joining; only its device can
+/// withdraw it; numbers are reused once free.
+#[tokio::test]
+async fn pairing_numbers_point_to_a_device_for_ten_minutes() {
+    let Some(t) = TestLedger::start().await else {
+        return;
+    };
+    let (laptop, desktop, _phone) = account(&t).await;
+    let stranger = Dev::new(&Arc::new(AccountKey::generate()), Platform::Android);
+
+    // A device on no account can't offer one.
+    let (status, body) = stranger.call(&t, "POST", "/v1/pairing", json!({})).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::NOT_FOUND, Some("unknown_device"))
+    );
+
+    let (status, offer) = laptop.call(&t, "POST", "/v1/pairing", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(offer["nameplate"], 1);
+    assert_eq!(offer["expires_at"], t.now() + 600);
+    let (_, second) = desktop.call(&t, "POST", "/v1/pairing", json!({})).await;
+    assert_eq!(second["nameplate"], 2, "the next free number");
+
+    // The new device looks it up before it has joined: the answer names the
+    // device and nothing else.
+    let (status, found) = stranger.call(&t, "GET", "/v1/pairing/1", json!(null)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(found, json!({ "device": laptop.id().to_string() }));
+
+    // Asking again replaces the device's earlier number.
+    let (_, again) = laptop.call(&t, "POST", "/v1/pairing", json!({})).await;
+    assert_eq!(again["nameplate"], 1);
+    let count: i64 = query_scalar("SELECT count(*) FROM pairing")
+        .fetch_one(&t.ledger.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
+
+    // Another device can't withdraw it; its own device can.
+    assert_eq!(
+        desktop
+            .call(&t, "DELETE", "/v1/pairing/1", json!({}))
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        stranger
+            .call(&t, "GET", "/v1/pairing/1", json!(null))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        laptop
+            .call(&t, "DELETE", "/v1/pairing/1", json!({}))
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    let (status, body) = stranger.call(&t, "GET", "/v1/pairing/1", json!(null)).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::NOT_FOUND, Some("not_found"))
+    );
+
+    // Ten minutes on, the rest have run out and the numbers start again at 1.
+    t.advance(600);
+    assert_eq!(
+        stranger
+            .call(&t, "GET", "/v1/pairing/2", json!(null))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    let (_, fresh) = laptop.call(&t, "POST", "/v1/pairing", json!({})).await;
+    assert_eq!(fresh["nameplate"], 1);
     t.finish().await;
 }

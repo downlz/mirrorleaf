@@ -81,6 +81,10 @@ dependencies {
     implementation("com.google.firebase:firebase-messaging")
     implementation("androidx.work:work-runtime-ktx:2.12.0")
     implementation("net.java.dev.jna:jna:5.19.1@aar")
+    // M9 (E1): scanning another device's pairing QR code with Google's code scanner, which needs no
+    // camera permission (owner, 8 Nov 2026). Proprietary, like Firebase; without Google Play services
+    // the word code is used instead.
+    implementation("com.google.android.gms:play-services-code-scanner:16.1.0")
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.4")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.0")

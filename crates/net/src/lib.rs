@@ -7,6 +7,7 @@ pub mod device;
 mod frame;
 pub mod ledger;
 mod node;
+pub mod pair;
 mod session;
 mod ticket;
 
@@ -20,6 +21,22 @@ pub use node::{
 };
 pub use session::RoundReport;
 pub use ticket::DevTicket;
+
+static APP_VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Sets the app's version, which devices tell each other when they connect
+/// (`Hello`) and when pairing. Set once, at startup; later calls are ignored.
+pub fn set_app_version(version: &str) {
+    let _ = APP_VERSION.set(version.to_owned());
+}
+
+/// The app's version, or this crate's if the app didn't set one (the CLI).
+pub fn app_version() -> &'static str {
+    APP_VERSION
+        .get()
+        .map(String::as_str)
+        .unwrap_or(env!("CARGO_PKG_VERSION"))
+}
 
 /// An error and its causes on one line. Iroh often repeats a cause's text in
 /// the error that wraps it, so causes already shown are left out.

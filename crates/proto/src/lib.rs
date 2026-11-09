@@ -5,10 +5,13 @@ mod change;
 mod devices;
 mod ids;
 pub mod ledger;
+pub mod pair;
 mod wire;
 
-pub use change::{Change, VersionVector};
-pub use devices::{AccountKey, DeviceEntry, DeviceList, DeviceListMerge, SignedDeviceList};
+pub use change::{Change, ContentType, SyncClass, VersionVector};
+pub use devices::{
+    AccountKey, DeviceEntry, DeviceList, DeviceListMerge, RotationLink, SignedDeviceList,
+};
 pub use ids::{AccountId, BlobHash, DeviceId};
 pub use wire::{
     ALPN, Hello, MAX_FRAME_LEN, Message, PROTOCOL_VERSIONS, choose_version, decode, encode,
