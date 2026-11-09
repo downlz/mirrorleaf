@@ -20,6 +20,7 @@ use crate::rules::{Device, Wake};
 const MIGRATIONS: &[(i32, &str)] = &[
     (1, include_str!("../migrations/0001_init.sql")),
     (2, include_str!("../migrations/0002_pairing.sql")),
+    (3, include_str!("../migrations/0003_account_moves.sql")),
 ];
 
 /// The highest pairing number handed out. Numbers are reused once free, so
@@ -361,6 +362,117 @@ pub async fn delete_account(pool: &PgPool, account: &AccountId) -> Result<()> {
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// Where an account moved when its key was replaced, if it did (E3).
+pub async fn moved_to(pool: &PgPool, account: &AccountId) -> Result<Option<AccountId>> {
+    let row: Option<Vec<u8>> =
+        query_scalar("SELECT new_account FROM account_moves WHERE old_account = $1")
+            .bind(&account.0[..])
+            .fetch_optional(pool)
+            .await?;
+    row.map(|bytes| key(bytes).map(AccountId)).transpose()
+}
+
+/// The account that moved to `account`, if one did (E3).
+pub async fn moved_from(pool: &PgPool, account: &AccountId) -> Result<Option<AccountId>> {
+    let row: Option<Vec<u8>> = query_scalar(
+        "SELECT old_account FROM account_moves WHERE new_account = $1 ORDER BY moved_at DESC LIMIT 1",
+    )
+    .bind(&account.0[..])
+    .fetch_optional(pool)
+    .await?;
+    row.map(|bytes| key(bytes).map(AccountId)).transpose()
+}
+
+/// What [`rekey`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rekeyed {
+    /// The account moved to the new key.
+    Moved,
+    /// The signer is already on the new account: a repeat, nothing to do.
+    AlreadyDone,
+    /// Another device moved the account to a different key first.
+    MovedElsewhere(AccountId),
+    /// The signer isn't registered (any more).
+    UnknownDevice,
+    /// The signer's account isn't the one the link comes from.
+    WrongAccount,
+}
+
+/// Moves the signer's account, `old`, to `new` (E3): the rows of `keep` move
+/// with it, the account's other devices go, and the move is remembered. The
+/// account's row is locked first, so of two devices replacing the key at
+/// once, the first wins and the second hears where the account went.
+pub async fn rekey(
+    pool: &PgPool,
+    signer: &DeviceId,
+    old: &AccountId,
+    new: &AccountId,
+    keep: &[DeviceId],
+    now: i64,
+) -> Result<Rekeyed> {
+    let mut tx = pool.begin().await?;
+    query("SELECT 1 FROM accounts WHERE account_id = $1 FOR UPDATE")
+        .bind(&old.0[..])
+        .execute(&mut *tx)
+        .await?;
+    let current: Option<Vec<u8>> =
+        query_scalar("SELECT account_id FROM devices WHERE device_id = $1")
+            .bind(&signer.0[..])
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some(current) = current else {
+        return Ok(Rekeyed::UnknownDevice);
+    };
+    let current = AccountId(key(current)?);
+    if current == *new {
+        return Ok(Rekeyed::AlreadyDone);
+    }
+    if current != *old {
+        // The account moved while this request waited for the lock.
+        let moved: Option<Vec<u8>> =
+            query_scalar("SELECT new_account FROM account_moves WHERE old_account = $1")
+                .bind(&old.0[..])
+                .fetch_optional(&mut *tx)
+                .await?;
+        return Ok(match moved {
+            Some(to) => Rekeyed::MovedElsewhere(AccountId(key(to)?)),
+            None => Rekeyed::WrongAccount,
+        });
+    }
+    query(
+        "INSERT INTO accounts (account_id, created_at) VALUES ($1, $2)
+         ON CONFLICT (account_id) DO NOTHING",
+    )
+    .bind(&new.0[..])
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    let keep: Vec<Vec<u8>> = keep.iter().map(|d| d.0.to_vec()).collect();
+    query("UPDATE devices SET account_id = $2 WHERE account_id = $1 AND device_id = ANY($3)")
+        .bind(&old.0[..])
+        .bind(&new.0[..])
+        .bind(&keep)
+        .execute(&mut *tx)
+        .await?;
+    // Whatever is left on the old account goes with it (the cascade).
+    query("DELETE FROM accounts WHERE account_id = $1")
+        .bind(&old.0[..])
+        .execute(&mut *tx)
+        .await?;
+    query(
+        "INSERT INTO account_moves (old_account, new_account, moved_at) VALUES ($1, $2, $3)
+         ON CONFLICT (old_account) DO UPDATE SET new_account = excluded.new_account,
+                                                 moved_at = excluded.moved_at",
+    )
+    .bind(&old.0[..])
+    .bind(&new.0[..])
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Rekeyed::Moved)
 }
 
 /// Gives `device` a pairing number valid until `expires_at` (E1): the lowest

@@ -80,3 +80,14 @@ Mirrorleaf keeps notes only on the user's own devices and syncs them device to d
 - A device's name can change only before it joins or starts an account: afterwards it is in the signed list.
 - Android asks for notifications and nearby devices in the joining sheet and in Settings (`PermissionsPlugin.kt`), never at app start. QR codes are scanned by `QrScannerPlugin.kt` (Google's code scanner, no camera permission).
 - Word codes need the ledger's pairing table (ledger migration 2): rebuild the ledger image after pulling M9.
+
+## Recovery kit and device lifecycle (M10, ADR-010)
+
+- The account key is derived from the 128-bit recovery secret (`AccountKey::from_recovery`, a fixed BLAKE3 context pinned by a test): never change the derivation. A new kit always means a new account key and account ID.
+- Sync protocol 3 (`mirrorleaf/sync/3`) adds `Handover`: a device with the replaced key hands the new one to a peer still on the old key, if the peer is on the new list (`session.rs`). M9 builds (0.2.5) can't sync with M10 builds (0.3.0).
+- Replacing the key moves the ledger first (`POST /v1/accounts/rekey`, ledger migration 3 `account_moves`); the old key can never register again. Rebuild the ledger after pulling M10.
+- The device list travels only in `Hello`, so live sync closes and redials every connection when the list or the account changes (`node.rs`, `DevicesChanged`).
+- A removed device knows it (`Account::removed`), stops using the ledger (`SyncNode::ledger` returns `None`) and shows the removed page.
+- Signing out erases at the next start (`erase-on-start`: key, database, photo store only), and the app restarts itself (desktop: `AppHandle::restart`; Android: `DocumentsPlugin.restart`).
+- Each Kotlin plugin is registered as its own Tauri plugin (`device.rs`): under one Tauri plugin, the last one registered takes every call.
+- The kit's PDF and text are made by `mirrorleaf-net::kit`; Android saves files through `DocumentsPlugin.kt` (the engine writes into its own folder, Kotlin copies to the place picked), never through the web view.

@@ -3,7 +3,9 @@
   import { api, onEngineEvent, onWillClose } from './lib/api';
   import { app } from './lib/state.svelte';
   import Menu from './components/Menu.svelte';
+  import KitStep from './components/KitStep.svelte';
   import NoteView from './components/NoteView.svelte';
+  import RemovedPage from './components/RemovedPage.svelte';
   import Settings from './components/Settings.svelte';
   import Stream from './components/Stream.svelte';
   import Welcome from './components/Welcome.svelte';
@@ -69,7 +71,15 @@
     (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName));
 
   function keydown(event: KeyboardEvent) {
-    if (event.defaultPrevented || app.settings || app.menu || app.needsAccount) return;
+    if (
+      event.defaultPrevented ||
+      app.settings ||
+      app.menu ||
+      app.needsAccount ||
+      app.status?.kit_pending ||
+      app.status?.removed
+    )
+      return;
     const mod = event.metaKey || event.ctrlKey;
     if (mod && !event.altKey && !event.shiftKey) {
       if (event.key === 'k' || event.key === 'f') {
@@ -113,6 +123,9 @@
   {#if app.needsAccount}
     <!-- First run: no account yet (E1, direction A). -->
     <Welcome />
+  {:else if app.status?.removed}
+    <!-- Another device removed this one (E3). -->
+    <RemovedPage />
   {:else}
     <Stream leading />
     {#if !sheet}
@@ -127,6 +140,17 @@
 
     {#if app.settings}
       <Settings />
+    {/if}
+
+    {#if app.status?.kit_pending}
+      <!-- A new recovery kit to save (E2): after replacing the key, or left
+           unsaved when the app closed. It can't be skipped. -->
+      <div class="scrim"></div>
+      <div class="sheet" role="dialog" aria-modal="true" aria-label="Your recovery kit">
+        <div class="sheet-body">
+          <KitStep ondone={() => void app.loadStatus()} />
+        </div>
+      </div>
     {/if}
   {/if}
   {#if app.menu}

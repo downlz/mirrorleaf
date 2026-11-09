@@ -17,10 +17,12 @@ use mirrorleaf_proto::ledger::{Platform, StatusResponse};
 use tokio::runtime::Runtime;
 use tracing::{info, warn};
 
+mod lifecycle;
 mod native;
 mod pairing;
 mod screen;
 
+pub use lifecycle::KitView;
 pub use native::{DecodedPixels, PhotoDecoder};
 pub use pairing::{Invitation, PairingStatus};
 use screen::OpenNote;
@@ -31,9 +33,12 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long a push-woken job counts as online, so the devices it dials can
 /// answer it; it reports going offline again when it finishes.
 const JOB_ONLINE_SECS: u32 = 60;
-/// When the app goes to the background, live sync keeps running this long so
-/// the last edits reach connected devices (flush-on-close, plan §5.7).
+/// When the app goes to the background or quits, live sync keeps running at
+/// most this long so the last edits reach connected devices (flush-on-close,
+/// plan §5.7).
 const FLUSH: Duration = Duration::from_millis(1500);
+/// How often going offline checks whether the last edits have gone out.
+const SENT_CHECK: Duration = Duration::from_millis(50);
 
 /// The only engine in this process (plan §5.7).
 static ENGINE: Mutex<Option<Arc<Engine>>> = Mutex::new(None);
@@ -93,6 +98,15 @@ pub struct EngineStatus {
     pub notifications: bool,
     /// Whether live sync is running (the app is in the foreground).
     pub live: bool,
+    /// When the account's recovery kit was made (Unix seconds); none for an
+    /// account made before M10 (E2).
+    pub kit_made_at: Option<u64>,
+    /// A kit is waiting to be saved: the screen shows it until it is.
+    pub kit_pending: bool,
+    /// This device recovered the account with its kit, so a new kit is due.
+    pub kit_used: bool,
+    /// Another device removed this one from the account (E3).
+    pub removed: bool,
 }
 
 /// What one push-woken sync did.
@@ -204,7 +218,12 @@ impl Engine {
                     .iter()
                     .map(|d| DeviceSummary {
                         id: d.id.to_string(),
-                        name: d.name.clone(),
+                        // Known only by its ID until it is met, after a recovery.
+                        name: if d.name.is_empty() {
+                            format!("Unknown device ({})", d.id.short())
+                        } else {
+                            d.name.clone()
+                        },
                         this_device: d.id == me,
                         changes_held: held.get(&d.id),
                         online: row(d.id).map(|r| r.online),
@@ -216,6 +235,10 @@ impl Engine {
             .unwrap_or_default();
         let notes = replica.list_notes()?.iter().filter(|n| !n.trashed).count();
         let profile = profile(&replica)?;
+        let kit_pending = Account::pending_kit(&replica)?.is_some();
+        let kit_used = Account::kit_used(&replica)?;
+        let kit_made_at = account.as_ref().and_then(|a| a.devices.kit_made_at());
+        let removed = account.as_ref().is_some_and(|a| a.removed(&me));
         Ok(EngineStatus {
             device_id: me.to_string(),
             device_name: device::device_name(&replica)?,
@@ -227,6 +250,10 @@ impl Engine {
             has_push_token: profile.push_token.is_some(),
             notifications: profile.notifications,
             live: self.live.load(Ordering::Acquire),
+            kit_made_at,
+            kit_pending,
+            kit_used,
+            removed,
         })
     }
 
@@ -561,11 +588,20 @@ impl Engine {
         if let Err(e) = self.flush_edits() {
             warn!("couldn't store edits: {e}");
         }
+        let started = Instant::now();
         let mut slot = self.slot.lock().await;
         let Some(task) = slot.live.take() else {
             return Ok(());
         };
-        tokio::time::sleep(FLUSH).await;
+        // Live sync sends what the connected devices still lack, at once, and
+        // stops as soon as they have everything: at most `FLUSH`, and not at
+        // all when there was nothing to send.
+        if let Some(node) = &slot.node {
+            node.nudge();
+        }
+        while started.elapsed() < FLUSH && !self.all_sent() {
+            tokio::time::sleep(SENT_CHECK).await;
+        }
         task.abort();
         self.live.store(false, Ordering::Release);
         lock(&self.connected).clear();
@@ -574,8 +610,25 @@ impl Engine {
             report_offline(node).await;
         }
         self.release_if_idle(&mut slot).await;
-        info!("live sync stopped");
+        info!("live sync stopped in {} ms", started.elapsed().as_millis());
         Ok(())
+    }
+
+    /// Whether every device live sync is connected to holds everything this
+    /// one holds, as far as the last sync rounds with them showed.
+    fn all_sent(&self) -> bool {
+        let connected: Vec<DeviceId> = lock(&self.connected).keys().copied().collect();
+        let replica = lock(&self.replica);
+        let Ok(ours) = replica.version_vector() else {
+            return true;
+        };
+        connected.iter().all(|peer| {
+            replica
+                .peer_holds(peer)
+                .ok()
+                .flatten()
+                .is_some_and(|(holds, _)| ours.ahead_of(&holds) == 0)
+        })
     }
 
     /// Opening the app while behind asks the ledger to wake the device holding
@@ -653,6 +706,12 @@ impl Engine {
                 self.notify(UiEvent::StatusChanged);
             }
             Event::LedgerFailed { error } => warn!("ledger: {error}"),
+            Event::DevicesChanged { account_replaced } => {
+                if account_replaced {
+                    info!("the account key was replaced");
+                }
+                self.notify(UiEvent::StatusChanged);
+            }
             _ => {}
         }
     }

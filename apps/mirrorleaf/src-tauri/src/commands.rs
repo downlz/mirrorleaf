@@ -130,6 +130,57 @@ pub async fn request_permissions(
     crate::device::request_permissions(&app, which).await
 }
 
+// --- The account's lifecycle (M10: E2, E3) ---
+
+/// The recovery kit waiting to be saved, if any.
+#[tauri::command]
+pub fn pending_kit() -> Result<Option<mirrorleaf_ffi::KitView>> {
+    engine()?.pending_kit().map_err(text)
+}
+
+/// Saves the kit as "pdf" or "text" where the person chooses. `false` if
+/// they cancelled.
+#[tauri::command]
+pub async fn save_kit(app: tauri::AppHandle, kind: String) -> Result<bool> {
+    crate::files::save_kit(&app, &kind).await
+}
+
+/// The kit is saved or its words written down: forget it.
+#[tauri::command]
+pub fn finish_kit() -> Result<()> {
+    engine()?.finish_kit().map_err(text)
+}
+
+/// Replaces the account key, leaving out `remove`, and makes a new kit.
+#[tauri::command]
+pub async fn replace_key(remove: Vec<String>) -> Result<()> {
+    engine()?.replace_key(remove).await.map_err(text)
+}
+
+#[tauri::command]
+pub async fn remove_device(id: String) -> Result<()> {
+    engine()?.remove_device(id).await.map_err(text)
+}
+
+/// How many changes exist only on this device.
+#[tauri::command]
+pub fn only_here() -> Result<u64> {
+    engine()?.only_here().map_err(text)
+}
+
+/// Signs out and erases this device, then starts the app afresh.
+#[tauri::command]
+pub async fn sign_out(app: tauri::AppHandle, force: bool) -> Result<()> {
+    engine()?.sign_out(force).await.map_err(text)?;
+    crate::files::restart(&app).await
+}
+
+/// Recovers the account with the kit's words or QR code.
+#[tauri::command]
+pub async fn recover(code: String, ledger: Option<String>) -> Result<String> {
+    engine()?.recover(code, ledger).await.map_err(text)
+}
+
 /// The device to name in "Open Mirrorleaf on <name> to sync", once due.
 #[tauri::command]
 pub fn fallback_prompt() -> Option<String> {

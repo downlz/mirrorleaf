@@ -60,6 +60,10 @@ impl DeviceKey {
         DeviceId(self.0.verifying_key().to_bytes())
     }
 
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.0.to_bytes()
+    }
+
     /// The signature header's value for this request.
     pub fn sign_request(&self, method: &str, path: &str, time: i64, body: &[u8]) -> String {
         let message = request_message(method, path, time, body);
@@ -234,6 +238,49 @@ pub struct DeviceStatus {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub devices: Vec<DeviceStatus>,
+    /// The account the ledger files the device under (M10). It differs from
+    /// the device's own when another device replaced the account's key and
+    /// this one hasn't received the new key yet. Absent from older ledgers.
+    #[serde(default, with = "hex_opt_id", skip_serializing_if = "Option::is_none")]
+    pub account: Option<AccountId>,
+}
+
+/// `POST /v1/accounts/rekey` (E3): the signer's account moves to a new
+/// account key. The ledger keeps the rows of `devices` under the new account
+/// and drops the account's other devices, and remembers the move, so the old
+/// key (and the recovery kit it came from) can't register again.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Rekey {
+    #[serde(with = "hex_id")]
+    pub new_account: AccountId,
+    /// The old account key's signature over the new account ID, in hex
+    /// (`RotationLink`).
+    pub link: String,
+    /// The devices on the new account's list.
+    #[serde(with = "hex_ids")]
+    pub devices: Vec<DeviceId>,
+}
+
+impl Rekey {
+    pub fn new(link: &crate::RotationLink, new_account: AccountId, devices: Vec<DeviceId>) -> Self {
+        Self {
+            new_account,
+            link: HEXLOWER.encode(&link.signature),
+            devices,
+        }
+    }
+
+    /// The link from `previous`, checked against the new account.
+    pub fn verify_link(&self, previous: AccountId) -> Result<(), ProtoError> {
+        let signature = HEXLOWER
+            .decode(self.link.as_bytes())
+            .map_err(|_| ProtoError::BadSignature)?;
+        crate::RotationLink {
+            previous,
+            signature,
+        }
+        .verify(&self.new_account)
+    }
 }
 
 /// The ledger's answer to `POST /v1/wake` (plan §5.9).
@@ -316,6 +363,9 @@ pub mod error_code {
     pub const RATE_LIMITED: &str = "rate_limited";
     /// No pairing offer has that number, or it ran out.
     pub const NOT_FOUND: &str = "not_found";
+    /// The account's key was replaced (E3): the old key can't register, and a
+    /// second replacement of the same account is refused.
+    pub const ACCOUNT_MOVED: &str = "account_moved";
 }
 
 /// Keys as hex strings in JSON. (Their serde form elsewhere is the raw bytes
@@ -332,6 +382,51 @@ pub mod hex_id {
         let s = String::deserialize(d)?;
         s.parse()
             .map_err(|_| serde::de::Error::custom("invalid hex key"))
+    }
+}
+
+/// An optional key as a hex string in JSON.
+pub mod hex_opt_id {
+    use super::*;
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<T: fmt::Display, S: Serializer>(
+        id: &Option<T>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        match id {
+            Some(id) => s.collect_str(id),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, T: FromStr, D: Deserializer<'de>>(d: D) -> Result<Option<T>, D::Error> {
+        Option::<String>::deserialize(d)?
+            .map(|s| {
+                s.parse()
+                    .map_err(|_| serde::de::Error::custom("invalid hex key"))
+            })
+            .transpose()
+    }
+}
+
+/// A list of keys as hex strings in JSON.
+pub mod hex_ids {
+    use super::*;
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<T: fmt::Display, S: Serializer>(ids: &[T], s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(ids.iter().map(ToString::to_string))
+    }
+
+    pub fn deserialize<'de, T: FromStr, D: Deserializer<'de>>(d: D) -> Result<Vec<T>, D::Error> {
+        Vec::<String>::deserialize(d)?
+            .into_iter()
+            .map(|s| {
+                s.parse()
+                    .map_err(|_| serde::de::Error::custom("invalid hex key"))
+            })
+            .collect()
     }
 }
 
@@ -440,5 +535,35 @@ mod tests {
             )
         );
         assert_eq!(serde_json::from_str::<WakeResponse>(&json).unwrap(), none);
+    }
+
+    #[test]
+    fn rekeying_carries_a_checkable_link() {
+        let old = AccountKey::from_bytes([1; 32]);
+        let new = AccountKey::from_bytes([2; 32]);
+        let rekey = Rekey::new(
+            &old.rotation_link(&new.id()),
+            new.id(),
+            vec![DeviceId([3; 32])],
+        );
+        let json = serde_json::to_string(&rekey).unwrap();
+        assert!(json.contains(&DeviceId([3; 32]).to_string()), "{json}");
+        let back: Rekey = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, rekey);
+        back.verify_link(old.id()).unwrap();
+        assert!(back.verify_link(new.id()).is_err());
+
+        // Older ledgers send no account in their status reply.
+        let status: StatusResponse = serde_json::from_str(r#"{"devices":[]}"#).unwrap();
+        assert_eq!(status.account, None);
+        let status = StatusResponse {
+            devices: Vec::new(),
+            account: Some(new.id()),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(
+            serde_json::from_str::<StatusResponse>(&json).unwrap(),
+            status
+        );
     }
 }

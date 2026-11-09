@@ -103,8 +103,9 @@ impl Engine {
 
     // --- Accounts (adding devices is in `pairing`, E1) ---
 
-    /// Starts an account with this device as its first member. The recovery
-    /// kit joins this step in M10 (E2).
+    /// Starts an account with this device as its first member. Its key comes
+    /// from a new recovery kit, which the screen shows next and which must be
+    /// saved before setup finishes (E2, assessment §8.1).
     pub fn create_account(&self) -> Result<String, EngineError> {
         let mut replica = lock(&self.replica);
         if Account::load(&replica)?.is_some() {
@@ -112,8 +113,13 @@ impl Engine {
                 "this device already belongs to an account".into(),
             ));
         }
-        let account = Account::create(device::me(&replica, &self.secret)?);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let (account, secret) = Account::create_with_kit(device::me(&replica, &self.secret)?, now);
         account.save(&mut replica)?;
+        Account::save_pending_kit(&mut replica, &secret, now)?;
         Ok(format!("Created account {}.", account.id().short()))
     }
 

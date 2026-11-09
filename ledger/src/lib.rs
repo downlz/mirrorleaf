@@ -20,8 +20,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use mirrorleaf_proto::ledger::{
-    self, Approval, DeviceStatus, LedgerError, PairingLookup, PairingOffer, Register, RemoveDevice,
-    StatusResponse, StatusUpdate, WakeResponse,
+    self, Approval, DeviceStatus, LedgerError, PairingLookup, PairingOffer, Register, Rekey,
+    RemoveDevice, StatusResponse, StatusUpdate, WakeResponse,
 };
 use mirrorleaf_proto::pair::CODE_LIFETIME_SECS;
 use mirrorleaf_proto::{AccountId, DeviceId};
@@ -63,6 +63,7 @@ impl Ledger {
             .route("/health", get(health))
             .route("/v1/accounts", post(create_account))
             .route("/v1/accounts/me", delete(delete_account))
+            .route("/v1/accounts/rekey", post(rekey))
             .route("/v1/devices", post(add_device))
             .route("/v1/devices/me/status", put(status))
             .route("/v1/devices/{id}", delete(remove_device))
@@ -175,6 +176,14 @@ impl ApiError {
             StatusCode::NOT_FOUND,
             ledger::error_code::UNKNOWN_DEVICE,
             "this device isn't registered",
+        )
+    }
+
+    fn account_moved(message: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            ledger::error_code::ACCOUNT_MOVED,
+            message,
         )
     }
 }
@@ -349,6 +358,12 @@ async fn register(l: &Ledger, req: Signed, create: bool) -> Result<StatusCode, A
     Approval::AddDevice
         .verify(&body.account, &req.device, &body.approval)
         .map_err(|_| ApiError::unauthorised("the account key didn't approve this device"))?;
+    // A replaced key, and the recovery kit it came from, stays retired (E3).
+    if db::moved_to(&l.db, &body.account).await?.is_some() {
+        return Err(ApiError::account_moved(
+            "this account's key was replaced: use the newest recovery kit, or add this device from one of your devices",
+        ));
+    }
     let mut tx = l.db.begin().await?;
     let now = l.now();
     let exists = db::account_exists(&mut tx, &body.account).await?;
@@ -439,8 +454,70 @@ async fn status(State(l): State<Ledger>, req: Signed) -> Result<Json<StatusRespo
                 last_seen: r.last_seen,
             })
             .collect(),
+        account: Some(account),
     };
     Ok(Json(response))
+}
+
+/// `POST /v1/accounts/rekey` (E3): the signer's account moves to a new key.
+/// The old key must have signed the new account ID; the devices on the new
+/// list move with it and the rest go. Of two devices replacing the key at
+/// once, the first wins; the second is told the account moved.
+async fn rekey(State(l): State<Ledger>, req: Signed) -> Result<StatusCode, ApiError> {
+    let body: Rekey = req.json()?;
+    let account = db::account_of(&l.db, &req.device)
+        .await?
+        .ok_or_else(ApiError::unknown_device)?;
+    if account == body.new_account {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    if body.verify_link(account).is_err() {
+        // A second device replacing the key it knew, after the first already
+        // moved the account (and this device with it).
+        if let Some(old) = db::moved_from(&l.db, &account).await?
+            && body.verify_link(old).is_ok()
+        {
+            return Err(ApiError::account_moved(format!(
+                "another device replaced this account's key first (account {})",
+                account.short()
+            )));
+        }
+        return Err(ApiError::unauthorised(
+            "the old account key didn't sign the new account",
+        ));
+    }
+    if !body.devices.contains(&req.device) {
+        return Err(ApiError::bad_request(
+            "the new account's devices must include the device asking",
+        ));
+    }
+    if body.devices.len() as i64 > ledger::MAX_DEVICES_PER_ACCOUNT {
+        return Err(ApiError::bad_request("too many devices for one account"));
+    }
+    match db::rekey(
+        &l.db,
+        &req.device,
+        &account,
+        &body.new_account,
+        &body.devices,
+        l.now(),
+    )
+    .await?
+    {
+        db::Rekeyed::Moved => {
+            tracing::info!("an account moved to a new key");
+            Ok(StatusCode::NO_CONTENT)
+        }
+        db::Rekeyed::AlreadyDone => Ok(StatusCode::NO_CONTENT),
+        db::Rekeyed::MovedElsewhere(to) => Err(ApiError::account_moved(format!(
+            "another device replaced this account's key first (account {})",
+            to.short()
+        ))),
+        db::Rekeyed::UnknownDevice => Err(ApiError::unknown_device()),
+        db::Rekeyed::WrongAccount => Err(ApiError::account_moved(
+            "this device's account changed while the request waited",
+        )),
+    }
 }
 
 /// `POST /v1/wake`: the signer was opened while behind (rule 3). The push goes

@@ -5,7 +5,8 @@
 //! edits when the window closes or the app quits (flush-on-close), and goes
 //! offline while the Mac sleeps.
 
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use mirrorleaf_ffi::Engine;
 use tauri::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
@@ -17,8 +18,17 @@ use crate::window;
 
 /// The argument the login item starts the app with: no window, menu bar only.
 const BACKGROUND_ARG: &str = "--background";
-/// The longest a quit waits for the last changes to go out.
-const QUIT_WAIT: Duration = Duration::from_secs(6);
+/// The longest a quit waits for the last changes to go out and the ledger to
+/// hear this device is going offline.
+const QUIT_WAIT: Duration = Duration::from_secs(3);
+/// How often a quit checks whether the window has closed.
+const CLOSE_CHECK: Duration = Duration::from_millis(20);
+/// The tray icon's ID.
+const TRAY: &str = "main";
+
+/// Set once the person chose Quit: the app looks gone, and a second launch
+/// mustn't open a window in the process about to exit.
+static QUITTING: AtomicBool = AtomicBool::new(false);
 /// Told to the screen before its window closes, so it sends the edits it is
 /// still holding and then calls `close_window`.
 pub const WILL_CLOSE: &str = "will-close";
@@ -42,6 +52,8 @@ pub fn plugins(builder: tauri::Builder<Wry>) -> tauri::Builder<Wry> {
             MacosLauncher::LaunchAgent,
             Some(vec![BACKGROUND_ARG]),
         ))
+        // The Save dialog for the recovery kit (M10).
+        .plugin(tauri_plugin_dialog::init())
 }
 
 pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
@@ -127,6 +139,9 @@ pub fn on_run_event(app: &AppHandle, event: &RunEvent) {
 
 /// Shows the main window, creating it if it was closed.
 pub fn show_window(app: &AppHandle) {
+    if QUITTING.load(Ordering::Acquire) {
+        return;
+    }
     #[cfg(target_os = "macos")]
     let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
     if let Some(window) = app.get_webview_window(window::MAIN) {
@@ -167,18 +182,35 @@ pub fn close_window(window: &tauri::WebviewWindow) {
 
 /// Quits for real: the screen sends its last edits, live sync sends them on
 /// and the ledger hears this device is going offline, then the app exits.
+/// The window, the menu-bar icon and the Dock icon go at once; the rest takes
+/// as long as it needs (usually a fraction of a second, at most about 4 s),
+/// out of sight.
 pub fn quit(app: &AppHandle) {
+    if QUITTING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let started = Instant::now();
+    if let Some(tray) = app.tray_by_id(TRAY) {
+        let _ = tray.set_visible(false);
+    }
     for window in app.webview_windows().values() {
         let _ = window.hide();
         ask_to_close(app, window.label());
     }
+    #[cfg(target_os = "macos")]
+    let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(CLOSE_WAIT).await;
+        // The screen closes its window as soon as it has sent its last edits
+        // (or `ask_to_close` closes it after `CLOSE_WAIT`).
+        while !app.webview_windows().is_empty() && started.elapsed() < CLOSE_WAIT {
+            tokio::time::sleep(CLOSE_CHECK).await;
+        }
         if let Some(engine) = Engine::get() {
             let _ = engine.flush_edits();
             let _ = tokio::time::timeout(QUIT_WAIT, engine.go_offline()).await;
         }
+        tracing::info!("quit in {} ms", started.elapsed().as_millis());
         app.exit(0);
     });
 }
@@ -226,7 +258,7 @@ fn tray(app: &App) -> tauri::Result<()> {
             &MenuItem::with_id(app, QUIT, "Quit Mirrorleaf", true, None::<&str>)?,
         ],
     )?;
-    TrayIconBuilder::with_id("main")
+    TrayIconBuilder::with_id(TRAY)
         .icon(tauri::include_image!("icons/tray.png"))
         .icon_as_template(true)
         .tooltip("Mirrorleaf")

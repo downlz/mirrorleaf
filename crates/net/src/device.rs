@@ -20,6 +20,9 @@ pub const KEY_FILE: &str = "device.key";
 pub const DB_FILE: &str = "mirrorleaf.db";
 /// The photo store's folder.
 pub const BLOB_DIR: &str = "blobs";
+/// Left by signing out (E3): the next start erases this device's key, notes
+/// and photos, and sets it up afresh.
+pub const ERASE_FILE: &str = "erase-on-start";
 
 // Settings kept in the database's `meta` table.
 pub const DEVICE_NAME: &str = "device_name";
@@ -83,8 +86,41 @@ impl DeviceDir {
         Ok((secret, replica))
     }
 
-    /// Opens the device, setting it up first if this is its first start.
+    /// Erases the device on its next start (signing out, E3): done then
+    /// rather than now, because the database and photo store are open.
+    pub fn erase_on_next_start(&self) -> Result<()> {
+        std::fs::write(self.path.join(ERASE_FILE), b"")?;
+        Ok(())
+    }
+
+    /// Erases this device's key, database and photo store, leaving anything
+    /// else in the folder (the app's own files) alone.
+    pub fn erase(&self) -> Result<()> {
+        for file in [
+            KEY_FILE.to_owned(),
+            DB_FILE.to_owned(),
+            format!("{DB_FILE}-wal"),
+            format!("{DB_FILE}-shm"),
+            ERASE_FILE.to_owned(),
+        ] {
+            match std::fs::remove_file(self.path.join(file)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            }
+        }
+        match std::fs::remove_dir_all(self.path.join(BLOB_DIR)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        }
+    }
+
+    /// Opens the device, setting it up first if this is its first start, or
+    /// afresh after signing out.
     pub fn open_or_init(&self, name: &str) -> Result<(SecretKey, Replica)> {
+        if self.path.join(ERASE_FILE).exists() {
+            self.erase()?;
+            tracing::info!("erased this device after signing out");
+        }
         if self.is_set_up() {
             self.open()
         } else {

@@ -20,5 +20,6 @@ pub fn set_app_version(version: String) {
 
 pub use engine::{
     DecodedPixels, DeviceSummary, Engine, EngineError, EngineStatus, FolderItem, Invitation,
-    NoteItem, NoteList, PairingStatus, PhotoDecoder, PhotoInfo, SyncListener, SyncSummary, UiEvent,
+    KitView, NoteItem, NoteList, PairingStatus, PhotoDecoder, PhotoInfo, SyncListener, SyncSummary,
+    UiEvent,
 };

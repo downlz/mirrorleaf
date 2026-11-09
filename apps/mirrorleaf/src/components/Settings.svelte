@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api, type Permissions } from '../lib/api';
+  import { api, type DeviceSummary, type Permissions } from '../lib/api';
   import { app } from '../lib/state.svelte';
   import AddDevice from './AddDevice.svelte';
   import Icon from './Icon.svelte';
@@ -12,8 +12,73 @@
   let autostart = $state<boolean | null>(null);
   /** Android's sync permissions (E1): asked when adding a device, changeable here. */
   let permissions = $state<Permissions | null>(null);
-  /** Settings itself, or adding a device (E1, direction A). */
-  let view = $state<'settings' | 'add'>('settings');
+  /** Settings itself, or one of its steps: adding a device (E1), removing one,
+   *  a new recovery kit, signing out (M10). */
+  let view = $state<'settings' | 'add' | 'remove' | 'kit' | 'signout'>('settings');
+  /** The device being removed. */
+  let target = $state<DeviceSummary | null>(null);
+  /** Changes only this device holds, for signing out. */
+  let onlyHere = $state<number | null>(null);
+  let working = $state(false);
+
+  const titles = {
+    settings: 'Settings',
+    add: 'Add a device',
+    remove: 'Remove a device',
+    kit: 'New recovery kit',
+    signout: 'Sign out',
+  };
+
+  const longDate = (seconds: number) =>
+    new Date(seconds * 1000).toLocaleDateString('en-GB', {
+      day: 'numeric',
+      month: 'long',
+      year: 'numeric',
+    });
+
+  function askRemove(device: DeviceSummary) {
+    target = device;
+    view = 'remove';
+  }
+
+  async function remove(replaceKey: boolean) {
+    if (!target) return;
+    working = true;
+    const id = target.id;
+    const done = await app.run(() => (replaceKey ? api.replaceKey([id]) : api.removeDevice(id)));
+    working = false;
+    if (done === undefined) return;
+    app.notify(
+      replaceKey
+        ? `Removed ${target.name}. Save your new recovery kit.`
+        : `Removed ${target.name}.`,
+    );
+    target = null;
+    view = 'settings';
+    await app.loadStatus();
+  }
+
+  async function newKit() {
+    working = true;
+    const done = await app.run(() => api.replaceKey([]));
+    working = false;
+    if (done === undefined) return;
+    view = 'settings';
+    // The kit shows over Settings until it is saved.
+    await app.loadStatus();
+  }
+
+  async function askSignOut() {
+    view = 'signout';
+    onlyHere = (await app.run(api.onlyHere)) ?? null;
+  }
+
+  async function signOut() {
+    working = true;
+    // The app starts afresh once this device is erased.
+    await app.run(() => api.signOut((onlyHere ?? 0) > 0));
+    working = false;
+  }
 
   const status = $derived(app.status);
 
@@ -48,8 +113,9 @@
   }
 
   function keydown(event: KeyboardEvent) {
-    if (event.key !== 'Escape') return;
+    if (event.key !== 'Escape' || working) return;
     if (view === 'add') void leaveAdding();
+    else if (view !== 'settings') view = 'settings';
     else app.closeSettings();
   }
 </script>
@@ -58,19 +124,19 @@
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div class="scrim" onpointerdown={() => app.closeSettings()}></div>
-<div
-  class="sheet"
-  role="dialog"
-  aria-modal="true"
-  aria-label={view === 'add' ? 'Add a device' : 'Settings'}
->
+<div class="sheet" role="dialog" aria-modal="true" aria-label={titles[view]}>
   <header class="sheet-header">
-    {#if view === 'add'}
-      <button class="icon-button" title="Back to Settings" onclick={leaveAdding}>
+    {#if view !== 'settings'}
+      <button
+        class="icon-button"
+        title="Back to Settings"
+        disabled={working}
+        onclick={() => (view === 'add' ? leaveAdding() : (view = 'settings'))}
+      >
         <Icon name="back" />
       </button>
     {/if}
-    <h1 class="grow">{view === 'add' ? 'Add a device' : 'Settings'}</h1>
+    <h1 class="grow">{titles[view]}</h1>
     <button class="icon-button" title="Close" onclick={() => app.closeSettings()}>
       <Icon name="close" />
     </button>
@@ -79,6 +145,64 @@
   <div class="sheet-body">
     {#if view === 'add'}
       <section><AddDevice /></section>
+    {:else if view === 'remove' && target}
+      <section>
+        <h2 class="question">Remove “{target.name}”?</h2>
+        <p class="hint">
+          It stops syncing with your devices, for good. To use it again, erase it and add it again.
+        </p>
+        <div class="actions wrap">
+          <button class="danger" disabled={working} onclick={() => remove(false)}>Remove</button>
+          <button disabled={working} onclick={() => (view = 'settings')}>Cancel</button>
+        </div>
+        <h3>Lost or stolen?</h3>
+        <p class="hint">
+          It still holds your account key. Remove it and make a new recovery kit: your other devices
+          get a new key, and your old kit stops working.
+        </p>
+        <div class="actions">
+          <button disabled={working} onclick={() => remove(true)}
+            >Remove and make a new recovery kit</button
+          >
+        </div>
+      </section>
+    {:else if view === 'kit'}
+      <section>
+        <p class="hint">
+          A new recovery kit comes with a new account key. Your other devices get the key the next
+          time they connect to this {app.deviceWord}, or to another device that has it. Your old kit
+          stops working.
+        </p>
+        <div class="actions">
+          <button class="primary" disabled={working} onclick={newKit}>Make the new kit</button>
+          <button disabled={working} onclick={() => (view = 'settings')}>Cancel</button>
+        </div>
+      </section>
+    {:else if view === 'signout'}
+      <section>
+        <p class="hint">
+          This {app.deviceWord} leaves your account, and its notes and photos are erased from it. Your
+          other devices keep everything.
+        </p>
+        {#if onlyHere === null}
+          <p class="waiting">
+            <span class="spinner"></span>Checking what only this {app.deviceWord} has…
+          </p>
+        {:else}
+          {#if onlyHere > 0}
+            <p class="error" role="alert">
+              {onlyHere === 1 ? '1 change exists' : `${onlyHere} changes exist`} only on this
+              {app.deviceWord}. Let it sync with another device first, or they are lost.
+            </p>
+          {/if}
+          <div class="actions">
+            <button class="danger" disabled={working} onclick={signOut}
+              >{onlyHere > 0 ? 'Sign out anyway' : 'Sign out and erase'}</button
+            >
+            <button disabled={working} onclick={() => (view = 'settings')}>Cancel</button>
+          </div>
+        {/if}
+      </section>
     {:else if status}
       <section>
         <h2>Sync</h2>
@@ -110,12 +234,39 @@
                     {/if}
                   </small>
                 </span>
+                {#if !device.this_device}
+                  <button class="link" onclick={() => askRemove(device)}>Remove…</button>
+                {/if}
               </li>
             {/each}
           </ul>
         {/if}
         {#if note}<p class="result">{note}</p>{/if}
       </section>
+
+      {#if status.account}
+        <section>
+          <h2>Recovery kit</h2>
+          {#if status.kit_used}
+            <p class="error">
+              Your kit was used to recover this account. Make a new one, so the old one stops
+              working.
+            </p>
+          {:else if status.kit_made_at}
+            <p class="hint">
+              Made {longDate(status.kit_made_at)}. It brings your account back if you lose all your
+              devices.
+            </p>
+          {:else}
+            <p class="error">
+              Your account has no recovery kit. If you lose all your devices, your notes are gone.
+            </p>
+          {/if}
+          <div class="actions">
+            <button onclick={() => (view = 'kit')}>Make a new recovery kit…</button>
+          </div>
+        </section>
+      {/if}
 
       {#if permissions && (!permissions.notifications || !permissions.nearby)}
         <section>
@@ -181,6 +332,17 @@
             Closing the window leaves Mirrorleaf syncing in the menu bar. Choose Quit from its menu
             to stop it.
           </p>
+        </section>
+      {/if}
+
+      {#if status.account}
+        <section>
+          <h2>Sign out</h2>
+          <div class="actions">
+            <button class="danger-text" onclick={askSignOut}
+              >Sign out of this {app.deviceWord}…</button
+            >
+          </div>
         </section>
       {/if}
 

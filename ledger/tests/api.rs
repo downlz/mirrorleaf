@@ -15,7 +15,7 @@ use mirrorleaf_ledger::limits::{Limits, Rate};
 use mirrorleaf_ledger::push::{FALLBACK_BODY_KEY, Fcm, Pusher, http_client};
 use mirrorleaf_ledger::rules::{Priority, Push, PushKind, WAKE_INTERVAL_SECS};
 use mirrorleaf_ledger::{Ledger, db};
-use mirrorleaf_proto::ledger::{Approval, DeviceKey, MAX_DEVICES_PER_ACCOUNT, Platform};
+use mirrorleaf_proto::ledger::{Approval, DeviceKey, MAX_DEVICES_PER_ACCOUNT, Platform, Rekey};
 use mirrorleaf_proto::{AccountKey, DeviceId};
 use serde_json::{Value, json};
 use sqlx_core::query::query;
@@ -626,6 +626,106 @@ async fn devices_can_be_removed_and_unseen_ones_are_pruned() {
         .await
         .unwrap();
     assert_eq!(devices, 0);
+    t.finish().await;
+}
+
+/// E3: replacing the account key moves the account once. The devices on the
+/// new list keep their rows, the rest go, the old key can't register again,
+/// and a second device replacing the same key is told the account moved.
+#[tokio::test]
+async fn an_account_moves_to_a_new_key_once() {
+    let Some(t) = TestLedger::start().await else {
+        return;
+    };
+    let (laptop, desktop, phone) = account(&t).await;
+    for d in [&laptop, &desktop, &phone] {
+        d.report(&t, &[], Some(0)).await;
+    }
+    let old = laptop.account.clone();
+    let new = Arc::new(AccountKey::from_recovery(&rand::random()));
+    let rekey = |link_from: &AccountKey, to: &AccountKey, keep: &[&Dev]| {
+        serde_json::to_value(Rekey::new(
+            &link_from.rotation_link(&to.id()),
+            to.id(),
+            keep.iter().map(|d| d.id()).collect(),
+        ))
+        .unwrap()
+    };
+
+    // A link signed by any key but the account's own is refused.
+    let stranger = AccountKey::generate();
+    let (status, _) = laptop
+        .call(
+            &t,
+            "POST",
+            "/v1/accounts/rekey",
+            rekey(&stranger, &new, &[&laptop]),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // The new list must include the device asking.
+    let (status, _) = laptop
+        .call(
+            &t,
+            "POST",
+            "/v1/accounts/rekey",
+            rekey(&old, &new, &[&desktop]),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // The phone was lost: the laptop moves the account without it.
+    let body = rekey(&old, &new, &[&laptop, &desktop]);
+    let (status, response) = laptop
+        .call(&t, "POST", "/v1/accounts/rekey", body.clone())
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{response}");
+    // Repeating it is harmless.
+    let (status, _) = laptop.call(&t, "POST", "/v1/accounts/rekey", body).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // The desktop's row moved: its next report says which account it is in.
+    let response = desktop.report(&t, &[], Some(0)).await;
+    assert_eq!(response["account"], new.id().to_string());
+    assert_eq!(response["devices"].as_array().unwrap().len(), 2);
+    // The phone's row is gone, and the old key can't register it again.
+    let (status, _) = phone
+        .call(
+            &t,
+            "PUT",
+            "/v1/devices/me/status",
+            json!({
+                "version_vector": {}, "online_for_secs": 0, "platform": "android",
+                "push_token": null, "notifications": false,
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, response) = phone.register(&t, "/v1/accounts").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(response["error"], "account_moved");
+
+    // The desktop also tried to replace the old key: it lost the race.
+    let other = AccountKey::from_recovery(&rand::random());
+    let (status, response) = desktop
+        .call(
+            &t,
+            "POST",
+            "/v1/accounts/rekey",
+            rekey(&old, &other, &[&desktop]),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(response["error"], "account_moved");
+
+    // A device approved by the new key joins the new account.
+    let tablet = Dev::new(&new, Platform::Android);
+    assert_eq!(
+        tablet.register(&t, "/v1/devices").await.0,
+        StatusCode::NO_CONTENT
+    );
+    let response = tablet.report(&t, &[], Some(0)).await;
+    assert_eq!(response["devices"].as_array().unwrap().len(), 3);
     t.finish().await;
 }
 

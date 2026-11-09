@@ -10,11 +10,13 @@ mod wire;
 
 pub use change::{Change, ContentType, SyncClass, VersionVector};
 pub use devices::{
-    AccountKey, DeviceEntry, DeviceList, DeviceListMerge, RotationLink, SignedDeviceList,
+    AccountKey, DeviceEntry, DeviceList, DeviceListMerge, KIT_MADE_AT, RotationLink,
+    SignedDeviceList,
 };
 pub use ids::{AccountId, BlobHash, DeviceId};
 pub use wire::{
-    ALPN, Hello, MAX_FRAME_LEN, Message, PROTOCOL_VERSIONS, choose_version, decode, encode,
+    ALPN, Handover, Hello, MAX_FRAME_LEN, Message, PROTOCOL_VERSIONS, choose_version, decode,
+    encode,
 };
 
 /// Errors from decoding or verifying protocol data.

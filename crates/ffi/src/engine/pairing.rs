@@ -26,7 +26,7 @@ const ONLINE_WAIT: Duration = Duration::from_secs(10);
 /// The ledger a new device asks about a word code when it has none of its
 /// own: set at build time (for development, the ledger on the local
 /// network). Production builds will name Mirrorleaf's own ledger (E10).
-const DEFAULT_LEDGER: Option<&str> = option_env!("MIRRORLEAF_DEFAULT_LEDGER");
+pub(super) const DEFAULT_LEDGER: Option<&str> = option_env!("MIRRORLEAF_DEFAULT_LEDGER");
 
 /// What the inviting device shows.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]

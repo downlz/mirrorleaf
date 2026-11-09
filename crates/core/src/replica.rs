@@ -74,6 +74,22 @@ const SCHEMA_V3: &str = "
     ALTER TABLE changes ADD COLUMN made_at INTEGER NOT NULL DEFAULT 0;
 ";
 
+/// Schema version 4 (Phase 1, M10): what each other device was last seen to
+/// hold, from the sync rounds with it. Sign-out uses it to warn about changes
+/// only this device holds (E3); E6 shows it, E11 compacts by it.
+const SCHEMA_V4: &str = "
+    CREATE TABLE peer_holds (
+        device BLOB NOT NULL,
+        origin BLOB NOT NULL,
+        seq    INTEGER NOT NULL,
+        PRIMARY KEY (device, origin)
+    );
+    CREATE TABLE peer_seen (
+        device BLOB PRIMARY KEY,
+        at     INTEGER NOT NULL
+    );
+";
+
 /// One device's copy of the account's notes.
 pub struct Replica {
     pub(crate) conn: Connection,
@@ -105,6 +121,9 @@ impl Replica {
         }
         if version < 3 {
             migrate_to_v3(&conn)?;
+        }
+        if version < 4 {
+            migrate(&conn, SCHEMA_V4, 4)?;
         }
         let mut replica = Self { conn, device };
         match replica.meta("device_id")? {
@@ -153,6 +172,80 @@ impl Replica {
         insert_change(&tx, &change)?;
         tx.commit()?;
         Ok(change)
+    }
+
+    pub fn delete_meta(&mut self, key: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM meta WHERE key = ?1", [key])?;
+        Ok(())
+    }
+
+    /// Remembers that `peer` held at least `holds` at Unix time `at` (after a
+    /// sync round with it). Never lowers a number already recorded.
+    pub fn record_peer_holds(
+        &mut self,
+        peer: DeviceId,
+        holds: &VersionVector,
+        at: u64,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO peer_holds (device, origin, seq) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (device, origin) DO UPDATE SET seq = max(seq, excluded.seq)",
+            )?;
+            for (origin, seq) in &holds.0 {
+                stmt.execute(params![&peer.0[..], &origin.0[..], *seq as i64])?;
+            }
+            tx.execute(
+                "INSERT INTO peer_seen (device, at) VALUES (?1, ?2)
+                 ON CONFLICT (device) DO UPDATE SET at = max(at, excluded.at)",
+                params![&peer.0[..], at as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// What `peer` was last seen to hold, and when (Unix seconds), if this
+    /// device has synced with it.
+    pub fn peer_holds(&self, peer: &DeviceId) -> Result<Option<(VersionVector, u64)>> {
+        let at: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT at FROM peer_seen WHERE device = ?1",
+                [&peer.0[..]],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(at) = at else {
+            return Ok(None);
+        };
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT origin, seq FROM peer_holds WHERE device = ?1")?;
+        let rows = stmt.query_map([&peer.0[..]], |row| {
+            Ok((device_id(row.get::<_, Vec<u8>>(0)?)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut vv = VersionVector::default();
+        for row in rows {
+            let (origin, seq) = row?;
+            vv.0.insert(origin, seq as u64);
+        }
+        Ok(Some((vv, at as u64)))
+    }
+
+    /// How many changes this device holds that none of `others` is known to
+    /// hold: what signing out would lose (E3). Each change counts as long as
+    /// no other device was seen to hold it, wherever it was made.
+    pub fn only_here(&self, others: &[DeviceId]) -> Result<u64> {
+        let mut known = VersionVector::default();
+        for peer in others {
+            if let Some((holds, _)) = self.peer_holds(peer)? {
+                known = known.merged(&holds);
+            }
+        }
+        Ok(self.version_vector()?.ahead_of(&known))
     }
 
     pub fn version_vector(&self) -> Result<VersionVector> {
@@ -361,10 +454,15 @@ fn unix_now() -> u64 {
 
 /// Adds each change's content type, sync class and time (M9).
 fn migrate_to_v3(conn: &Connection) -> Result<()> {
+    migrate(conn, SCHEMA_V3, 3)
+}
+
+/// Runs `schema` and sets the schema version to `version`, in one transaction.
+fn migrate(conn: &Connection, schema: &str, version: i64) -> Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let migrated = (|| {
-        conn.execute_batch(SCHEMA_V3)?;
-        conn.pragma_update(None, "user_version", 3)?;
+        conn.execute_batch(schema)?;
+        conn.pragma_update(None, "user_version", version)?;
         Ok(())
     })();
     conn.execute_batch(if migrated.is_ok() {
@@ -554,7 +652,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         assert_eq!(replica.photos().unwrap()[0].photo, photo);
         // M9's columns: the old change reads as a Yjs update, normal class,
         // made at an unknown time.
@@ -567,6 +665,35 @@ mod tests {
         );
         drop(replica);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn changes_no_other_device_holds_are_counted() {
+        let me = DeviceId([1; 32]);
+        let (phone, laptop, lost) = (DeviceId([2; 32]), DeviceId([3; 32]), DeviceId([4; 32]));
+        let mut replica = Replica::open_in_memory(me).unwrap();
+        for text in ["a", "b", "c"] {
+            replica.record_local("note", text_update(text)).unwrap();
+        }
+        // A change from the lost device that only this one received.
+        let theirs = Change::yjs(lost, 1, "note", text_update("d"), 0);
+        replica.apply_remote(&[theirs]).unwrap();
+        assert_eq!(replica.only_here(&[phone, laptop]).unwrap(), 4);
+
+        // The phone took two of ours; the laptop took all three, then less
+        // in an older report that mustn't lower what is known.
+        let vv = |n| VersionVector([(me, n)].into());
+        replica.record_peer_holds(phone, &vv(2), 100).unwrap();
+        replica.record_peer_holds(laptop, &vv(3), 200).unwrap();
+        replica.record_peer_holds(laptop, &vv(1), 150).unwrap();
+        assert_eq!(replica.peer_holds(&laptop).unwrap(), Some((vv(3), 200)));
+        assert_eq!(replica.peer_holds(&lost).unwrap(), None);
+        assert_eq!(
+            replica.only_here(&[phone, laptop]).unwrap(),
+            1,
+            "the lost device's"
+        );
+        assert_eq!(replica.only_here(&[phone]).unwrap(), 2);
     }
 
     #[test]

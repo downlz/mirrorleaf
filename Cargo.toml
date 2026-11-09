@@ -39,6 +39,7 @@ iroh = "=1.4.1"
 iroh-blobs = { version = "=0.103.1", default-features = false, features = ["fs-store"] }
 # Iroh's own futures helpers (already in the tree through Iroh), for iroh-blobs' progress streams.
 n0-future = "0.3.2"
+pdf-writer = "0.15.0"
 postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
 rand = "0.10.3"
 # HTTPS to the ledger and to FCM, through the rustls and ring Iroh already uses.
@@ -66,6 +67,7 @@ tauri-build = "2.7.4"
 # Desktop agent (M5): one instance, and starting at login. Both from Tauri's
 # plugins workspace; Apache-2.0 OR MIT.
 tauri-plugin-autostart = "=2.7.0"
+tauri-plugin-dialog = "=2.8.4"
 tauri-plugin-single-instance = "=2.5.4"
 # macOS sleep and wake notifications for the desktop agent (M5). Already in the
 # tree through Tauri's window code; only features are added.

@@ -9,10 +9,11 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use mirrorleaf_core::{BlobHash, BlobKind, Block, PhotoRef, Replica, photos};
 use mirrorleaf_net::device::{self, DeviceDir, device_names, device_of, ledger_client, me};
+use mirrorleaf_net::kit::{self, Kit};
 use mirrorleaf_net::ledger::{DeviceProfile, Fallback, LedgerClient, PROMPT_AFTER};
 use mirrorleaf_net::pair::{self, JoinRequest, PairingCode, PairingEvent, WordCode};
 use mirrorleaf_net::{
-    Account, BlobStorage, DevTicket, Event, Network, SecretKey, State, SyncNode, describe,
+    Account, BlobStorage, DevTicket, Event, Network, SecretKey, State, SyncNode, describe, recovery,
 };
 use mirrorleaf_proto::DeviceId;
 use mirrorleaf_proto::ledger::{Platform, StatusResponse, WakeResponse};
@@ -64,6 +65,51 @@ enum Command {
     },
     /// Show this device, its account and its change log
     Status,
+    /// The recovery kit (E2): `new` replaces the account key and prints a new kit
+    #[command(subcommand)]
+    Kit(KitCmd),
+    /// Bring the account back to this new device with its recovery kit (E2)
+    Recover {
+        /// The kit's 12 words (quoted), or its QR code's text (MLR1…)
+        code: String,
+        /// The account's ledger, if the code doesn't name it
+        #[arg(long)]
+        ledger: Option<String>,
+    },
+    /// The account's devices (E3)
+    #[command(subcommand)]
+    Device(DeviceCmd),
+    /// Take this device off the account and erase its notes (E3)
+    SignOut {
+        /// Even if some changes exist only on this device
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum KitCmd {
+    /// Replace the account key and print the new recovery kit; the old kit
+    /// stops working. The other devices get the new key when they next connect.
+    New {
+        /// Devices to leave behind (ID prefixes), such as a lost one
+        #[arg(long)]
+        remove: Vec<String>,
+        /// Also save the kit as a PDF and a text file in this folder
+        #[arg(long, value_name = "FOLDER")]
+        out: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DeviceCmd {
+    /// Remove a device from the account for good (its ID or a prefix of it)
+    Remove {
+        device: String,
+        /// It was lost or stolen: replace the account key too, and print the new kit
+        #[arg(long)]
+        replace_key: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -214,6 +260,13 @@ async fn main() -> Result<()> {
         Command::Ledger(cmd) => ledger(&dir, cmd).await,
         Command::Sync { watch, export } => sync(&dir, watch, export).await,
         Command::Status => status(&dir),
+        Command::Kit(KitCmd::New { remove, out }) => new_kit(&dir, &remove, out).await,
+        Command::Recover { code, ledger } => recover(&dir, &code, ledger).await,
+        Command::Device(DeviceCmd::Remove {
+            device,
+            replace_key,
+        }) => remove_device(&dir, &device, replace_key).await,
+        Command::SignOut { force } => sign_out(&dir, force).await,
     }
 }
 
@@ -247,9 +300,10 @@ async fn dev_account(dir: &Path, cmd: DevAccount) -> Result<()> {
             if existing.is_some() {
                 bail!("this device already belongs to an account");
             }
-            let account = Account::create(me(&replica, &secret)?);
+            let (account, kit) = Account::create_with_kit(me(&replica, &secret)?, now());
             account.save(&mut replica)?;
-            println!("Created developer account {}", account.id());
+            println!("Created account {}", account.id());
+            println!("Recovery words: {}", kit.words().join(" "));
         }
         DevAccount::Ticket => {
             let account = existing.context("no account yet: run `dev-account new` first")?;
@@ -1019,6 +1073,13 @@ async fn sync(dir: &Path, watch: bool, export: Option<PathBuf>) -> Result<()> {
                         }
                     }
                     Some(Event::Disconnected { peer }) => println!("{} disconnected", label(peer)),
+                    Some(Event::DevicesChanged { account_replaced }) => {
+                        if account_replaced {
+                            println!("the account key was replaced: now account {}", node.state().lock().unwrap().account.id());
+                        } else {
+                            println!("the device list changed; reconnecting");
+                        }
+                    }
                     Some(Event::Fetched { peer, path, report, .. }) => {
                         println!(
                             "{} via {path}: {}, {} ({} read) in {} ms",
@@ -1160,6 +1221,13 @@ fn status(dir: &Path) -> Result<()> {
         account.id(),
         account.devices.list.version
     );
+    match account.devices.kit_made_at() {
+        Some(made) => println!("Kit      made {}", kit::long_date(made)),
+        None => println!("Kit      none yet (`kit new` makes one)"),
+    }
+    if account.removed(&device) {
+        println!("Removed  another device removed this one: `sign-out --force` erases it");
+    }
     let vv = replica.version_vector()?;
     println!("Devices  (changes held from each)");
     for d in &account.devices.list.devices {
@@ -1202,6 +1270,208 @@ fn status(dir: &Path) -> Result<()> {
         photos.len(),
         photos.iter().filter(|p| p.has_thumbnail).count(),
         photos.iter().filter(|p| p.has_full).count()
+    );
+    Ok(())
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The device whose ID starts with `prefix`, among the account's devices.
+fn find_device(account: &Account, prefix: &str) -> Result<DeviceId> {
+    let prefix = prefix.to_ascii_lowercase();
+    let mut found = account
+        .devices
+        .list
+        .devices
+        .iter()
+        .filter(|d| d.id.to_string().starts_with(&prefix));
+    match (found.next(), found.next()) {
+        (Some(d), None) => Ok(d.id),
+        (None, _) => bail!("no device of this account starts with {prefix}"),
+        _ => bail!("more than one device starts with {prefix}: give more of its ID"),
+    }
+}
+
+/// A node for this device with its ledger, holding no photos.
+async fn bind(dir: &Path) -> Result<SyncNode> {
+    let (secret, replica) = open(dir)?;
+    let account =
+        Account::load(&replica)?.context("no account yet: run `dev-account new` or `recover`")?;
+    let ledger = ledger_client(&replica, &secret, &account)?;
+    let node = SyncNode::bind(
+        State { replica, account },
+        secret,
+        Network::Internet,
+        BlobStorage::Memory,
+    )
+    .await?;
+    if let Some(ledger) = ledger {
+        node.use_ledger(ledger);
+    }
+    Ok(node)
+}
+
+/// Replaces the account key, prints the new kit, and hands the key to the
+/// devices that can be reached now (E2, E3).
+async fn replace_key(node: &SyncNode, remove: &[DeviceId], out: Option<PathBuf>) -> Result<()> {
+    let secret = node.replace_key(remove).await?;
+    let (ledger, made_at) = {
+        let mut state = node.state().lock().unwrap();
+        let made_at = Account::pending_kit(&state.replica)?.map_or_else(now, |(_, at)| at);
+        // The terminal shows it now: nothing to keep.
+        Account::clear_pending_kit(&mut state.replica)?;
+        (
+            device::ledger_settings(&state.replica)?.map(|(url, _)| url),
+            made_at,
+        )
+    };
+    let kit = Kit::new(secret, made_at, ledger);
+    println!("Replaced the account key: now account {}.", kit.account);
+    println!("\n{}", kit.text());
+    if let Some(folder) = out {
+        std::fs::create_dir_all(&folder)?;
+        let pdf = folder.join(kit.file_name("pdf"));
+        std::fs::write(&pdf, kit.pdf()?)?;
+        let text = folder.join(kit.file_name("txt"));
+        std::fs::write(&text, kit.text())?;
+        println!("Saved {} and {}.", pdf.display(), text.display());
+    }
+    let told = node.announce().await;
+    println!(
+        "Handed the new key to {told} device(s) now; the others get it when they next connect."
+    );
+    Ok(())
+}
+
+async fn new_kit(dir: &Path, remove: &[String], out: Option<PathBuf>) -> Result<()> {
+    let node = bind(dir).await?;
+    let remove = {
+        let state = node.state().lock().unwrap();
+        remove
+            .iter()
+            .map(|p| find_device(&state.account, p))
+            .collect::<Result<Vec<_>>>()?
+    };
+    let result = replace_key(&node, &remove, out).await;
+    node.close().await;
+    result
+}
+
+async fn remove_device(dir: &Path, prefix: &str, rekey: bool) -> Result<()> {
+    let node = bind(dir).await?;
+    let result = async {
+        let device = find_device(&node.state().lock().unwrap().account, prefix)?;
+        if rekey {
+            replace_key(&node, &[device], None).await?;
+        } else {
+            node.remove_device(device).await?;
+            println!("Removed {}.", device.short());
+            let told = node.announce().await;
+            println!("Told {told} device(s) now; the others learn it when they next connect.");
+            println!(
+                "If it was lost or stolen, run `kit new` too: it still holds the account key."
+            );
+        }
+        anyhow::Ok(())
+    }
+    .await;
+    node.close().await;
+    result
+}
+
+/// The new device's side of recovery (E2).
+async fn recover(dir: &Path, code: &str, ledger: Option<String>) -> Result<()> {
+    let (secret, mut replica) = open(dir)?;
+    if Account::load(&replica)?.is_some() {
+        bail!("this device already belongs to an account");
+    }
+    let code: kit::RecoveryCode = code.parse()?;
+    let lookup = ledger.or_else(|| {
+        device::ledger_settings(&replica)
+            .ok()
+            .flatten()
+            .map(|(url, _)| url)
+    });
+    let profile = DeviceProfile {
+        platform: Platform::this(),
+        push_token: None,
+        notifications: false,
+    };
+    let (account, client) = recovery::recover(
+        &code,
+        me(&replica, &secret)?,
+        &secret,
+        lookup,
+        profile.clone(),
+    )
+    .await?;
+    account.save(&mut replica)?;
+    device::save_ledger(&mut replica, client.url(), &profile)?;
+    Account::mark_kit_used(&mut replica)?;
+    println!("Recovered account {}.", account.id());
+    let others = account.devices.list.devices.len() - 1;
+    println!("The ledger knows {others} other device(s) of it; syncing with those that answer…");
+    drop(replica);
+    let node = bind(dir).await?;
+    let started = Instant::now();
+    let told = node.announce().await;
+    let notes = node.state().lock().unwrap().replica.list_notes()?.len();
+    println!(
+        "Reached {told} device(s) in {:.1} s; {notes} notes here now.",
+        started.elapsed().as_secs_f64()
+    );
+    println!(
+        "Remove the devices you lost (`device remove`), then make a new kit (`kit new`): this one was used."
+    );
+    node.close().await;
+    Ok(())
+}
+
+/// Signing out (E3): off the account, then erased.
+async fn sign_out(dir: &Path, force: bool) -> Result<()> {
+    let node = bind(dir).await?;
+    let result = async {
+        let (only_here, removed) = {
+            let state = node.state().lock().unwrap();
+            let me = node.device();
+            let others: Vec<DeviceId> = state
+                .account
+                .devices
+                .list
+                .devices
+                .iter()
+                .map(|d| d.id)
+                .filter(|d| *d != me)
+                .collect();
+            (
+                state.replica.only_here(&others)?,
+                state.account.removed(&me),
+            )
+        };
+        if only_here > 0 && !force && !removed {
+            bail!(
+                "{only_here} change(s) exist only on this device: run `sync` first, or sign out with --force to lose them"
+            );
+        }
+        if !removed {
+            node.leave_account().await?;
+            let told = node.announce().await;
+            println!("Signed out; told {told} device(s).");
+        }
+        anyhow::Ok(())
+    }
+    .await;
+    node.close().await;
+    result?;
+    DeviceDir::new(dir).erase()?;
+    println!(
+        "Erased this device's key, notes and photos from {}.",
+        dir.display()
     );
     Ok(())
 }

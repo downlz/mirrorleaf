@@ -5,9 +5,11 @@ mod account;
 mod blobs;
 pub mod device;
 mod frame;
+pub mod kit;
 pub mod ledger;
 mod node;
 pub mod pair;
+pub mod recovery;
 mod session;
 mod ticket;
 
@@ -62,6 +64,8 @@ pub enum AuthError {
     OtherAccount,
     #[error("the peer isn't on this account's device list")]
     NotOnList,
+    #[error("this device was removed from the account")]
+    Removed,
     #[error("the peer's device list isn't validly signed: {0}")]
     BadList(mirrorleaf_proto::ProtoError),
 }

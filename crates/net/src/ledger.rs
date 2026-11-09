@@ -4,10 +4,10 @@ use anyhow::{Context, Result, bail};
 use iroh::SecretKey;
 use mirrorleaf_proto::ledger::{
     Approval, DEVICE_HEADER, DeviceKey, LedgerError, PairingLookup, PairingOffer, Platform,
-    Register, SIGNATURE_HEADER, StatusResponse, StatusUpdate, TIME_HEADER, WakeResponse,
-    error_code,
+    Register, Rekey, RemoveDevice, SIGNATURE_HEADER, StatusResponse, StatusUpdate, TIME_HEADER,
+    WakeResponse, error_code,
 };
-use mirrorleaf_proto::{AccountId, DeviceId, VersionVector};
+use mirrorleaf_proto::{AccountId, DeviceId, RotationLink, VersionVector};
 
 use crate::Account;
 
@@ -77,6 +77,56 @@ impl LedgerClient {
         &self.base
     }
 
+    /// The account this client registers under.
+    pub fn account(&self) -> AccountId {
+        self.account
+    }
+
+    /// The same ledger and profile for `account`, after the account's key was
+    /// replaced (E3).
+    pub fn for_account(&self, account: &Account) -> Result<Self> {
+        let approval = match (&account.approval, &account.key) {
+            (Some(approval), _) => approval.clone(),
+            (None, Some(key)) => Approval::AddDevice.sign(key, &self.key.id()),
+            (None, None) => bail!("this device holds neither the account key nor its approval"),
+        };
+        Ok(Self {
+            base: self.base.clone(),
+            http: self.http.clone(),
+            key: DeviceKey::from_bytes(self.key.to_bytes()),
+            account: account.id(),
+            approval,
+            profile: self.profile.clone(),
+        })
+    }
+
+    /// Moves this device's account to the key that replaces it (E3). The
+    /// devices on the new list move with it; the others are dropped. Fails
+    /// if another device replaced the key first.
+    pub async fn rekey(
+        &self,
+        link: &RotationLink,
+        new_account: AccountId,
+        devices: Vec<DeviceId>,
+    ) -> Result<()> {
+        let body = serde_json::to_vec(&Rekey::new(link, new_account, devices))?;
+        match self.send("POST", "/v1/accounts/rekey", body).await {
+            Ok(_) => Ok(()),
+            Err(e) if is(&e, error_code::ACCOUNT_MOVED) => bail!(
+                "another of your devices replaced the account key a moment ago; this one gets the new key when it next connects to it"
+            ),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Removes another device of the account from the ledger, with the
+    /// account key's approval (E3).
+    pub async fn remove_device(&self, device: DeviceId, approval: String) -> Result<()> {
+        let path = format!("/v1/devices/{device}");
+        let body = serde_json::to_vec(&RemoveDevice { approval })?;
+        self.send("DELETE", &path, body).await.map(drop)
+    }
+
     pub fn profile(&self) -> &DeviceProfile {
         &self.profile
     }
@@ -89,12 +139,39 @@ impl LedgerClient {
             approval: self.approval.clone(),
             platform: self.profile.platform,
         })?;
-        match self.send("POST", "/v1/devices", body.clone()).await {
+        let registered = match self.send("POST", "/v1/devices", body.clone()).await {
             Err(e) if is(&e, error_code::UNKNOWN_ACCOUNT) => {
-                self.send("POST", "/v1/accounts", body).await?;
-                Ok(())
+                self.send("POST", "/v1/accounts", body).await.map(drop)
             }
             other => other.map(drop),
+        };
+        match registered {
+            Err(e) if is(&e, error_code::ACCOUNT_MOVED) => bail!(
+                "this account's key was replaced on another device: use your newest recovery kit, or add this device again from one of your devices"
+            ),
+            other => other,
+        }
+    }
+
+    /// Joins an account the ledger already knows, never creating one: a
+    /// recovered device (E2) must find its account there, or the words were
+    /// mistyped (a wrong word passes the checksum one time in sixteen).
+    pub async fn join_existing(&self) -> Result<()> {
+        let body = serde_json::to_vec(&Register {
+            account: self.account,
+            approval: self.approval.clone(),
+            platform: self.profile.platform,
+        })?;
+        match self.send("POST", "/v1/devices", body).await {
+            Ok(_) => Ok(()),
+            Err(e) if is(&e, error_code::UNKNOWN_ACCOUNT) => bail!(
+                "no account with this recovery kit is known at {}: check the words, or the ledger's address",
+                self.base
+            ),
+            Err(e) if is(&e, error_code::ACCOUNT_MOVED) => {
+                bail!("this recovery kit was replaced by a newer one: use the newest kit you made")
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -326,6 +403,7 @@ mod tests {
                 row(1, Platform::Macos, &[5]),
                 row(2, Platform::Android, &[5, 3]),
             ],
+            account: None,
         }
     }
 

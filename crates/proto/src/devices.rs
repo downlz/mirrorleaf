@@ -17,6 +17,13 @@ const LEGACY_CONTEXT: &[u8] = b"mirrorleaf/device-list/1";
 /// The old account key's signature over the new account ID, when a key is
 /// replaced (E3).
 const ROTATION_CONTEXT: &[u8] = b"mirrorleaf/rotate-account/1";
+/// BLAKE3 key-derivation context: the account key from the recovery secret
+/// (E2, ADR-010). Fixed for good: changing it would make every kit useless.
+const RECOVERY_KEY_CONTEXT: &str = "mirrorleaf 2026-11-09 account key from recovery secret";
+
+/// The account setting saying when the account's recovery kit was made, in
+/// Unix seconds (E2). Absent for accounts made before M10, which have none.
+pub const KIT_MADE_AT: &str = "kit_made_at";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceEntry {
@@ -143,6 +150,22 @@ impl SignedDeviceList {
         self.list.removed.binary_search(device).is_ok()
     }
 
+    /// When the account's current recovery kit was made, if it has one (E2).
+    pub fn kit_made_at(&self) -> Option<u64> {
+        self.list.settings.get(KIT_MADE_AT)?.parse().ok()
+    }
+
+    /// Checks this list belongs to an account that replaced `previous` (E3):
+    /// signed by its own account key, and linked from `previous` by the old
+    /// key's signature.
+    pub fn verify_replacement_of(&self, previous: &AccountId) -> Result<(), ProtoError> {
+        self.verify(&self.list.account)?;
+        match &self.list.rotated_from {
+            Some(link) if link.previous == *previous => link.verify(&self.list.account),
+            _ => Err(ProtoError::WrongAccount),
+        }
+    }
+
     /// Reads a list stored before M9 (device list 1, which held only IDs and
     /// names), checks its signature, and signs the same devices as a version 2
     /// list under the same version number. The conversion is fixed, so every
@@ -219,6 +242,13 @@ impl AccountKey {
         Self(SigningKey::from_bytes(&bytes))
     }
 
+    /// The account key the 128-bit recovery secret stands for (E2): the
+    /// recovery kit's 12 words recreate the same key, so a recovered device
+    /// joins the same account, with the same ID on the ledger.
+    pub fn from_recovery(secret: &[u8; 16]) -> Self {
+        Self::from_bytes(blake3::derive_key(RECOVERY_KEY_CONTEXT, secret))
+    }
+
     pub fn to_bytes(&self) -> [u8; 32] {
         self.0.to_bytes()
     }
@@ -272,6 +302,73 @@ impl AccountKey {
             previous: self.id(),
             signature: self.0.sign(&rotation_message(new)).to_bytes().to_vec(),
         }
+    }
+
+    /// The first device list of the account `new` that replaces this key (E3):
+    /// the same devices less `remove`, with the removed devices remembered, the
+    /// same settings plus `kit_made_at`, and this key's signature linking the
+    /// two accounts. Signed by `new`.
+    pub fn replacement_list(
+        &self,
+        current: &SignedDeviceList,
+        new: &AccountKey,
+        remove: &[DeviceId],
+        kit_made_at: u64,
+    ) -> SignedDeviceList {
+        let mut list = current.list.clone();
+        list.account = new.id();
+        list.version += 1;
+        list.removed.extend_from_slice(remove);
+        list.settings
+            .insert(KIT_MADE_AT.to_owned(), kit_made_at.to_string());
+        list.rotated_from = Some(self.rotation_link(&new.id()));
+        new.sign(list)
+    }
+
+    /// A recovered device's first list (E2): itself only, at version 0, so the
+    /// list of any surviving device is newer and its settings win the merge.
+    pub fn recovery_list(&self, me: DeviceEntry) -> SignedDeviceList {
+        self.sign(DeviceList {
+            account: self.id(),
+            version: 0,
+            devices: vec![me],
+            removed: Vec::new(),
+            settings: BTreeMap::new(),
+            rotated_from: None,
+        })
+    }
+
+    /// Adds devices the ledger knows but this device can't name yet (a
+    /// recovery with no other device reachable): no name, no platform, so the
+    /// device's own entry wins once it is seen (`DeviceEntry::rank`).
+    pub fn add_unnamed(
+        &self,
+        current: &SignedDeviceList,
+        devices: &[DeviceId],
+    ) -> SignedDeviceList {
+        let mut list = current.list.clone();
+        list.version += 1;
+        list.devices.extend(devices.iter().map(|id| DeviceEntry {
+            id: *id,
+            name: String::new(),
+            platform: None,
+            added_at: 0,
+        }));
+        self.sign(list)
+    }
+
+    /// `current` with the account settings in `settings` changed.
+    pub fn with_settings(
+        &self,
+        current: &SignedDeviceList,
+        settings: &[(&str, String)],
+    ) -> SignedDeviceList {
+        let mut list = current.list.clone();
+        list.version += 1;
+        for (key, value) in settings {
+            list.settings.insert((*key).to_owned(), value.clone());
+        }
+        self.sign(list)
     }
 }
 
@@ -527,6 +624,68 @@ mod tests {
             SignedDeviceList::upgrade_legacy(&bytes, &AccountKey::generate()),
             Err(ProtoError::WrongAccount)
         ));
+    }
+
+    #[test]
+    fn the_recovery_secret_always_makes_the_same_account_key() {
+        let secret = [9u8; 16];
+        assert_eq!(
+            AccountKey::from_recovery(&secret).id(),
+            AccountKey::from_recovery(&secret).id()
+        );
+        assert_ne!(
+            AccountKey::from_recovery(&secret).id(),
+            AccountKey::from_recovery(&[8u8; 16]).id()
+        );
+        // Pinned: a kit made today must open the same account in every later
+        // version of the app.
+        assert_eq!(
+            AccountKey::from_recovery(&[0u8; 16]).id().to_string()[..16],
+            *"44ce0cc369631239"
+        );
+    }
+
+    #[test]
+    fn a_replacement_list_moves_the_devices_to_the_new_key() {
+        let old = AccountKey::generate();
+        let current = old.add_device(&old.first_list(device(1)), device(2));
+        let new = AccountKey::from_recovery(&[1u8; 16]);
+        let replaced = old.replacement_list(&current, &new, &[DeviceId([2; 32])], 1_794_200_000);
+        replaced.verify(&new.id()).unwrap();
+        replaced.verify_replacement_of(&old.id()).unwrap();
+        assert!(replaced.contains(&DeviceId([1; 32])));
+        assert!(!replaced.contains(&DeviceId([2; 32])));
+        assert!(replaced.was_removed(&DeviceId([2; 32])));
+        assert_eq!(replaced.kit_made_at(), Some(1_794_200_000));
+        // Not a replacement of some other account.
+        assert!(
+            replaced
+                .verify_replacement_of(&AccountKey::generate().id())
+                .is_err()
+        );
+        // Someone holding only the new key can't claim the old account.
+        let mut forged = replaced.clone();
+        forged.list.rotated_from = Some(new.rotation_link(&new.id()));
+        let forged = new.sign(forged.list);
+        assert!(forged.verify_replacement_of(&old.id()).is_err());
+    }
+
+    #[test]
+    fn a_recovered_device_takes_the_names_and_settings_its_account_already_has() {
+        let key = AccountKey::from_recovery(&[2u8; 16]);
+        let held = key.with_settings(
+            &key.add_device(&key.first_list(device(1)), device(2)),
+            &[(KIT_MADE_AT, "1794200000".into())],
+        );
+        // The recovered device knows the others only from the ledger.
+        let recovered = key.add_unnamed(&key.recovery_list(device(3)), &[DeviceId([1; 32])]);
+        let DeviceListMerge::Resigned(merged) = DeviceListMerge::of(&recovered, &held, Some(&key))
+        else {
+            panic!("expected a re-signed union");
+        };
+        assert_eq!(merged.list.devices.len(), 3);
+        assert_eq!(merged.list.entry(&DeviceId([1; 32])), Some(&device(1)));
+        assert_eq!(merged.kit_made_at(), Some(1_794_200_000));
     }
 
     #[test]

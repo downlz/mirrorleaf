@@ -24,6 +24,23 @@ export interface EngineStatus {
   has_push_token: boolean;
   notifications: boolean;
   live: boolean;
+  /** When the account's recovery kit was made (Unix seconds); null if it has none (E2). */
+  kit_made_at: number | null;
+  /** A kit is waiting to be saved. */
+  kit_pending: boolean;
+  /** This device recovered the account with its kit: a new kit is due. */
+  kit_used: boolean;
+  /** Another device removed this one from the account (E3). */
+  removed: boolean;
+}
+
+/** The recovery kit waiting to be saved (E2). */
+export interface KitView {
+  words: string[];
+  /** The account's short form, "48a02495". */
+  account: string;
+  /** "9 November 2026". */
+  made: string;
 }
 
 export interface NoteItem {
@@ -116,6 +133,17 @@ export const api = {
   startupDone: (what: string) => invoke<void>('startup_done', { what }),
   autostart: () => invoke<boolean>('autostart'),
   setAutostart: (enabled: boolean) => invoke<void>('set_autostart', { enabled }),
+  // The account's lifecycle (M10).
+  pendingKit: () => invoke<KitView | null>('pending_kit'),
+  /** Saves the kit where the person chooses; false if they cancelled. */
+  saveKit: (kind: 'pdf' | 'text') => invoke<boolean>('save_kit', { kind }),
+  finishKit: () => invoke<void>('finish_kit'),
+  replaceKey: (remove: string[]) => invoke<void>('replace_key', { remove }),
+  removeDevice: (id: string) => invoke<void>('remove_device', { id }),
+  onlyHere: () => invoke<number>('only_here'),
+  /** Signs out and erases this device; the app then starts afresh. */
+  signOut: (force: boolean) => invoke<void>('sign_out', { force }),
+  recover: (code: string, ledger: string | null) => invoke<string>('recover', { code, ledger }),
 };
 
 export function onEngineEvent(handler: (event: EngineEvent) => void): Promise<UnlistenFn> {

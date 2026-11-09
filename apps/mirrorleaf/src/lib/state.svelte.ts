@@ -47,7 +47,12 @@ class AppState {
   /** Adding a device, on either side (E1). */
   pairing = $state<PairingStatus>({ state: 'idle' });
   /** On first run, the sheet over the welcome page, if one is open. */
-  welcomeSheet = $state<'create' | 'join' | null>(null);
+  welcomeSheet = $state<'create' | 'join' | 'recover' | null>(null);
+  /**
+   * Setting up continues after the account exists (the kit, the permissions,
+   * the devices after a recovery): the welcome page stays until it's done.
+   */
+  onboarding = $state(false);
 
   layout = $derived(layoutFor(this.width));
   visible = $derived(visibleNotes(this.notes, this.view, this.search));
@@ -62,7 +67,7 @@ class AppState {
   selectedTrashed = $derived(this.selected?.trashed ?? false);
   isDesktop = $derived(['macos', 'linux', 'windows'].includes(this.platform));
   /** No account yet: the welcome page instead of the stream (direction A, owner, 9 Nov 2026). */
-  needsAccount = $derived(this.status !== null && !this.status.account);
+  needsAccount = $derived(this.status !== null && (!this.status.account || this.onboarding));
   /** What to call this device in sentences: "Add this phone to my account". */
   deviceWord = $derived(
     this.platform === 'android'
@@ -208,7 +213,7 @@ class AppState {
     this.closeOverlay('note');
   }
 
-  openWelcomeSheet(kind: 'create' | 'join') {
+  openWelcomeSheet(kind: 'create' | 'join' | 'recover') {
     this.welcomeSheet = kind;
     this.pushOverlay('welcome');
   }
@@ -229,7 +234,15 @@ class AppState {
   private close(kind: Overlay) {
     if (kind === 'note') this.pane = 'list';
     else if (kind === 'settings') this.settings = false;
-    else this.welcomeSheet = null;
+    else {
+      this.welcomeSheet = null;
+      // Closed midway through setting up (the back gesture): the account
+      // exists, so the notes take over; a kit not saved yet comes back.
+      if (this.onboarding) {
+        this.onboarding = false;
+        void this.loadStatus();
+      }
+    }
   }
 
   /** The back gesture, or a close that went through history. */

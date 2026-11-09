@@ -84,7 +84,7 @@ On the first device:
 
 ```bash
 mirrorleaf-cli init --name laptop
-mirrorleaf-cli dev-account new         # starts an account
+mirrorleaf-cli dev-account new         # starts an account and prints its 12 recovery words
 mirrorleaf-cli note new "Groceries" --text "milk"
 mirrorleaf-cli pair invite             # shows a QR code, its text, and words; keep it running
 ```
@@ -103,6 +103,18 @@ Both print the same four-digit number, and `pair invite` asks before letting the
 Edits made in another terminal (`note edit <id> --append "eggs"`) reach the other device within seconds. `sync --watch` reports each connection as **direct** or **relay**, with the time and bytes each sync took. `status` shows the devices and how many changes this device holds from each.
 
 > Phase 0's `dev-account ticket` and `dev-account join` still work between CLI devices, for tests. A ticket contains the account key: share it only with your own devices.
+
+### Recovery kit, removing devices, signing out
+
+```bash
+mirrorleaf-cli kit new --out ~/Desktop            # replaces the account key; prints and saves the new kit (PDF and text)
+mirrorleaf-cli device remove 0fce                 # removes a device for good (an ID prefix)
+mirrorleaf-cli device remove 0fce --replace-key   # it was lost or stolen: also replace the key
+mirrorleaf-cli recover "word1 word2 … word12" --ledger http://<ledger>:8080   # on a new device
+mirrorleaf-cli sign-out                           # off the account, then this folder is erased
+```
+
+The recovery words derive the account key, so a new kit always comes with a new key: the other devices get it the next time they connect to a device that has it, and the old kit stops working (the ledger refuses the old key). `sign-out` refuses while some changes exist only on this device; `--force` signs out anyway.
 
 ### Photos
 

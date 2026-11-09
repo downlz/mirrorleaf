@@ -5,17 +5,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use iroh::endpoint::{Connection, Incoming, presets};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMode, SecretKey};
 use mirrorleaf_core::{BlobKind, Replica};
+use mirrorleaf_proto::ledger::Approval;
 use mirrorleaf_proto::pair::PAIR_ALPN;
-use mirrorleaf_proto::{ALPN, BlobHash, DeviceId, VersionVector};
+use mirrorleaf_proto::{ALPN, AccountId, BlobHash, DeviceId, VersionVector};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::account::Account;
 use crate::blobs::{BlobStorage, Blobs, PhotoStore};
 use crate::frame::Traffic;
+use crate::kit::RecoverySecret;
 use crate::ledger::{HEARTBEAT, LedgerClient, MIN_REPORT_INTERVAL, ONLINE_FOR_SECS};
 use crate::pair::{self, Invitation, OfferSlot, PairingEvent, WordCode};
 use crate::session::{Role, RoundReport, handshake, round};
@@ -156,6 +158,11 @@ pub enum Event {
     LedgerFailed {
         error: String,
     },
+    /// The device list changed, or the account key was replaced (E3), and
+    /// the connections started again.
+    DevicesChanged {
+        account_replaced: bool,
+    },
 }
 
 /// This device on the network: an Iroh endpoint whose key is the device ID.
@@ -174,6 +181,8 @@ struct Inner {
     ledger: Mutex<Option<Arc<LedgerClient>>>,
     /// The invitation to join the account this node is showing, if any (E1).
     offer: OfferSlot,
+    /// Wakes `watch` before its next tick, to push new changes at once.
+    nudge: tokio::sync::Notify,
 }
 
 /// What `watch` last told the ledger.
@@ -257,6 +266,7 @@ impl SyncNode {
                 owns_store,
                 ledger: Mutex::default(),
                 offer: Arc::default(),
+                nudge: tokio::sync::Notify::new(),
             }),
         })
     }
@@ -268,7 +278,13 @@ impl SyncNode {
         *self.inner.ledger.lock().unwrap() = Some(Arc::new(ledger));
     }
 
+    /// The ledger client, unless this device was removed from the account:
+    /// a removed device still holds the key, and mustn't register again (E3).
     pub fn ledger(&self) -> Option<Arc<LedgerClient>> {
+        let me = self.device();
+        if self.inner.state.lock().unwrap().account.removed(&me) {
+            return None;
+        }
         self.inner.ledger.lock().unwrap().clone()
     }
 
@@ -315,6 +331,171 @@ impl SyncNode {
 
     pub fn device(&self) -> DeviceId {
         DeviceId(*self.inner.endpoint.id().as_bytes())
+    }
+
+    /// Makes `watch` look for changes to push now rather than at its next
+    /// tick (up to a second away): for the last edits before going offline.
+    pub fn nudge(&self) {
+        self.inner.nudge.notify_one();
+    }
+
+    /// Keeps the ledger client on this device's account after the account's
+    /// key changed (E3): taken from another device, or replaced here.
+    fn follow_account(&self) {
+        let Some(ledger) = self.ledger() else {
+            return;
+        };
+        let moved = {
+            let state = self.inner.state.lock().unwrap();
+            (ledger.account() != state.account.id()).then(|| ledger.for_account(&state.account))
+        };
+        match moved {
+            Some(Ok(client)) => self.use_ledger(client),
+            Some(Err(e)) => tracing::warn!("ledger: {}", describe(&e)),
+            None => {}
+        }
+    }
+
+    /// Replaces the account key (E3) and returns the new recovery kit's
+    /// secret, which the caller shows once. Every device on the list moves to
+    /// the new key except `remove`, which can't sync any more. The ledger moves
+    /// the account first, so if another device replaced the key a moment
+    /// earlier this one is refused and nothing changes here; other devices get
+    /// the new key the next time they connect to one that has it.
+    pub async fn replace_key(&self, remove: &[DeviceId]) -> Result<RecoverySecret> {
+        let me = self.device();
+        let now = unix_now();
+        let (current, replaced, secret) = {
+            let state = self.inner.state.lock().unwrap();
+            let (replaced, secret) = state.account.replaced(&me, remove, now)?;
+            (state.account.id(), replaced, secret)
+        };
+        if let Some(ledger) = self.ledger() {
+            let link = replaced
+                .devices
+                .list
+                .rotated_from
+                .clone()
+                .expect("a replaced account links to the old one");
+            let devices = replaced.devices.list.devices.iter().map(|d| d.id).collect();
+            ledger.rekey(&link, replaced.id(), devices).await?;
+        }
+        {
+            let mut state = self.inner.state.lock().unwrap();
+            ensure!(
+                state.account.id() == current,
+                "the account changed while its key was being replaced"
+            );
+            state.account = replaced;
+            let state = &mut *state;
+            state.account.save(&mut state.replica)?;
+            // Kept until the person has saved the kit, so closing the app
+            // midway doesn't lose it.
+            Account::save_pending_kit(&mut state.replica, &secret, now)?;
+        }
+        self.follow_account();
+        tracing::info!("replaced the account key");
+        Ok(secret)
+    }
+
+    /// Removes another device from the account for good (E3): it is refused
+    /// from now on, by this device at once and by the others as the new list
+    /// reaches them. The ledger forgets it too, if it can be reached.
+    pub async fn remove_device(&self, device: DeviceId) -> Result<()> {
+        ensure!(
+            device != self.device(),
+            "to remove this device, sign out of it instead"
+        );
+        let approval = {
+            let mut state = self.inner.state.lock().unwrap();
+            let key = state
+                .account
+                .key
+                .as_ref()
+                .context("this device doesn't hold the account key")?;
+            if !state.account.devices.contains(&device) {
+                anyhow::bail!("that device isn't on the account");
+            }
+            let devices = key.remove_device(&state.account.devices, device);
+            let approval = Approval::RemoveDevice.sign(key, &device);
+            state.account.devices = devices;
+            let state = &mut *state;
+            state.account.save(&mut state.replica)?;
+            approval
+        };
+        if let Some(ledger) = self.ledger()
+            && let Err(e) = ledger.remove_device(device, approval).await
+        {
+            // Its ledger row goes unseen and is pruned after 90 days.
+            tracing::warn!(
+                "the ledger didn't remove {} yet: {}",
+                device.short(),
+                describe(&e)
+            );
+        }
+        Ok(())
+    }
+
+    /// Takes this device off the account's list (signing out, E3) and tells
+    /// the ledger. The others learn it the next time they meet this device
+    /// or one that has met it: `announce` dials them once to make that soon.
+    pub async fn leave_account(&self) -> Result<()> {
+        let me = self.device();
+        // Taken first: once off the list, this device no longer uses it.
+        let ledger = self.ledger();
+        {
+            let mut state = self.inner.state.lock().unwrap();
+            let key = state
+                .account
+                .key
+                .as_ref()
+                .context("this device doesn't hold the account key")?;
+            let devices = key.remove_device(&state.account.devices, me);
+            state.account.devices = devices;
+            let state = &mut *state;
+            state.account.save(&mut state.replica)?;
+        }
+        if let Some(ledger) = ledger
+            && let Err(e) = ledger.leave().await
+        {
+            tracing::warn!("the ledger didn't remove this device: {}", describe(&e));
+        }
+        Ok(())
+    }
+
+    /// Dials every other device on the list once, so they learn of a change
+    /// to the device list (their handshake merges ours even if they then
+    /// refuse this device). Returns how many answered.
+    pub async fn announce(&self) -> usize {
+        let me = self.device();
+        let peers: Vec<DeviceId> = {
+            let state = self.inner.state.lock().unwrap();
+            let list = &state.account.devices.list;
+            list.devices
+                .iter()
+                .map(|d| d.id)
+                .chain(list.removed.iter().copied())
+                .filter(|d| *d != me)
+                .collect()
+        };
+        let mut dials = tokio::task::JoinSet::new();
+        for peer in peers {
+            let node = self.clone();
+            dials.spawn(async move {
+                let addr = node.addr_for(peer).ok()?;
+                match tokio::time::timeout(DIAL_TIMEOUT, node.tell(addr)).await {
+                    Ok(Ok(true)) => Some(()),
+                    _ => None,
+                }
+            });
+        }
+        let mut answered = 0;
+        while let Some(result) = dials.join_next().await {
+            if matches!(result, Ok(Some(()))) {
+                answered += 1;
+            }
+        }
+        answered
     }
 
     /// Our current address: relay and direct addresses as far as known.
@@ -370,9 +551,42 @@ impl SyncNode {
             &mut traffic,
         );
         refuse_on_error(&conn, shook.await)?;
-        let mut report = round(&self.inner.state, send, recv, Role::Opener).await?;
+        self.follow_account();
+        let mut report = round(
+            &self.inner.state,
+            send,
+            recv,
+            Role::Opener,
+            device_of(&conn),
+        )
+        .await?;
         report.traffic += traffic;
         Ok((conn, report))
+    }
+
+    /// Dials a peer to give it our device list: whether the handshake got
+    /// through. A round follows (the peer may refuse it, having taken the
+    /// list), so the peer has read our list before either side hangs up.
+    async fn tell(&self, addr: EndpointAddr) -> Result<bool> {
+        let conn = self.inner.endpoint.connect(addr, ALPN).await?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        let mut traffic = Traffic::default();
+        let peer = device_of(&conn);
+        let shook = handshake(&self.inner.state, &mut send, &mut recv, peer, &mut traffic).await;
+        let told = match &shook {
+            Ok(()) => {
+                let _ = round(&self.inner.state, send, recv, Role::Opener, peer).await;
+                true
+            }
+            // Hellos were exchanged, and the handshake waited for the peer
+            // to read ours: it has our list, even if one side then refused.
+            Err(e) => matches!(
+                e.downcast_ref::<AuthError>(),
+                Some(AuthError::Removed | AuthError::NotOnList)
+            ),
+        };
+        conn.close(0u32.into(), b"done");
+        Ok(told)
     }
 
     /// Dials a peer, syncs once and hangs up.
@@ -389,7 +603,7 @@ impl SyncNode {
     /// Runs another round on an open connection.
     pub async fn sync_round(&self, conn: &Connection) -> Result<RoundReport> {
         let (send, recv) = conn.open_bi().await?;
-        round(&self.inner.state, send, recv, Role::Opener).await
+        round(&self.inner.state, send, recv, Role::Opener, device_of(conn)).await
     }
 
     /// Accepts the next incoming sync connection and serves its first round.
@@ -441,7 +655,15 @@ impl SyncNode {
             &mut traffic,
         );
         refuse_on_error(&conn, shook.await)?;
-        let mut report = round(&self.inner.state, send, recv, Role::Responder).await?;
+        self.follow_account();
+        let mut report = round(
+            &self.inner.state,
+            send,
+            recv,
+            Role::Responder,
+            device_of(&conn),
+        )
+        .await?;
         report.traffic += traffic;
         Ok(Some((conn, report)))
     }
@@ -574,7 +796,14 @@ impl SyncNode {
     pub async fn serve(&self, conn: &Connection) -> Result<(RoundReport, Duration)> {
         let (send, recv) = conn.accept_bi().await?;
         let started = Instant::now();
-        let report = round(&self.inner.state, send, recv, Role::Responder).await?;
+        let report = round(
+            &self.inner.state,
+            send,
+            recv,
+            Role::Responder,
+            device_of(conn),
+        )
+        .await?;
         Ok((report, started.elapsed()))
     }
 
@@ -618,12 +847,17 @@ impl SyncNode {
         let fetching = Arc::new(AtomicBool::new(false));
         let backoff: Backoff = Arc::default();
         let reporting: Arc<Mutex<Reporting>> = Arc::default();
+        // Which account and device list the open connections were made under.
+        let mut generation: Option<(AccountId, u64)> = None;
         let result = loop {
-            tick.tick().await;
+            tokio::select! {
+                _ = tick.tick() => {}
+                () = self.inner.nudge.notified() => {}
+            }
             if self.inner.endpoint.is_closed() {
                 break Ok(());
             }
-            let (ours, devices) = {
+            let (ours, devices, now) = {
                 let state = self.inner.state.lock().unwrap();
                 let devices: Vec<DeviceId> = state
                     .account
@@ -633,11 +867,32 @@ impl SyncNode {
                     .iter()
                     .map(|d| d.id)
                     .collect();
+                let now = (state.account.id(), state.account.devices.list.version);
                 match state.replica.version_vector() {
-                    Ok(vv) => (vv, devices),
+                    Ok(vv) => (vv, devices, now),
                     Err(e) => break Err(e.into()),
                 }
             };
+            // The device list travels only in the handshake, so when it
+            // changes (a device added or removed, the key replaced) every
+            // connection starts again: the others learn the change, and a
+            // removed device is refused (E3).
+            if let Some(before) = generation
+                && before != now
+            {
+                let replaced = before.0 != now.0;
+                self.follow_account();
+                let dropped: Vec<(DeviceId, Peer)> = peers.lock().unwrap().drain().collect();
+                for (id, peer) in dropped {
+                    peer.conn.close(0u32.into(), b"device list changed");
+                    let _ = events.send(Event::Disconnected { peer: id });
+                }
+                last_dial.clear();
+                let _ = events.send(Event::DevicesChanged {
+                    account_replaced: replaced,
+                });
+            }
+            generation = Some(now);
             for peer in devices.into_iter().filter(|d| *d != self.device()) {
                 let known = {
                     let mut map = peers.lock().unwrap();
@@ -924,6 +1179,13 @@ impl SyncNode {
             }
         });
     }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// The address to dial a device by its ID alone; Iroh looks up where it is.

@@ -7,11 +7,12 @@ use crate::{AccountId, Change, DeviceId, ProtoError, SignedDeviceList, VersionVe
 /// has its own ALPN, so devices that share none fail when the connection
 /// opens, before any message is misread. Version 2 (M9) added the device list
 /// v2, the change's content type, sync class and time, and the app version in
-/// `Hello`.
-pub const ALPN: &[u8] = b"mirrorleaf/sync/2";
+/// `Hello`. Version 3 (M10) added `Handover`, which gives a device the
+/// account's new key.
+pub const ALPN: &[u8] = b"mirrorleaf/sync/3";
 
 /// Protocol versions this build speaks, oldest first.
-pub const PROTOCOL_VERSIONS: &[u16] = &[2];
+pub const PROTOCOL_VERSIONS: &[u16] = &[3];
 
 /// Largest message accepted from a peer. Change batches stay well below this.
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
@@ -41,6 +42,19 @@ pub enum Message {
     /// The sender has stored everything the receiver sent before its `End`, so
     /// the round is complete on both sides.
     Ack,
+    /// The account's key was replaced (E3): the new key and device list, for
+    /// a device on the new list that still uses the old key. Sent right after
+    /// `Hello`, over the connection Iroh encrypts between the two device keys.
+    Handover(Box<Handover>),
+}
+
+/// The account's new key, handed to a device that missed its replacement (E3).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Handover {
+    pub account_secret: [u8; 32],
+    /// The new account's list, linked from the old account by the old key's
+    /// signature (`SignedDeviceList::verify_replacement_of`).
+    pub devices: SignedDeviceList,
 }
 
 pub fn encode(message: &Message) -> Vec<u8> {
@@ -77,7 +91,7 @@ mod tests {
 
     #[test]
     fn version_choice_needs_overlap() {
-        assert_eq!(choose_version(&[1, 2]), Some(2));
-        assert_eq!(choose_version(&[1]), None);
+        assert_eq!(choose_version(&[2, 3]), Some(3));
+        assert_eq!(choose_version(&[2]), None);
     }
 }

@@ -1393,3 +1393,62 @@ kbd {
   user-select: text;
   -webkit-user-select: text;
 }
+
+/* --- Recovery kit, removing a device, signing out (M10) --- */
+
+.kit-words {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-rows: repeat(4, auto);
+  grid-auto-flow: column;
+  gap: 6px 16px;
+  list-style: none;
+  margin: 4px 0 10px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: var(--field);
+}
+
+.kit-words li {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.kit-words span {
+  width: 1.4em;
+  color: var(--muted);
+  font: 500 12px/1 var(--mono);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.kit-words b {
+  font: 600 16px/1.4 var(--mono);
+  overflow-wrap: anywhere;
+}
+
+.layout-narrow .kit-words {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-rows: repeat(6, auto);
+}
+
+.actions.wrap {
+  flex-wrap: wrap;
+}
+
+.sheet button.danger {
+  background: var(--danger);
+  color: #ffffff;
+}
+
+.sheet button.danger-text {
+  color: var(--danger);
+}
+
+.devices li button.link {
+  flex: none;
+  min-height: 30px;
+  font-weight: 500;
+}
