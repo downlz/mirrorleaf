@@ -30,6 +30,7 @@ docs/adr/ADR-007-android-ui-decisions.md
 docs/adr/ADR-008-ledger-readiness-decisions.md
 docs/adr/ADR-009-identity-pairing-decisions.md
 docs/adr/ADR-010-recovery-lifecycle-decisions.md
+docs/adr/ADR-011-protection-decisions.md
 docs/phase1-implementation-plan.md
 
 # Push-to-wake matrix results (tools/push-matrix.py); summaries go in docs/tests.

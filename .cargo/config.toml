@@ -1,3 +1,11 @@
 # Implementation plan §3.3: cap parallel jobs so builds don't swap on the 8 GB Mac.
 [build]
 jobs = 4
+
+# M11: SQLCipher builds OpenSSL from source on Android, and OpenSSL's install step needs a
+# ranlib the NDK doesn't ship under the name it looks for (`tools/ndk-ranlib`, ADR-011).
+[env]
+RANLIB_aarch64_linux_android = { value = "tools/ndk-ranlib", relative = true }
+RANLIB_armv7_linux_androideabi = { value = "tools/ndk-ranlib", relative = true }
+RANLIB_x86_64_linux_android = { value = "tools/ndk-ranlib", relative = true }
+RANLIB_i686_linux_android = { value = "tools/ndk-ranlib", relative = true }

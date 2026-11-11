@@ -15,6 +15,7 @@ use mirrorleaf_proto::{ALPN, AccountId, BlobHash, DeviceId, VersionVector};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::account::Account;
+use crate::backup::{BackupCounts, BackupReader, BackupWriter, Record, backup_key};
 use crate::blobs::{BlobStorage, Blobs, PhotoStore};
 use crate::frame::Traffic;
 use crate::kit::RecoverySecret;
@@ -461,6 +462,104 @@ impl SyncNode {
             tracing::warn!("the ledger didn't remove this device: {}", describe(&e));
         }
         Ok(())
+    }
+
+    /// Writes a backup of everything this device holds to `out` (E9): every
+    /// change in the log and every photo blob it has. Encrypted with the
+    /// account's backup key if `encrypt`.
+    pub async fn write_backup<W: std::io::Write>(
+        &self,
+        out: W,
+        encrypt: bool,
+    ) -> Result<(W, BackupCounts)> {
+        // Photos imported but not yet in the photo store (`photo add` stages
+        // them until a sync) go in first, so the backup has them.
+        self.store_staged().await?;
+        let me = self.device();
+        let (account, key, photos) = {
+            let state = self.inner.state.lock().unwrap();
+            let key = match (encrypt, &state.account.key) {
+                (false, _) => None,
+                (true, Some(key)) => Some(backup_key(key)),
+                (true, None) => anyhow::bail!("this device doesn't hold the account key"),
+            };
+            (state.account.id(), key, state.replica.photos()?)
+        };
+        let mut writer = BackupWriter::new(out, account, me, unix_now(), key)?;
+        let everything = VersionVector::default();
+        let mut cursor = 0;
+        loop {
+            let (batch, next) = self.inner.state.lock().unwrap().replica.changes_since(
+                &everything,
+                cursor,
+                1 << 20,
+            )?;
+            if batch.is_empty() {
+                break;
+            }
+            for change in &batch {
+                writer.change(change)?;
+            }
+            cursor = next;
+        }
+        for photo in photos {
+            for (held, hash) in [
+                (photo.has_thumbnail, photo.photo.thumbnail),
+                (photo.has_full, photo.photo.full),
+            ] {
+                if held && let Some(data) = self.blob(hash).await? {
+                    writer.blob(hash, &data)?;
+                }
+            }
+        }
+        writer.finish()
+    }
+
+    /// Reads a backup into this device (E9): its changes merge as they do in
+    /// sync, and its photos join the photo store. Returns what was new here.
+    pub async fn read_backup<R: std::io::Read>(
+        &self,
+        mut reader: BackupReader<R>,
+    ) -> Result<BackupCounts> {
+        let mut counts = BackupCounts::default();
+        let mut batch = Vec::new();
+        let apply = |batch: &mut Vec<mirrorleaf_proto::Change>| -> Result<u64> {
+            if batch.is_empty() {
+                return Ok(0);
+            }
+            let applied = self
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .replica
+                .apply_remote(batch)?;
+            batch.clear();
+            Ok(applied as u64)
+        };
+        while let Some(record) = reader.next_record()? {
+            match record {
+                Record::Change(change) => {
+                    batch.push(change);
+                    if batch.len() >= 500 {
+                        counts.changes += apply(&mut batch)?;
+                    }
+                }
+                Record::Blob { hash, data } => {
+                    counts.changes += apply(&mut batch)?;
+                    let mut state = self.inner.state.lock().unwrap();
+                    if !state.replica.holds_blob(hash)? {
+                        state.replica.stage_blob(hash, &data)?;
+                        counts.photos += 1;
+                        counts.bytes += data.len() as u64;
+                    }
+                }
+                Record::End => break,
+            }
+        }
+        counts.changes += apply(&mut batch)?;
+        self.store_staged().await?;
+        Ok(counts)
     }
 
     /// Dials every other device on the list once, so they learn of a change

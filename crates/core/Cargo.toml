@@ -8,10 +8,16 @@ publish.workspace = true
 blake3.workspace = true
 image.workspace = true
 mirrorleaf-proto.workspace = true
+rand.workspace = true
 rusqlite.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 yrs.workspace = true
+
+# Android has no public crypto library for SQLCipher, and Windows none the
+# build can find: OpenSSL 3 is built in (M11, E4).
+[target.'cfg(any(target_os = "android", windows))'.dependencies]
+rusqlite = { workspace = true, features = ["bundled-sqlcipher-vendored-openssl"] }
 
 # macOS decodes HEIC with ImageIO (plan §5.5).
 [target.'cfg(target_os = "macos")'.dependencies]

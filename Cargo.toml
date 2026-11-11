@@ -52,7 +52,10 @@ spake2 = { version = "=0.5.0-pre.0", default-features = false, features = ["getr
 # QR codes for pairing (E1), drawn as SVG.
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+# SQLCipher (M11, E4): the database is encrypted. Apple builds use the system's
+# CommonCrypto; Linux uses the system's libcrypto; Android and Windows build
+# OpenSSL in (`mirrorleaf-core`'s target-specific features).
+rusqlite = { version = "0.40.2", features = ["bundled-sqlcipher"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 # sqlx's Postgres crates rather than the `sqlx` facade: the facade's optional
@@ -72,6 +75,11 @@ tauri-plugin-single-instance = "=2.5.4"
 # macOS sleep and wake notifications for the desktop agent (M5). Already in the
 # tree through Tauri's window code; only features are added.
 block2 = "0.6.2"
+objc2 = "0.6.5"
+# The Mac keeps the database key in the Keychain (M11, E4).
+security-framework = "3.7.0"
+# The app lock: Touch ID or the Mac's password (M11, E4).
+objc2-local-authentication = { version = "0.3.2", default-features = false, features = ["std", "block2", "LAContext", "LAPublicDefines", "LAError"] }
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSWorkspace"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSNotification", "NSOperation", "NSString"] }
 thiserror = "2.0.21"

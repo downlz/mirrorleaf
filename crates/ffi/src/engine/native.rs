@@ -239,7 +239,8 @@ mod tests {
     #[test]
     fn shared_text_and_photos_become_a_note_the_screen_opens() {
         let dir = temp_dir("share");
-        let engine = Arc::new(Engine::start(dir.to_str().unwrap(), "Test").unwrap());
+        let engine =
+            Arc::new(Engine::start(mirrorleaf_net::device::DeviceDir::new(&dir), "Test").unwrap());
         let opened = Arc::new(std::sync::Mutex::new(Vec::new()));
         let heard = opened.clone();
         engine.set_ui_listener(move |event| {
@@ -286,7 +287,8 @@ mod tests {
     #[test]
     fn picked_heic_photos_go_through_the_native_decoder() {
         let dir = temp_dir("picked");
-        let engine = Arc::new(Engine::start(dir.to_str().unwrap(), "Test").unwrap());
+        let engine =
+            Arc::new(Engine::start(mirrorleaf_net::device::DeviceDir::new(&dir), "Test").unwrap());
         let calls = Arc::new(AtomicU32::new(0));
         engine.set_photo_decoder(Box::new(FakeDecoder(calls.clone())));
         // Only the file type box matters to the pipeline; the fake decodes it.

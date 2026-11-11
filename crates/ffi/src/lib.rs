@@ -18,8 +18,43 @@ pub fn set_app_version(version: String) {
     mirrorleaf_net::set_app_version(&version);
 }
 
+/// A new random database key (32 bytes), for the platform to keep (M11).
+#[uniffi::export]
+pub fn new_database_key() -> Vec<u8> {
+    mirrorleaf_core::DatabaseKey::generate().to_bytes().to_vec()
+}
+
+/// The database key kept in a private file in `data_dir`, made on first use:
+/// for desktops with no keychain (Linux; Windows until DPAPI).
+pub fn database_key_file(data_dir: &str) -> Result<Vec<u8>, EngineError> {
+    let path = std::path::Path::new(data_dir).join(mirrorleaf_net::device::DB_KEY_FILE);
+    match std::fs::read(&path) {
+        Ok(bytes) => Ok(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let key = new_database_key();
+            std::fs::create_dir_all(data_dir).map_err(|e| EngineError::Failed(e.to_string()))?;
+            write_private(&path, &key).map_err(|e| EngineError::Failed(e.to_string()))?;
+            Ok(key)
+        }
+        Err(e) => Err(EngineError::Failed(e.to_string())),
+    }
+}
+
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path)?.write_all(bytes)
+}
+
 pub use engine::{
-    DecodedPixels, DeviceSummary, Engine, EngineError, EngineStatus, FolderItem, Invitation,
-    KitView, NoteItem, NoteList, PairingStatus, PhotoDecoder, PhotoInfo, SyncListener, SyncSummary,
-    UiEvent,
+    BackupDone, BackupInfo, BackupSettings, DecodedPixels, DeviceSummary, Engine, EngineError,
+    EngineStatus, FolderItem, Invitation, KitView, LockSettings, NoteItem, NoteList, PairingStatus,
+    PhotoDecoder, PhotoInfo, SyncListener, SyncSummary, UiEvent,
 };
+/// A backup file's extension, without the dot.
+pub use mirrorleaf_net::backup::EXTENSION as BACKUP_EXTENSION;
+/// The database key file of CLI and Linux devices (`database.key`).
+pub use mirrorleaf_net::device::DB_KEY_FILE;

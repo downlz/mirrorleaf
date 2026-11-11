@@ -1,0 +1,10 @@
+#!/bin/sh
+# The Android NDK's ranlib, for the OpenSSL that SQLCipher builds on Android (M11, ADR-011).
+# openssl-src looks for <target>-ranlib, which NDKs since r23 don't ship, and its
+# `make install_dev` fails without one. `.cargo/config.toml` points the Android targets'
+# RANLIB here, so every cargo run (the Tauri CLI, Gradle, CI) gets the same setting.
+case "$(uname -s)" in
+  Darwin) host=darwin-x86_64 ;;
+  *) host=linux-x86_64 ;;
+esac
+exec "${NDK_HOME:?set NDK_HOME to the Android NDK}/toolchains/llvm/prebuilt/$host/bin/llvm-ranlib" "$@"

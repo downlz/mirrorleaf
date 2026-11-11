@@ -2,6 +2,7 @@
 //! authentication. All Iroh use stays inside this crate (implementation plan §5.3).
 
 mod account;
+pub mod backup;
 mod blobs;
 pub mod device;
 mod frame;

@@ -181,6 +181,141 @@ pub async fn recover(code: String, ledger: Option<String>) -> Result<String> {
     engine()?.recover(code, ledger).await.map_err(text)
 }
 
+// --- Backups (E9) ---
+
+#[tauri::command]
+pub fn backup_settings() -> Result<mirrorleaf_ffi::BackupSettings> {
+    engine()?.backup_settings().map_err(text)
+}
+
+#[tauri::command]
+pub fn set_backup_encryption(on: bool) -> Result<()> {
+    engine()?.set_backup_encryption(on).map_err(text)
+}
+
+/// "Later" on the main screen's reminder.
+#[tauri::command]
+pub fn snooze_backup() -> Result<()> {
+    engine()?.snooze_backup_reminder().map_err(text)
+}
+
+/// Writes a backup where the person chooses. `None` if they cancelled.
+#[tauri::command]
+pub async fn save_backup(app: tauri::AppHandle) -> Result<Option<mirrorleaf_ffi::BackupDone>> {
+    crate::files::save_backup(&app).await
+}
+
+/// Lets the person pick a backup to restore. `None` if they cancelled.
+#[tauri::command]
+pub async fn pick_backup(app: tauri::AppHandle) -> Result<Option<crate::files::PickedBackup>> {
+    crate::files::pick_backup(&app).await
+}
+
+/// Restores the backup picked; `words` are its own kit's, when it was made
+/// with an earlier account key.
+#[tauri::command]
+pub async fn restore_backup(
+    path: String,
+    words: Option<String>,
+) -> Result<mirrorleaf_ffi::BackupDone> {
+    let restored = engine()?
+        .restore_backup(path.clone(), words)
+        .await
+        .map_err(text);
+    // A wrong kit can be tried again; anything else ends the restore.
+    if restored.is_ok() {
+        crate::files::forget_backup(&path);
+    }
+    restored
+}
+
+/// The person closed the restore without restoring.
+#[tauri::command]
+pub fn forget_backup(path: String) {
+    crate::files::forget_backup(&path);
+}
+
+// --- The app lock (E4) ---
+
+/// The lock's settings, and whether this device has an unlock it can use.
+#[derive(serde::Serialize)]
+pub struct LockView {
+    #[serde(flatten)]
+    settings: mirrorleaf_ffi::LockSettings,
+    available: bool,
+}
+
+#[tauri::command]
+pub async fn lock_settings(app: tauri::AppHandle) -> Result<LockView> {
+    let settings = engine()?.lock_settings().map_err(text)?;
+    let available = crate::auth::available(&app).await;
+    Ok(LockView {
+        settings,
+        available,
+    })
+}
+
+/// Changes the lock after the device's own unlock, so only its owner can.
+/// `false` if they cancelled the unlock.
+#[tauri::command]
+pub async fn set_lock(app: tauri::AppHandle, enabled: bool, after_minutes: u32) -> Result<bool> {
+    let engine = engine()?;
+    if !authenticate(&app, &engine).await? {
+        return Ok(false);
+    }
+    engine.set_lock(enabled, after_minutes).map_err(text)?;
+    engine.unlocked();
+    Ok(true)
+}
+
+/// Whether the screen must show the lock. Called as the screen starts.
+#[tauri::command]
+pub fn is_locked() -> Result<bool> {
+    engine()?.screen_returned().map_err(text)
+}
+
+/// The screen went out of sight.
+#[tauri::command]
+pub fn screen_left() -> Result<()> {
+    engine()?.screen_left();
+    Ok(())
+}
+
+/// The screen is back in sight: whether it must show the lock.
+#[tauri::command]
+pub fn screen_returned() -> Result<bool> {
+    engine()?.screen_returned().map_err(text)
+}
+
+/// Asks for the device's own unlock. `true` once unlocked.
+#[tauri::command]
+pub async fn unlock(app: tauri::AppHandle) -> Result<bool> {
+    let engine = engine()?;
+    if !crate::auth::available(&app).await {
+        // The device's own lock was removed since the app lock was turned
+        // on: anyone holding the device can already open it, so the app lock
+        // goes too rather than shutting its owner out.
+        tracing::info!("no device unlock any more: turning the app lock off");
+        let minutes = engine.lock_settings().map_err(text)?.after_minutes;
+        engine.set_lock(false, minutes).map_err(text)?;
+        engine.unlocked();
+        return Ok(true);
+    }
+    let passed = authenticate(&app, &engine).await?;
+    if passed {
+        engine.unlocked();
+    }
+    Ok(passed)
+}
+
+/// The device's own unlock, with the time away paused while it shows.
+async fn authenticate(app: &tauri::AppHandle, engine: &Engine) -> Result<bool> {
+    engine.authenticating(true);
+    let passed = crate::auth::authenticate(app).await;
+    engine.authenticating(false);
+    passed
+}
+
 /// The device to name in "Open Mirrorleaf on <name> to sync", once due.
 #[tauri::command]
 pub fn fallback_prompt() -> Option<String> {

@@ -6,6 +6,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use yrs::updates::decoder::Decode;
 use yrs::{Doc, ReadTxn, StateVector, Transact, Update};
 
+use crate::DatabaseKey;
 use crate::blobs::record_refs;
 use crate::{CoreError, Result};
 
@@ -100,9 +101,39 @@ impl Replica {
     /// Opens or creates the database at `path` for `device`. Refuses a database
     /// created for another device, which would corrupt the sequence numbers.
     pub fn open(path: impl AsRef<Path>, device: DeviceId) -> Result<Self> {
+        Self::open_with_key(path, Some(device), None)
+    }
+
+    /// Opens the database at `path`, encrypted with `key` if one is given
+    /// (M11, E4). With no `device`, the one the database was created for: for
+    /// a device whose key is kept inside its encrypted database.
+    pub fn open_with_key(
+        path: impl AsRef<Path>,
+        device: Option<DeviceId>,
+        key: Option<&DatabaseKey>,
+    ) -> Result<Self> {
         let conn = Connection::open(path)?;
+        if let Some(key) = key {
+            crate::encryption::unlock(&conn, key)?;
+        }
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.busy_timeout(Duration::from_secs(5))?;
+        let device = match device {
+            Some(device) => device,
+            None => {
+                let stored: Option<Vec<u8>> = conn
+                    .query_row(
+                        "SELECT value FROM meta WHERE key = 'device_id'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let stored = stored.ok_or_else(|| {
+                    CoreError::Invalid("the database doesn't say which device it belongs to".into())
+                })?;
+                device_id(stored)?
+            }
+        };
         Self::init(conn, device)
     }
 

@@ -6,6 +6,7 @@
 //! because a push-woken job may need it with no screen at all. On the desktop
 //! the app opens it here, and the same process is the background agent.
 
+mod auth;
 mod commands;
 #[cfg(desktop)]
 mod desktop;
@@ -87,6 +88,19 @@ pub fn run() {
             commands::only_here,
             commands::sign_out,
             commands::recover,
+            commands::backup_settings,
+            commands::set_backup_encryption,
+            commands::snooze_backup,
+            commands::save_backup,
+            commands::pick_backup,
+            commands::restore_backup,
+            commands::forget_backup,
+            commands::lock_settings,
+            commands::set_lock,
+            commands::is_locked,
+            commands::screen_left,
+            commands::screen_returned,
+            commands::unlock,
         ])
         .build(tauri::generate_context!())
         .expect("error while starting the Mirrorleaf app");

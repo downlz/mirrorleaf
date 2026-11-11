@@ -91,3 +91,13 @@ Mirrorleaf keeps notes only on the user's own devices and syncs them device to d
 - Signing out erases at the next start (`erase-on-start`: key, database, photo store only), and the app restarts itself (desktop: `AppHandle::restart`; Android: `DocumentsPlugin.restart`).
 - Each Kotlin plugin is registered as its own Tauri plugin (`device.rs`): under one Tauri plugin, the last one registered takes every call.
 - The kit's PDF and text are made by `mirrorleaf-net::kit`; Android saves files through `DocumentsPlugin.kt` (the engine writes into its own folder, Kotlin copies to the place picked), never through the web view.
+
+## Protection (M11, ADR-011)
+
+- The database is always SQLCipher-encrypted (`crates/core/src/encryption.rs`), with a raw 256-bit key: the Mac Keychain (`desktop.rs`, service `app.mirrorleaf`), Android Keystore wrapping (`DatabaseKey.kt`, `database.key.wrapped`), or a `database.key` file for CLI and Linux devices. The device secret lives in `meta`, not in `device.key`. A plain database is converted on first open (`encrypt_in_place`); never open the owner's real folders with an older build afterwards.
+- Never point `mirrorleaf-cli` at the Mac app's folder: its key is in the Keychain (the CLI refuses). To inspect the owner's data, copy the folder and test on the copy.
+- The Mac app must be signed with the same identity each build (`APPLE_SIGNING_IDENTITY="Mirrorleaf Local Signing"`), or the Keychain asks after every rebuild.
+- Android builds compile OpenSSL from source for SQLCipher; `.cargo/config.toml` sets the Android targets' `RANLIB` to `tools/ndk-ranlib` (needs `NDK_HOME`). Android's own backup of the app's data is off (`allowBackup="false"`).
+- Backups are `crates/net/src/backup.rs` (format) and `SyncNode::write_backup` / `read_backup`; the engine's side and the app lock are `crates/ffi/src/engine/protection.rs`. Restoring merges like sync and replaces nothing.
+- The app lock covers the screen only; sync carries on. The engine keeps the lock state; the screen reports `screen_left` / `screen_returned` (`visibilitychange`), the Mac app reports the window closing and sleep. The device's own unlock is `auth.rs` (LocalAuthentication on the Mac, `LockPlugin.kt` on Android).
+- `deny.toml` ignores RUSTSEC-2026-0459 until a `libsqlite3-sys` release bundles `sqlcipher-src` 420 or later; then upgrade rusqlite and remove the ignore.

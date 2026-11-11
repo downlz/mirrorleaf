@@ -8,12 +8,19 @@
     <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
     <!-- Android 13+: "Syncing…" during a high-priority job, and the fallback prompt (plan §5.9). -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- M11: the app lock asks for the phone's own fingerprint, face or screen lock (BiometricPrompt). -->
+    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
 
     <!-- AndroidTV support -->
     <uses-feature android:name="android.software.leanback" android:required="false" />
 
+    <!-- No Android backup of Mirrorleaf's data: notes live only on the person's
+         devices (M11). Older Androids read allowBackup, Android 12+ the rules. -->
     <application
         android:name=".MirrorleafApp"
+        android:allowBackup="false"
+        android:fullBackupContent="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:theme="@style/Theme.mirrorleaf_app"

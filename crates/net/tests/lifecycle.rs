@@ -265,3 +265,94 @@ async fn signing_out_warns_about_unsent_changes_and_reaches_the_others() {
     a.close().await;
     b.close().await;
 }
+
+/// Adds a photo with made-up bytes to a note, as an import would.
+async fn add_photo(node: &SyncNode, note: &str) -> mirrorleaf_core::PhotoRef {
+    use mirrorleaf_core::{PhotoRef, photos};
+    let full: Vec<u8> = (0..300_000).map(|i| (i * 31 % 251) as u8).collect();
+    let thumbnail = b"a small thumbnail ".repeat(1000);
+    let photo = PhotoRef {
+        full: photos::hash(&full),
+        thumbnail: photos::hash(&thumbnail),
+    };
+    {
+        let replica = &mut node.state().lock().unwrap().replica;
+        replica.stage_blob(photo.full, &full).unwrap();
+        replica.stage_blob(photo.thumbnail, &thumbnail).unwrap();
+        replica.add_photo(note, &photo, 4, 3).unwrap();
+    }
+    node.store_staged().await.unwrap();
+    photo
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_backup_restores_notes_and_photos_with_or_without_encryption() {
+    use mirrorleaf_net::backup::{BackupReader, key_for};
+
+    let (a, b, c, secret) = three().await;
+    let id = note(&a, "Holiday");
+    let photo = add_photo(&a, &id).await;
+
+    for encrypt in [false, true] {
+        let (bytes, counts) = a.write_backup(Vec::new(), encrypt).await.unwrap();
+        assert!(counts.changes > 0);
+        assert_eq!(counts.photos, 2, "the thumbnail and the full image");
+
+        // Every device lost: a new one recovers with the kit, then restores.
+        let r = node("new laptop", |me| Account::recover(&secret, me)).await;
+        let reader = BackupReader::open(bytes.as_slice()).unwrap();
+        assert_eq!(reader.header().encrypted, encrypt);
+        let key = {
+            let state = r.state().lock().unwrap();
+            key_for(reader.header(), state.account.key.as_ref(), None).unwrap()
+        };
+        let mut reader = reader;
+        if let Some(key) = key {
+            reader.unlock(key);
+        }
+        let restored = r.read_backup(reader).await.unwrap();
+        assert!(restored.changes > 0 && restored.photos == 2);
+        assert!(has_note(&r, &id));
+        assert!(r.blob(photo.full).await.unwrap().is_some());
+        r.close().await;
+    }
+
+    // An encrypted backup made before the key was replaced opens only with
+    // the kit it was made with.
+    let (old_backup, _) = a.write_backup(Vec::new(), true).await.unwrap();
+    a.replace_key(&[]).await.unwrap();
+    let reader = BackupReader::open(old_backup.as_slice()).unwrap();
+    let new_key = a
+        .state()
+        .lock()
+        .unwrap()
+        .account
+        .key
+        .as_ref()
+        .unwrap()
+        .to_bytes();
+    let new_key = mirrorleaf_proto::AccountKey::from_bytes(new_key);
+    let needs = key_for(reader.header(), Some(&new_key), None).unwrap_err();
+    assert!(
+        needs.to_string().contains("earlier recovery kit"),
+        "{needs}"
+    );
+    let words = secret.words().join(" ");
+    assert!(
+        key_for(reader.header(), Some(&new_key), Some(&words))
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        key_for(
+            reader.header(),
+            None,
+            Some(&RecoverySecret::generate().words().join(" "))
+        )
+        .is_err(),
+        "another account's kit"
+    );
+    for n in [a, b, c] {
+        n.close().await;
+    }
+}

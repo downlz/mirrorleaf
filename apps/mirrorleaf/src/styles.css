@@ -571,6 +571,22 @@ kbd {
   margin: 0 0 12px;
 }
 
+/* The backup reminder (E9): the text, then its two answers. */
+.banner.with-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+}
+
+.banner.with-actions button {
+  min-height: var(--tap);
+}
+
+button.link.muted {
+  color: var(--muted);
+}
+
 /* --- Note --- */
 
 .note-scroll {
@@ -1021,7 +1037,8 @@ kbd {
 }
 
 .field input,
-.field textarea {
+.field textarea,
+.field select {
   width: 100%;
   padding: 7px 9px;
   border: 1px solid var(--line);
@@ -1034,7 +1051,8 @@ kbd {
 }
 
 .field input:focus,
-.field textarea:focus {
+.field textarea:focus,
+.field select:focus {
   border-color: var(--accent);
 }
 
@@ -1451,4 +1469,9 @@ kbd {
   flex: none;
   min-height: 30px;
   font-weight: 500;
+}
+
+.field select {
+  font-family: inherit;
+  font-size: 13px;
 }

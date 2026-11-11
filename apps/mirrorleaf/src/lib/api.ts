@@ -90,12 +90,50 @@ export interface Permissions {
   nearby: boolean;
 }
 
+/** Backups (E9): a setting of this device, plain by default. */
+export interface BackupSettings {
+  encrypt: boolean;
+  /** "9 November 2026", if there has been a backup. */
+  last_backup: string | null;
+  /** The main screen's reminder, when one is due. */
+  due: string | null;
+}
+
+/** What a backup file says about itself, before restoring it. */
+export interface BackupInfo {
+  made: string;
+  encrypted: boolean;
+  /** Encrypted with an earlier account key: restoring needs that kit's words. */
+  needs_kit: boolean;
+}
+
+export interface PickedBackup {
+  path: string;
+  info: BackupInfo;
+}
+
+/** What a backup or a restore moved. */
+export interface BackupDone {
+  changes: number;
+  photos: number;
+}
+
+/** The app lock (E4): off by default; the device's own unlock. */
+export interface LockSettings {
+  enabled: boolean;
+  /** Minutes away before it locks: 0, 1, 5 or 15. */
+  after_minutes: number;
+  /** The device has an unlock the lock can use (a screen lock, a login password). */
+  available: boolean;
+}
+
 export type EngineEvent =
   | { kind: 'notes_changed' }
   | { kind: 'photo_arrived'; hash: string }
   | { kind: 'status_changed' }
   | { kind: 'open_note'; id: string }
-  | { kind: 'pairing_changed' };
+  | { kind: 'pairing_changed' }
+  | { kind: 'lock_changed' };
 
 export const api = {
   platform: () => invoke<string>('platform'),
@@ -144,6 +182,27 @@ export const api = {
   /** Signs out and erases this device; the app then starts afresh. */
   signOut: (force: boolean) => invoke<void>('sign_out', { force }),
   recover: (code: string, ledger: string | null) => invoke<string>('recover', { code, ledger }),
+  // Backups (M11, E9).
+  backupSettings: () => invoke<BackupSettings>('backup_settings'),
+  setBackupEncryption: (on: boolean) => invoke<void>('set_backup_encryption', { on }),
+  snoozeBackup: () => invoke<void>('snooze_backup'),
+  /** Writes a backup where the person chooses; null if they cancelled. */
+  saveBackup: () => invoke<BackupDone | null>('save_backup'),
+  /** Lets the person pick a backup to restore; null if they cancelled. */
+  pickBackup: () => invoke<PickedBackup | null>('pick_backup'),
+  restoreBackup: (path: string, words: string | null) =>
+    invoke<BackupDone>('restore_backup', { path, words }),
+  forgetBackup: (path: string) => invoke<void>('forget_backup', { path }),
+  // The app lock (M11, E4).
+  lockSettings: () => invoke<LockSettings>('lock_settings'),
+  /** Asks the device's own unlock first; false if the person cancelled. */
+  setLock: (enabled: boolean, afterMinutes: number) =>
+    invoke<boolean>('set_lock', { enabled, afterMinutes }),
+  isLocked: () => invoke<boolean>('is_locked'),
+  screenLeft: () => invoke<void>('screen_left'),
+  screenReturned: () => invoke<boolean>('screen_returned'),
+  /** The device's own unlock; true once unlocked. */
+  unlock: () => invoke<boolean>('unlock'),
 };
 
 export function onEngineEvent(handler: (event: EngineEvent) => void): Promise<UnlistenFn> {

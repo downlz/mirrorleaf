@@ -16,6 +16,9 @@ struct PermissionsHandle<R: Runtime>(tauri::plugin::PluginHandle<R>);
 /// Saving the recovery kit and restarting the app (M10, `DocumentsPlugin.kt`).
 #[cfg(target_os = "android")]
 struct Documents<R: Runtime>(tauri::plugin::PluginHandle<R>);
+/// The app lock's unlock (M11, `LockPlugin.kt`).
+#[cfg(target_os = "android")]
+struct Lock<R: Runtime>(tauri::plugin::PluginHandle<R>);
 
 /// Registers the Kotlin plugins (Android only).
 #[cfg(target_os = "android")]
@@ -38,6 +41,15 @@ pub fn init<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
                     let handle =
                         api.register_android_plugin("app.mirrorleaf", "PermissionsPlugin")?;
                     app.manage(PermissionsHandle(handle));
+                    Ok(())
+                })
+                .build(),
+        )
+        .plugin(
+            tauri::plugin::Builder::<R>::new("lock")
+                .setup(|app, api| {
+                    let handle = api.register_android_plugin("app.mirrorleaf", "LockPlugin")?;
+                    app.manage(Lock(handle));
                     Ok(())
                 })
                 .build(),
@@ -171,5 +183,59 @@ pub async fn restart<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         .0
         .run_mobile_plugin_async::<()>("restart", ())
         .await
+        .map_err(|e| e.to_string())
+}
+
+/// Lets the person pick a file and copies it to `path` (M11: a backup to
+/// restore). `false` if they cancelled.
+#[cfg(target_os = "android")]
+pub async fn open_document<R: Runtime>(app: &AppHandle<R>, path: String) -> Result<bool, String> {
+    use tauri::Manager;
+    #[derive(serde::Serialize)]
+    struct Args {
+        path: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Opened {
+        opened: bool,
+    }
+    let opened: Opened = app
+        .state::<Documents<R>>()
+        .0
+        .run_mobile_plugin_async("open", Args { path })
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(opened.opened)
+}
+
+/// Whether the phone has a screen lock (M11).
+#[cfg(target_os = "android")]
+pub async fn lock_available<R: Runtime>(app: &AppHandle<R>) -> bool {
+    use tauri::Manager;
+    #[derive(serde::Deserialize)]
+    struct Available {
+        available: bool,
+    }
+    app.state::<Lock<R>>()
+        .0
+        .run_mobile_plugin_async::<Available>("available", ())
+        .await
+        .map(|a| a.available)
+        .unwrap_or(false)
+}
+
+/// The phone's own unlock (M11). `true` once passed.
+#[cfg(target_os = "android")]
+pub async fn authenticate<R: Runtime>(app: &AppHandle<R>) -> Result<bool, String> {
+    use tauri::Manager;
+    #[derive(serde::Deserialize)]
+    struct Unlocked {
+        unlocked: bool,
+    }
+    app.state::<Lock<R>>()
+        .0
+        .run_mobile_plugin_async::<Unlocked>("authenticate", ())
+        .await
+        .map(|u| u.unlocked)
         .map_err(|e| e.to_string())
 }

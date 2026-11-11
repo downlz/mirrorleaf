@@ -77,14 +77,14 @@ impl Engine {
     }
 
     /// The node, bound for one piece of work: live sync's if it is running.
-    async fn borrow_node(&self) -> anyhow::Result<SyncNode> {
+    pub(super) async fn borrow_node(&self) -> anyhow::Result<SyncNode> {
         let mut slot = self.slot.lock().await;
         let node = self.bind(&mut slot).await?;
         slot.jobs += 1;
         Ok(node)
     }
 
-    async fn return_node(&self) {
+    pub(super) async fn return_node(&self) {
         let mut slot = self.slot.lock().await;
         slot.jobs = slot.jobs.saturating_sub(1);
         self.release_if_idle(&mut slot).await;

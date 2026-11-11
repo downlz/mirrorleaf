@@ -60,7 +60,8 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     init_logging();
     let dir = app.path().app_data_dir()?;
     mirrorleaf_ffi::set_app_version(app.package_info().version.to_string());
-    let engine = Engine::open(dir.to_string_lossy().into_owned(), device_name())?;
+    let data_dir = dir.to_string_lossy().into_owned();
+    let engine = Engine::open(data_dir.clone(), device_name(), database_key(&data_dir)?)?;
 
     #[cfg(target_os = "macos")]
     app.set_menu(app_menu(app.handle())?)?;
@@ -97,7 +98,11 @@ pub fn on_window_event(window: &Window, event: &WindowEvent) {
             }
         }
         // The last window is gone: leave the Dock and stay in the menu bar.
+        // The app lock's time away starts (E4).
         WindowEvent::Destroyed => {
+            if let Some(engine) = Engine::get() {
+                engine.screen_left();
+            }
             #[cfg(target_os = "macos")]
             {
                 let app = window.app_handle();
@@ -313,6 +318,52 @@ fn app_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         ],
     )?;
     Menu::with_items(app, &[&app_menu, &edit, &window])
+}
+
+/// The Keychain item holding the database key (M11, E4).
+#[cfg(target_os = "macos")]
+const KEYCHAIN_SERVICE: &str = "app.mirrorleaf";
+#[cfg(target_os = "macos")]
+const KEYCHAIN_ACCOUNT: &str = "database-key";
+
+/// The database's key: in the login Keychain on the Mac, made on first use.
+/// Builds signed with the same certificate read it without asking; an
+/// unsigned (ad-hoc) build counts as a new app each time, so macOS asks once
+/// per build (ADR-011).
+#[cfg(target_os = "macos")]
+fn database_key(data_dir: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    use security_framework::passwords::{get_generic_password, set_generic_password};
+    // errSecItemNotFound
+    const NOT_FOUND: i32 = -25300;
+    match get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) {
+        Ok(key) if key.len() == 32 => Ok(key),
+        Ok(_) => Err("the database key in the Keychain is damaged".into()),
+        Err(e) if e.code() == NOT_FOUND => {
+            // A CLI device folder's key file (the CLI converted this folder
+            // before the app did): adopt it, so the database still opens.
+            let file = std::path::Path::new(data_dir).join(mirrorleaf_ffi::DB_KEY_FILE);
+            let (key, from_file) = match std::fs::read(&file) {
+                Ok(key) if key.len() == 32 => (key, true),
+                _ => (mirrorleaf_ffi::new_database_key(), false),
+            };
+            set_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, &key)?;
+            if from_file {
+                std::fs::remove_file(&file)?;
+                tracing::info!("moved the database key from its file into the Keychain");
+            } else {
+                tracing::info!("made the database key and kept it in the Keychain");
+            }
+            Ok(key)
+        }
+        Err(e) => Err(format!("couldn't read the database key from the Keychain: {e}").into()),
+    }
+}
+
+/// Desktops with no keychain support yet (Linux; Windows until DPAPI): a
+/// private key file beside the database.
+#[cfg(not(target_os = "macos"))]
+fn database_key(data_dir: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    Ok(mirrorleaf_ffi::database_key_file(data_dir)?)
 }
 
 /// What other devices show for this one, from the computer's name.

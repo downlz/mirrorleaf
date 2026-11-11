@@ -85,6 +85,30 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Back up every note and photo, or restore a backup (E9). Opens the photo
+    /// store, so not while `sync --watch` runs
+    #[command(subcommand)]
+    Backup(BackupCmd),
+}
+
+#[derive(Subcommand)]
+enum BackupCmd {
+    /// Write a backup of everything this device holds
+    Export {
+        file: PathBuf,
+        /// Encrypt it with a key derived from the account key (the recovery
+        /// kit recreates it)
+        #[arg(long)]
+        encrypt: bool,
+    },
+    /// Restore a backup: what this device lacks is added, nothing is replaced
+    Import {
+        file: PathBuf,
+        /// The 12 words of the kit the backup was made with, for an encrypted
+        /// backup from an earlier account key
+        #[arg(long)]
+        words: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -267,6 +291,12 @@ async fn main() -> Result<()> {
             replace_key,
         }) => remove_device(&dir, &device, replace_key).await,
         Command::SignOut { force } => sign_out(&dir, force).await,
+        Command::Backup(BackupCmd::Export { file, encrypt }) => {
+            backup_export(&dir, &file, encrypt).await
+        }
+        Command::Backup(BackupCmd::Import { file, words }) => {
+            backup_import(&dir, &file, words).await
+        }
     }
 }
 
@@ -279,7 +309,7 @@ fn data_dir(given: Option<PathBuf>) -> Result<PathBuf> {
 }
 
 fn init(dir: &Path, name: Option<String>) -> Result<()> {
-    let (secret, replica) = DeviceDir::new(dir).init(name.as_deref())?;
+    let (secret, replica) = DeviceDir::with_key_file(dir)?.init(name.as_deref())?;
     let name = device::device_name(&replica)?;
     println!(
         "Set up {name} ({}) in {}",
@@ -1316,6 +1346,82 @@ async fn bind(dir: &Path) -> Result<SyncNode> {
     Ok(node)
 }
 
+/// A node with the device's own photo store, for backups.
+async fn bind_with_photos(dir: &Path) -> Result<SyncNode> {
+    let (secret, replica) = open(dir)?;
+    let account =
+        Account::load(&replica)?.context("no account yet: run `dev-account new` or `recover`")?;
+    SyncNode::bind(
+        State { replica, account },
+        secret,
+        Network::Internet,
+        DeviceDir::new(dir).blob_storage(),
+    )
+    .await
+}
+
+async fn backup_export(dir: &Path, file: &Path, encrypt: bool) -> Result<()> {
+    let node = bind_with_photos(dir).await?;
+    let partial = PathBuf::from(format!("{}.partial", file.display()));
+    let result = async {
+        let out = std::io::BufWriter::new(std::fs::File::create(&partial)?);
+        let (out, counts) = node.write_backup(out, encrypt).await?;
+        out.into_inner()
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+            .sync_all()?;
+        std::fs::rename(&partial, file)?;
+        println!(
+            "Backed up {} changes and {} photos to {} ({}).",
+            counts.changes,
+            counts.photos,
+            file.display(),
+            if encrypt {
+                "encrypted"
+            } else {
+                "not encrypted"
+            }
+        );
+        anyhow::Ok(())
+    }
+    .await;
+    if result.is_err() {
+        let _ = std::fs::remove_file(&partial);
+    }
+    node.close().await;
+    result
+}
+
+async fn backup_import(dir: &Path, file: &Path, words: Option<String>) -> Result<()> {
+    let node = bind_with_photos(dir).await?;
+    let result = async {
+        let input = std::fs::File::open(file).context("can't open the backup")?;
+        let mut reader =
+            mirrorleaf_net::backup::BackupReader::open(std::io::BufReader::new(input))?;
+        let key = {
+            let state = node.state().lock().unwrap();
+            mirrorleaf_net::backup::key_for(
+                reader.header(),
+                state.account.key.as_ref(),
+                words.as_deref(),
+            )?
+        };
+        if let Some(key) = key {
+            reader.unlock(key);
+        }
+        let made = kit::long_date(reader.header().made_at);
+        let counts = node.read_backup(reader).await?;
+        println!(
+            "Restored the backup from {made}: {} changes and {} photos were new here.",
+            counts.changes, counts.photos
+        );
+        println!("Run `sync` to pass anything new to your other devices.");
+        anyhow::Ok(())
+    }
+    .await;
+    node.close().await;
+    result
+}
+
 /// Replaces the account key, prints the new kit, and hands the key to the
 /// devices that can be reached now (E2, E3).
 async fn replace_key(node: &SyncNode, remove: &[DeviceId], out: Option<PathBuf>) -> Result<()> {
@@ -1469,6 +1575,7 @@ async fn sign_out(dir: &Path, force: bool) -> Result<()> {
     node.close().await;
     result?;
     DeviceDir::new(dir).erase()?;
+    let _ = std::fs::remove_file(dir.join(device::DB_KEY_FILE));
     println!(
         "Erased this device's key, notes and photos from {}.",
         dir.display()
@@ -1477,9 +1584,9 @@ async fn sign_out(dir: &Path, force: bool) -> Result<()> {
 }
 
 fn open(dir: &Path) -> Result<(SecretKey, Replica)> {
-    let device_dir = DeviceDir::new(dir);
-    if !device_dir.is_set_up() {
+    // Checked before the key file is made, so a mistyped --dir leaves nothing.
+    if !DeviceDir::new(dir).is_set_up() {
         bail!("{} isn't set up: run `init` first", dir.display());
     }
-    device_dir.open()
+    DeviceDir::with_key_file(dir)?.open()
 }

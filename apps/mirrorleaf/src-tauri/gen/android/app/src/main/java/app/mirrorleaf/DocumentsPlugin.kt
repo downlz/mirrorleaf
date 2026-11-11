@@ -21,11 +21,18 @@ class SaveArgs {
     lateinit var mime: String
 }
 
+@InvokeArg
+class OpenArgs {
+    /** Where to copy the picked file, in the app's own storage. */
+    lateinit var path: String
+}
+
 /**
- * Saving the recovery kit (E2) where the person chooses, through Android's own "Save to" picker
- * (the Storage Access Framework): the engine writes the kit to the app's storage, and this copies
- * it to the place picked, so the kit never passes through the web view (ADR-007). Also restarts
- * the app after signing out (E3), so the engine opens afresh.
+ * Saving the recovery kit (E2) and backups (E9) where the person chooses, through Android's own
+ * "Save to" picker (the Storage Access Framework): the engine writes the file to the app's
+ * storage, and this copies it to the place picked, so it never passes through the web view
+ * (ADR-007). Opening works the other way round, for restoring a backup (M11). Also restarts the
+ * app after signing out (E3), so the engine opens afresh.
  */
 @TauriPlugin
 class DocumentsPlugin(private val activity: Activity) : Plugin(activity) {
@@ -62,6 +69,44 @@ class DocumentsPlugin(private val activity: Activity) : Plugin(activity) {
             invoke.reject(e.message ?: "couldn't save the kit")
         } finally {
             file?.delete()
+        }
+    }
+
+    /** Where a picked file is copied to, while the picker is open. */
+    private var opening: File? = null
+
+    /**
+     * Lets the person pick a file (a backup to restore, M11) and copies it into the app's own
+     * storage at `path`, so the engine reads it there; the copy is deleted after use.
+     */
+    @Command
+    fun open(invoke: Invoke) {
+        val args = invoke.parseArgs(OpenArgs::class.java)
+        opening = File(args.path)
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+        }
+        startActivityForResult(invoke, intent, "opened")
+    }
+
+    @ActivityCallback
+    private fun opened(invoke: Invoke, result: ActivityResult) {
+        val file = opening
+        opening = null
+        try {
+            val uri = result.data?.data
+            if (result.resultCode != Activity.RESULT_OK || uri == null || file == null) {
+                invoke.resolve(JSObject().put("opened", false))
+                return
+            }
+            val input = activity.contentResolver.openInputStream(uri)
+                ?: throw IllegalStateException("can't read the file chosen")
+            input.use { stream -> file.outputStream().use { stream.copyTo(it) } }
+            invoke.resolve(JSObject().put("opened", true))
+        } catch (e: Exception) {
+            file?.delete()
+            invoke.reject(e.message ?: "couldn't open the file")
         }
     }
 

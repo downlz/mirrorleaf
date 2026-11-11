@@ -3,7 +3,7 @@
   // that is always ready. Typing filters; Enter opens the top match, or
   // creates a note with that title when none has it. Folders are chips.
   import { onMount } from 'svelte';
-  import type { NoteItem } from '../lib/api';
+  import { api, type NoteItem } from '../lib/api';
   import { listDate } from '../lib/dates';
   import { contextMenu } from '../lib/gestures';
   import { displayTitle, highlight, type View } from '../lib/notes';
@@ -236,6 +236,17 @@
 
   {#if app.fallback}
     <p class="banner">Open Mirrorleaf on {app.fallback} to sync.</p>
+  {/if}
+  {#if app.backup?.due}
+    <!-- The backup reminder (E9): 30 days on, or after a new recovery kit. -->
+    <div class="banner with-actions">
+      <span class="grow">{app.backup.due}</span>
+      <button class="link" onclick={() => app.backUpNow()}>Back up now</button>
+      <button
+        class="link muted"
+        onclick={() => void app.run(api.snoozeBackup).then(() => app.loadStatus())}>Later</button
+      >
+    </div>
   {/if}
 
   <div class="pane-body stream-body" bind:this={list}>

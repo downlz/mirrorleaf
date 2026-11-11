@@ -16,6 +16,8 @@ pub fn watch_sleep() {
     let sleeping = RcBlock::new(|_: NonNull<NSNotification>| {
         tracing::info!("the Mac is going to sleep");
         if let Some(engine) = Engine::get() {
+            // The app lock's time away starts, if the window is in sight (E4).
+            engine.device_sleeping();
             tauri::async_runtime::spawn(async move {
                 let _ = engine.go_offline().await;
             });
@@ -24,6 +26,8 @@ pub fn watch_sleep() {
     let woken = RcBlock::new(|_: NonNull<NSNotification>| {
         tracing::info!("the Mac woke up");
         if let Some(engine) = Engine::get() {
+            // Locks the screen if the Mac slept long enough (`LockChanged`).
+            engine.device_woke();
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = engine.go_live().await {
                     tracing::info!("live sync didn't restart: {e}");

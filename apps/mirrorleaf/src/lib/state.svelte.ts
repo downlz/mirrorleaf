@@ -6,7 +6,14 @@
 
 import type { NoteMeta } from '@mirrorleaf/editor';
 import type { MenuItem } from '../components/Menu.svelte';
-import { api, type EngineStatus, type FolderItem, type NoteItem, type PairingStatus } from './api';
+import {
+  api,
+  type BackupSettings,
+  type EngineStatus,
+  type FolderItem,
+  type NoteItem,
+  type PairingStatus,
+} from './api';
 import { counts, hasTitle, visibleNotes, viewTitle, type View } from './notes';
 
 export type Layout = 'wide' | 'medium' | 'narrow';
@@ -53,6 +60,10 @@ class AppState {
    * the devices after a recovery): the welcome page stays until it's done.
    */
   onboarding = $state(false);
+  /** The app lock covers the screen (E4); null until the engine has said. */
+  locked = $state<boolean | null>(null);
+  /** Backups (E9): the last one, and the main screen's reminder. */
+  backup = $state<BackupSettings | null>(null);
 
   layout = $derived(layoutFor(this.width));
   visible = $derived(visibleNotes(this.notes, this.view, this.search));
@@ -98,6 +109,8 @@ class AppState {
 
   async start() {
     this.platform = await api.platform();
+    // The lock first, so no note shows before it.
+    this.locked = await api.isLocked().catch(() => false);
     await Promise.all([this.refresh(), this.loadStatus()]);
     if (this.layout !== 'narrow') this.selectFirst();
     await this.openShared();
@@ -141,9 +154,29 @@ class AppState {
     try {
       this.status = await api.status();
       this.fallback = await api.fallbackPrompt();
+      this.backup = this.status.account ? await api.backupSettings() : null;
     } catch (error) {
       this.fail(error);
     }
+  }
+
+  /** The screen went out of sight (E4): the lock's time away starts. */
+  screenLeft() {
+    void api.screenLeft().catch(() => {});
+  }
+
+  /** The screen is back in sight, or the engine locked it: show the lock if due. */
+  async checkLock() {
+    const locked = await this.run(api.screenReturned);
+    if (locked !== undefined) this.locked = locked;
+  }
+
+  /** Writes a backup where the person chooses (E9). */
+  async backUpNow() {
+    const done = await this.run(api.saveBackup);
+    if (!done) return;
+    this.notify('Backup saved.');
+    await this.loadStatus();
   }
 
   /** Shows a short message for a few seconds. */

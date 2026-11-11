@@ -4,6 +4,7 @@
   import { app } from './lib/state.svelte';
   import Menu from './components/Menu.svelte';
   import KitStep from './components/KitStep.svelte';
+  import LockScreen from './components/LockScreen.svelte';
   import NoteView from './components/NoteView.svelte';
   import RemovedPage from './components/RemovedPage.svelte';
   import Settings from './components/Settings.svelte';
@@ -39,6 +40,7 @@
         else if (event.kind === 'status_changed') void app.loadStatus();
         else if (event.kind === 'open_note') void app.openShared();
         else if (event.kind === 'pairing_changed') void app.loadPairing();
+        else if (event.kind === 'lock_changed') void app.checkLock();
         else app.editorHooks.photo?.(event.hash);
       }),
       // The window is closing: send the editor's last edits first.
@@ -52,9 +54,15 @@
     // Android's back gesture closes the note sheet or Settings.
     const popstate = () => app.onPopState();
     window.addEventListener('popstate', popstate);
-    // Going to the background (Android) or hidden: send waiting edits now.
+    // Going to the background (Android) or hidden: send waiting edits now,
+    // and start the app lock's time away (E4). Back in sight: lock if due.
     const hidden = () => {
-      if (document.visibilityState === 'hidden') void app.editorHooks.flush?.();
+      if (document.visibilityState === 'hidden') {
+        void app.editorHooks.flush?.();
+        app.screenLeft();
+      } else if (app.locked !== null) {
+        void app.checkLock();
+      }
     };
     document.addEventListener('visibilitychange', hidden);
     return () => {
@@ -73,6 +81,7 @@
   function keydown(event: KeyboardEvent) {
     if (
       event.defaultPrevented ||
+      app.locked !== false ||
       app.settings ||
       app.menu ||
       app.needsAccount ||
@@ -120,7 +129,10 @@
      class reaches them: on phones Settings fills the screen and the note's
      sheet gets the narrow margins. -->
 <div class="app layout-{app.layout}">
-  {#if app.needsAccount}
+  {#if app.locked !== false}
+    <!-- The app lock (E4), or not yet known: nothing of the notes shows. -->
+    {#if app.locked}<LockScreen />{/if}
+  {:else if app.needsAccount}
     <!-- First run: no account yet (E1, direction A). -->
     <Welcome />
   {:else if app.status?.removed}
@@ -153,7 +165,7 @@
       </div>
     {/if}
   {/if}
-  {#if app.menu}
+  {#if app.menu && app.locked === false}
     <Menu {...app.menu} onclose={() => (app.menu = null)} />
   {/if}
   {#if app.message}

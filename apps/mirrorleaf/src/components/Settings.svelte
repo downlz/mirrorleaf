@@ -1,9 +1,16 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api, type DeviceSummary, type Permissions } from '../lib/api';
+  import {
+    api,
+    type DeviceSummary,
+    type LockSettings,
+    type Permissions,
+    type PickedBackup,
+  } from '../lib/api';
   import { app } from '../lib/state.svelte';
   import AddDevice from './AddDevice.svelte';
   import Icon from './Icon.svelte';
+  import RestoreBackup from './RestoreBackup.svelte';
   import SyncStatus from './SyncStatus.svelte';
 
   let ledgerUrl = $state('');
@@ -13,8 +20,19 @@
   /** Android's sync permissions (E1): asked when adding a device, changeable here. */
   let permissions = $state<Permissions | null>(null);
   /** Settings itself, or one of its steps: adding a device (E1), removing one,
-   *  a new recovery kit, signing out (M10). */
-  let view = $state<'settings' | 'add' | 'remove' | 'kit' | 'signout'>('settings');
+   *  a new recovery kit, signing out (M10), restoring a backup (M11). */
+  let view = $state<'settings' | 'add' | 'remove' | 'kit' | 'signout' | 'restore'>('settings');
+  /** The backup picked to restore. */
+  let picked = $state<PickedBackup | null>(null);
+  /** The app lock (E4). */
+  let lockSettings = $state<LockSettings | null>(null);
+
+  const LOCK_AFTER = [
+    { minutes: 0, label: 'Immediately' },
+    { minutes: 1, label: 'After 1 minute away' },
+    { minutes: 5, label: 'After 5 minutes away' },
+    { minutes: 15, label: 'After 15 minutes away' },
+  ];
   /** The device being removed. */
   let target = $state<DeviceSummary | null>(null);
   /** Changes only this device holds, for signing out. */
@@ -27,6 +45,7 @@
     remove: 'Remove a device',
     kit: 'New recovery kit',
     signout: 'Sign out',
+    restore: 'Restore a backup',
   };
 
   const longDate = (seconds: number) =>
@@ -82,8 +101,43 @@
 
   const status = $derived(app.status);
 
+  async function pickBackup() {
+    const backup = await app.run(api.pickBackup);
+    if (!backup) return;
+    picked = backup;
+    view = 'restore';
+  }
+
+  function closeRestore() {
+    picked = null;
+    view = 'settings';
+  }
+
+  async function setEncrypt(on: boolean) {
+    await app.run(() => api.setBackupEncryption(on));
+    await app.loadStatus();
+  }
+
+  /** Any change to the lock asks the device's own unlock first. */
+  async function setLock(
+    control: HTMLInputElement | HTMLSelectElement,
+    enabled: boolean,
+    minutes: number,
+  ) {
+    working = true;
+    await app.run(() => api.setLock(enabled, minutes));
+    working = false;
+    // Shows what holds now, also when the unlock was cancelled: the control
+    // itself is put back, as an unchanged setting doesn't redraw it.
+    lockSettings = (await app.run(api.lockSettings)) ?? lockSettings;
+    if (!lockSettings) return;
+    if (control instanceof HTMLInputElement) control.checked = lockSettings.enabled;
+    else control.value = String(lockSettings.after_minutes);
+  }
+
   onMount(async () => {
     ledgerUrl = app.status?.ledger_url ?? '';
+    if (app.status?.account) lockSettings = (await app.run(api.lockSettings)) ?? null;
     if (app.isDesktop) autostart = (await app.run(api.autostart)) ?? null;
     if (app.platform === 'android') permissions = (await app.run(api.permissions)) ?? null;
   });
@@ -115,7 +169,10 @@
   function keydown(event: KeyboardEvent) {
     if (event.key !== 'Escape' || working) return;
     if (view === 'add') void leaveAdding();
-    else if (view !== 'settings') view = 'settings';
+    else if (view === 'restore' && picked) {
+      void api.forgetBackup(picked.path).catch(() => {});
+      closeRestore();
+    } else if (view !== 'settings') view = 'settings';
     else app.closeSettings();
   }
 </script>
@@ -131,7 +188,12 @@
         class="icon-button"
         title="Back to Settings"
         disabled={working}
-        onclick={() => (view === 'add' ? leaveAdding() : (view = 'settings'))}
+        onclick={() =>
+          view === 'add'
+            ? leaveAdding()
+            : view === 'restore' && picked
+              ? (void api.forgetBackup(picked.path).catch(() => {}), closeRestore())
+              : (view = 'settings')}
       >
         <Icon name="back" />
       </button>
@@ -145,6 +207,8 @@
   <div class="sheet-body">
     {#if view === 'add'}
       <section><AddDevice /></section>
+    {:else if view === 'restore' && picked}
+      <section><RestoreBackup {picked} onclose={closeRestore} /></section>
     {:else if view === 'remove' && target}
       <section>
         <h2 class="question">Remove “{target.name}”?</h2>
@@ -265,6 +329,87 @@
           <div class="actions">
             <button onclick={() => (view = 'kit')}>Make a new recovery kit…</button>
           </div>
+        </section>
+      {/if}
+
+      {#if status.account && app.backup}
+        <section>
+          <h2>Backups</h2>
+          <p class="hint">
+            {app.backup.last_backup ? `Last backup ${app.backup.last_backup}.` : 'No backup yet.'}
+            A backup holds all your notes and photos. Keep it somewhere other than your devices.
+          </p>
+          <label class="toggle">
+            <input
+              id="backup-encrypt"
+              type="checkbox"
+              checked={app.backup.encrypt}
+              onchange={(e) => setEncrypt(e.currentTarget.checked)}
+            />
+            <span>Encrypt backups</span>
+          </label>
+          {#if app.backup.encrypt}
+            <p class="hint">
+              Encrypted backups open only on your devices, or with the recovery kit you have when
+              you make them.
+            </p>
+          {:else}
+            <p class="hint">
+              This file isn't encrypted: keep it somewhere private, or turn on Encrypt backups.
+            </p>
+          {/if}
+          <div class="actions wrap">
+            <button onclick={() => app.backUpNow()}>Back up now…</button>
+            <button onclick={pickBackup}>Restore from a backup…</button>
+          </div>
+        </section>
+      {/if}
+
+      {#if status.account && lockSettings}
+        <section>
+          <h2>App lock</h2>
+          <label class="toggle">
+            <input
+              id="app-lock"
+              type="checkbox"
+              checked={lockSettings.enabled}
+              disabled={working || (!lockSettings.available && !lockSettings.enabled)}
+              onchange={(e) =>
+                setLock(e.currentTarget, e.currentTarget.checked, lockSettings?.after_minutes ?? 5)}
+            />
+            <span>Lock Mirrorleaf</span>
+          </label>
+          {#if !lockSettings.available}
+            <p class="error">
+              {app.platform === 'android'
+                ? 'Set a screen lock on this phone first.'
+                : app.platform === 'macos'
+                  ? 'Set a login password on this Mac first.'
+                  : 'The app lock isn’t available on this computer.'}
+            </p>
+          {:else}
+            <p class="hint">
+              {app.platform === 'android'
+                ? 'Unlock with your fingerprint, face or screen lock.'
+                : 'Unlock with Touch ID or your Mac’s password.'}
+              Your notes keep syncing while it’s locked.
+            </p>
+          {/if}
+          {#if lockSettings.enabled}
+            <label class="field">
+              <span>Lock</span>
+              <select
+                id="lock-after"
+                value={lockSettings.after_minutes}
+                disabled={working}
+                onchange={(e) => setLock(e.currentTarget, true, Number(e.currentTarget.value))}
+              >
+                {#each LOCK_AFTER as choice (choice.minutes)}
+                  <option value={choice.minutes}>{choice.label}</option>
+                {/each}
+              </select>
+            </label>
+          {/if}
         </section>
       {/if}
 

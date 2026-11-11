@@ -28,7 +28,8 @@ class MirrorleafApp : Application() {
         MirrorleafNative.init(this)
         // Devices tell each other their version when they connect and pair.
         setAppVersion(packageManager.getPackageInfo(packageName, 0).versionName ?: "unknown")
-        engine = Engine.open(File(filesDir, "mirrorleaf").path, deviceName())
+        // The database is encrypted; its key is wrapped by the Android Keystore (M11).
+        engine = Engine.open(File(filesDir, "mirrorleaf").path, deviceName(), DatabaseKey.get(this))
         // HEIC and AVIF photos are decoded by Android (plan §5.5, M6).
         engine.setPhotoDecoder(PhotoDecoding)
         Notifications.createChannels(this)

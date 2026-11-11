@@ -7,6 +7,7 @@
 
 mod batch;
 mod blobs;
+mod encryption;
 mod heif;
 #[cfg(target_os = "macos")]
 mod imageio;
@@ -16,6 +17,7 @@ mod replica;
 
 pub use batch::{BATCH_WINDOW, Batcher};
 pub use blobs::{BLOB_SCHEME, BlobKind, PhotoRef, PhotoStatus};
+pub use encryption::{DatabaseKey, encrypt_in_place, is_plain_database};
 pub use mirrorleaf_proto::{BlobHash, Change, DeviceId, VersionVector};
 pub use notes::{
     Block, CONTENT_FRAGMENT, FolderMeta, INDEX_DOC, NoteMeta, PREVIEW_CHARS, TOUCH_INTERVAL_MS,

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use mirrorleaf_core::{BATCH_WINDOW, Batcher, Replica};
+use mirrorleaf_core::{BATCH_WINDOW, Batcher, DatabaseKey, Replica};
 use mirrorleaf_net::device::{self, DeviceDir, device_of};
 use mirrorleaf_net::ledger::{DeviceProfile, Fallback, ONLINE_FOR_SECS};
 use mirrorleaf_net::{
@@ -20,11 +20,13 @@ use tracing::{info, warn};
 mod lifecycle;
 mod native;
 mod pairing;
+mod protection;
 mod screen;
 
 pub use lifecycle::KitView;
 pub use native::{DecodedPixels, PhotoDecoder};
 pub use pairing::{Invitation, PairingStatus};
+pub use protection::{BackupDone, BackupInfo, BackupSettings, LockSettings};
 use screen::OpenNote;
 pub use screen::{FolderItem, NoteItem, NoteList, PhotoInfo, UiEvent};
 
@@ -168,6 +170,8 @@ pub struct Engine {
     pending_open: Mutex<Option<String>>,
     /// Adding a device, on either side (E1).
     pairing: Mutex<pairing::Pairing>,
+    /// Whether the screen is locked (M11, E4).
+    lock: Mutex<protection::LockState>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -179,9 +183,15 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[uniffi::export]
 impl Engine {
     /// The process's engine, opened in `data_dir`. On a device's first start it
-    /// creates the device's key and database, named `device_name`.
+    /// creates the device's key and database, named `device_name`. The
+    /// database is encrypted with `database_key` (32 bytes), which the
+    /// platform keeps: the Keychain on the Mac, the Android Keystore (M11).
     #[uniffi::constructor]
-    pub fn open(data_dir: String, device_name: String) -> Result<Arc<Self>, EngineError> {
+    pub fn open(
+        data_dir: String,
+        device_name: String,
+        database_key: Vec<u8>,
+    ) -> Result<Arc<Self>, EngineError> {
         let mut engine = lock(&ENGINE);
         if let Some(open) = engine.as_ref() {
             if open.dir.path() == Path::new(&data_dir) {
@@ -192,7 +202,11 @@ impl Engine {
                 open.dir.path().display()
             )));
         }
-        let opened = Arc::new(Self::start(&data_dir, &device_name)?);
+        let key = DatabaseKey::from_slice(&database_key)?;
+        let opened = Arc::new(Self::start(
+            DeviceDir::with_key(&data_dir, key),
+            &device_name,
+        )?);
         *engine = Some(opened.clone());
         Ok(opened)
     }
@@ -330,8 +344,7 @@ impl Engine {
 }
 
 impl Engine {
-    fn start(data_dir: &str, device_name: &str) -> anyhow::Result<Self> {
-        let dir = DeviceDir::new(data_dir);
+    fn start(dir: DeviceDir, device_name: &str) -> anyhow::Result<Self> {
         let (secret, replica) = dir.open_or_init(device_name)?;
         // Two workers are plenty for one device's sync, and keep the push-woken
         // job small (plan §7.3: Android background job ≤ 50 MB).
@@ -341,7 +354,7 @@ impl Engine {
             .enable_all()
             .build()?;
         info!("engine open for {}", device_of(&secret).short());
-        Ok(Self {
+        let engine = Self {
             dir,
             secret,
             replica: Mutex::new(replica),
@@ -360,7 +373,10 @@ impl Engine {
             decoder: Mutex::default(),
             pending_open: Mutex::default(),
             pairing: Mutex::default(),
-        })
+            lock: Mutex::default(),
+        };
+        engine.note_first_open()?;
+        Ok(engine)
     }
 
     /// Runs `work` on the engine's own runtime, whoever calls: Kotlin's

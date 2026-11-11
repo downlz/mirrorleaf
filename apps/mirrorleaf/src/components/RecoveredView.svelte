@@ -2,15 +2,22 @@
   // After a recovery (E2, assessment §8.4): the account's devices as the
   // ledger knows them, so the lost ones can be removed, then a new kit,
   // because this one was used.
-  import { api } from '../lib/api';
+  import { api, type PickedBackup } from '../lib/api';
   import { app } from '../lib/state.svelte';
   import Icon from './Icon.svelte';
   import KitStep from './KitStep.svelte';
+  import RestoreBackup from './RestoreBackup.svelte';
 
   let { ondone }: { ondone: () => void } = $props();
 
   let busy = $state(false);
   let kitStep = $state(false);
+  /** A backup picked to restore (E9: kit plus latest backup is a full restore). */
+  let picked = $state<PickedBackup | null>(null);
+
+  async function pickBackup() {
+    picked = (await app.run(api.pickBackup)) ?? null;
+  }
 
   const others = $derived(app.status?.devices.filter((d) => !d.this_device) ?? []);
 
@@ -31,6 +38,8 @@
 
 {#if kitStep}
   <KitStep {ondone} />
+{:else if picked}
+  <RestoreBackup {picked} onclose={() => (picked = null)} />
 {:else}
   <h1 class="step-title">Your account is back</h1>
   {#if others.length > 0}
@@ -55,6 +64,10 @@
   {:else}
     <p class="hint">None of your other devices is left on the account.</p>
   {/if}
+  <p class="hint">
+    Have a backup? Restore it to bring back anything your devices don’t have.
+    <button class="link" disabled={busy} onclick={pickBackup}>Restore from a backup…</button>
+  </p>
   <p class="hint">Your recovery kit was used, so make a new one. The old one then stops working.</p>
   <div class="actions">
     <button class="primary" disabled={busy} onclick={newKit}>Make a new recovery kit</button>

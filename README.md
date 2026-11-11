@@ -55,7 +55,7 @@ You need a physical Android phone with USB debugging on; Android 17 is the targe
    adb install -r gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
    ```
 
-The build bundles the notes screen first (`pnpm build`), so run `pnpm install` once beforehand. `MIRRORLEAF_DEFAULT_LEDGER` is the ledger a new phone asks about a word code before it belongs to an account (optional: a scanned QR code carries the ledger's address, and the joining sheet has a **Ledger…** field). On first start the app offers **Start a new account**, **Add this phone to my account** (scan the other device's code, or type its words) and **Recover my account** (from M10). Settings shows the devices, adds new ones, and sets the ledger. Pushes from the ledger wake the app in the background; follow it with `adb logcat -s mirrorleaf`. The step-by-step test is in [docs/tests/m4-android-tests.md](docs/tests/m4-android-tests.md). The full Android screen is M6.
+The build bundles the notes screen first (`pnpm build`), so run `pnpm install` once beforehand. The first build also compiles OpenSSL from source for the encrypted database (M11; it needs `NDK_HOME`, through `tools/ndk-ranlib`). `MIRRORLEAF_DEFAULT_LEDGER` is the ledger a new phone asks about a word code before it belongs to an account (optional: a scanned QR code carries the ledger's address, and the joining sheet has a **Ledger…** field). On first start the app offers **Start a new account**, **Add this phone to my account** (scan the other device's code, or type its words) and **Recover my account** (from M10). Settings shows the devices, adds new ones, and sets the ledger. Pushes from the ledger wake the app in the background; follow it with `adb logcat -s mirrorleaf`. The step-by-step test is in [docs/tests/m4-android-tests.md](docs/tests/m4-android-tests.md). The full Android screen is M6.
 
 ## Run the Mac app
 
@@ -64,14 +64,17 @@ Needs the Mac setup above and the Tauri CLI (`cargo install tauri-cli --version 
 ```bash
 cd apps/mirrorleaf/src-tauri
 cargo tauri dev            # development: the screen reloads from Vite
-cargo tauri build --bundles app   # a release .app in target/release/bundle/macos/
+APPLE_SIGNING_IDENTITY="Mirrorleaf Local Signing" cargo tauri build --bundles app   # a release .app in target/release/bundle/macos/
 ```
+
+Sign every build with the same certificate: the database key is in the Keychain, which trusts the app by its signature. Make the certificate once in Keychain Access (**Certificate Assistant → Create a Certificate…**, name **Mirrorleaf Local Signing**, Self-Signed Root, Code Signing; then set its Trust to **Code Signing: Always Trust**); `security find-identity -v -p codesigning` should list it. An unsigned or ad-hoc build works too, but the Keychain asks once after each rebuild.
 
 - **First start:** choose **Start a new account**, or **Add this Mac to my account** and type the words another device shows under Settings → Devices → Add a device (or paste its code as text). Both devices show the same four-digit number, and the other device asks before letting this one in. The step-by-step test is in [docs/tests/m9-identity-tests.md](docs/tests/m9-identity-tests.md).
 - **Finding and creating:** just start typing: the search field filters the notes, Enter opens the top match, and if no note has that title Enter creates one. ⌘K (Ctrl+K) goes back to the search field from anywhere; Esc in a note does too. Folders are the chips under the search field (+ adds one).
 - **Notes:** the first line of a note is its title. Type `/` for headings, lists, checklists, quotes, dividers and photos; **Aa** in the toolbar for paragraph styles and bold, italic, underline and strikethrough. Drop or paste photos into a note, including HEIC. Right-click a note or a folder chip (long-press on a touch screen) for pin, move, rename and delete.
 - **The agent:** closing the window leaves Mirrorleaf syncing from the menu bar (the leaf icon); its menu shows who it is syncing with and has **Quit Mirrorleaf**. "Open at login" is off until you turn it on in Settings → This computer (it stays off by default until the app has proved reliable). The Mac going to sleep tells the ledger this device is offline; waking it reconnects.
-- **Data:** `~/Library/Application Support/app.mirrorleaf`, the same layout as a CLI device folder, so `mirrorleaf-cli --dir ~/Library/Application\ Support/app.mirrorleaf status` works on it.
+- **Data:** `~/Library/Application Support/app.mirrorleaf`. The database is encrypted (M11) with a key kept in the Keychain, so `mirrorleaf-cli` can't open this folder; it refuses rather than touch it.
+- **Protection:** Settings → **App lock** (off by default) asks for Touch ID or the Mac's password after the time you choose away. Settings → **Backups** saves every note and photo in one file (**Encrypt backups** is off by default) and restores one.
 - **Logs:** `cargo tauri dev` prints the engine's log; set `RUST_LOG` to change what it shows.
 
 CI builds an unsigned Apple silicon `.dmg` (checked against the 25 MB limit) and a Linux `.deb` for the second desktop peer. On Ubuntu, install the `.deb` with `sudo apt install ./Mirrorleaf_*.deb`; the menu-bar icon needs `libayatana-appindicator3-1`. The M5 test steps are in [docs/tests/m5-desktop-tests.md](docs/tests/m5-desktop-tests.md).
@@ -115,6 +118,17 @@ mirrorleaf-cli sign-out                           # off the account, then this f
 ```
 
 The recovery words derive the account key, so a new kit always comes with a new key: the other devices get it the next time they connect to a device that has it, and the old kit stops working (the ledger refuses the old key). `sign-out` refuses while some changes exist only on this device; `--force` signs out anyway.
+
+### Backups
+
+```bash
+mirrorleaf-cli backup export ~/Desktop/notes.mirrorleaf-backup            # every note and photo, not encrypted
+mirrorleaf-cli backup export ~/Desktop/notes.mirrorleaf-backup --encrypt  # encrypted with a key from the account key
+mirrorleaf-cli backup import ~/Desktop/notes.mirrorleaf-backup            # adds what this device lacks; replaces nothing
+mirrorleaf-cli backup import old.mirrorleaf-backup --words "word1 … word12"   # encrypted before a newer kit: that kit's words
+```
+
+Both open the photo store, so stop `sync --watch` for that device first. A CLI device keeps its database key in `database.key` beside the database (the apps use the Keychain or Android Keystore); keep the two together.
 
 ### Photos
 

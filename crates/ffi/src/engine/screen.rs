@@ -36,6 +36,8 @@ pub enum UiEvent {
     OpenNote { id: String },
     /// Adding a device moved on a step: read `pairing_status` (E1).
     PairingChanged,
+    /// The app lock locked the screen: read `is_locked` (E4).
+    LockChanged,
 }
 
 pub(super) type Listener = Arc<dyn Fn(UiEvent) + Send + Sync>;
@@ -432,7 +434,7 @@ mod tests {
     #[test]
     fn the_editor_is_batched_and_hears_only_other_devices() {
         let dir = temp_dir("editor");
-        let engine = Arc::new(Engine::start(dir.to_str().unwrap(), "Test").unwrap());
+        let engine = Arc::new(Engine::start(DeviceDir::new(&dir), "Test").unwrap());
         let id = engine.create_note(None, None).unwrap();
         let before = lock(&engine.replica).change_count().unwrap();
 
@@ -506,7 +508,7 @@ mod tests {
     #[test]
     fn a_note_created_from_search_starts_with_its_title() {
         let dir = temp_dir("create");
-        let engine = Arc::new(Engine::start(dir.to_str().unwrap(), "Test").unwrap());
+        let engine = Arc::new(Engine::start(DeviceDir::new(&dir), "Test").unwrap());
         let id = engine
             .create_note(None, Some("  Packing list ".into()))
             .unwrap();
@@ -521,7 +523,7 @@ mod tests {
     #[test]
     fn photos_show_the_best_copy_held() {
         let dir = temp_dir("photos");
-        let engine = Arc::new(Engine::start(dir.to_str().unwrap(), "Test").unwrap());
+        let engine = Arc::new(Engine::start(DeviceDir::new(&dir), "Test").unwrap());
         let mut png = Vec::new();
         image::RgbImage::from_fn(640, 480, |x, y| {
             image::Rgb([(x % 256) as u8, (y % 256) as u8, 90])
@@ -573,7 +575,7 @@ mod tests {
     #[test]
     fn typing_is_stored_by_the_flushing_task() {
         let dir = temp_dir("flush");
-        let engine = Arc::new(Engine::start(dir.to_str().unwrap(), "Test").unwrap());
+        let engine = Arc::new(Engine::start(DeviceDir::new(&dir), "Test").unwrap());
         let id = engine.create_note(None, None).unwrap();
         let before = lock(&engine.replica).change_count().unwrap();
         engine.open_note(&id, |_| {}).unwrap();

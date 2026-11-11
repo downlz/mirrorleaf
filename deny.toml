@@ -27,6 +27,7 @@ ignore = [
     { id = "RUSTSEC-2026-0370", reason = "zvariant is unmaintained as a separate crate (merged into zbus), not vulnerable: used by zbus, the Linux D-Bus code of tauri-plugin-single-instance (M5)" },
     { id = "RUSTSEC-2026-0371", reason = "zbus_names is unmaintained as a separate crate (merged into zbus), not vulnerable: used by zbus, the Linux D-Bus code of tauri-plugin-single-instance (M5)" },
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive is unmaintained as a separate crate (merged into zbus), not vulnerable: used by zvariant, through zbus in tauri-plugin-single-instance on Linux (M5)" },
+    { id = "RUSTSEC-2026-0459", reason = "SQLite before 3.54 can return stale page-cache memory for a crafted database and -wal pair (CVE-2026-119375). libsqlite3-sys through rusqlite in mirrorleaf-core: every build uses bundled-sqlcipher (M11), and no libsqlite3-sys release yet bundles a fixed SQLCipher (0.39.1 pins sqlcipher-src =419.0.6, SQLite 3.53.4). Our database sits in the app's private folder, so an attacker would need to write there first. Remove when a libsqlite3-sys release uses sqlcipher-src 420 or later (SQLite 3.54.1); ADR-011" },
     { id = "RUSTSEC-2026-0374", reason = "basic-toml is unmaintained, not vulnerable: read at build time by askama's template macros in uniffi_bindgen, the host tool that generates the Kotlin bindings; not in the app" },
 ]
 
