@@ -8,6 +8,7 @@ pub mod device;
 mod frame;
 pub mod kit;
 pub mod ledger;
+mod local;
 mod node;
 pub mod pair;
 pub mod recovery;
@@ -39,6 +40,14 @@ pub fn app_version() -> &'static str {
         .get()
         .map(String::as_str)
         .unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
+/// Whether a failed connection means the two devices run versions of
+/// Mirrorleaf with no sync protocol in common (M12, E6): the TLS refusal when
+/// neither side offers the other's protocol name, or `AuthError::UpdateNeeded`.
+pub fn version_mismatch(error: &str) -> bool {
+    error.contains("doesn't support any known protocol")
+        || error.contains("one side needs an update")
 }
 
 /// An error and its causes on one line. Iroh often repeats a cause's text in

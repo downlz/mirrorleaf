@@ -74,6 +74,28 @@
     };
   });
 
+  // Files dropped outside the editor make a new note (M12, desktop). Without
+  // this the web view would open a dropped file in place of the app.
+  const carriesFiles = (event: DragEvent) => event.dataTransfer?.types.includes('Files') ?? false;
+  const inEditor = (event: DragEvent) =>
+    event.target instanceof Element && event.target.closest('.ProseMirror') !== null;
+
+  function dragover(event: DragEvent) {
+    if (!carriesFiles(event) || inEditor(event)) return;
+    event.preventDefault();
+    if (event.dataTransfer) {
+      event.dataTransfer.dropEffect =
+        app.isDesktop && app.locked === false && !app.needsAccount ? 'copy' : 'none';
+    }
+  }
+
+  function drop(event: DragEvent) {
+    if (!carriesFiles(event) || inEditor(event)) return;
+    event.preventDefault();
+    if (!app.isDesktop || app.locked !== false || app.needsAccount || !app.status?.account) return;
+    void app.dropFiles(Array.from(event.dataTransfer?.files ?? []));
+  }
+
   const editable = (target: EventTarget | null) =>
     target instanceof HTMLElement &&
     (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName));
@@ -104,6 +126,12 @@
       }
       return;
     }
+    // Esc outside a text field steps out of a folder (M12, option A).
+    if (event.key === 'Escape' && !editable(event.target) && app.view.kind === 'folder') {
+      event.preventDefault();
+      app.folderUp();
+      return;
+    }
     // Esc in the note goes back to the search field (and closes the sheet).
     if (event.key === 'Escape' && editable(event.target)) {
       if (event.target instanceof HTMLElement && event.target.closest('.ProseMirror')) {
@@ -123,7 +151,7 @@
   }
 </script>
 
-<svelte:window onkeydown={keydown} />
+<svelte:window onkeydown={keydown} ondragover={dragover} ondrop={drop} />
 
 <!-- The overlays sit inside .app too (they are all fixed), so the layout
      class reaches them: on phones Settings fills the screen and the note's

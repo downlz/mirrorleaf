@@ -95,6 +95,9 @@ const SCHEMA_V4: &str = "
 pub struct Replica {
     pub(crate) conn: Connection,
     device: DeviceId,
+    /// Told after each local change is written (M12): the app nudges live
+    /// sync with it, instead of live sync polling the database.
+    on_local: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl Replica {
@@ -156,7 +159,15 @@ impl Replica {
         if version < 4 {
             migrate(&conn, SCHEMA_V4, 4)?;
         }
-        let mut replica = Self { conn, device };
+        if version < 5 {
+            // The search index (M12, E5).
+            migrate(&conn, crate::search::SCHEMA_V5, 5)?;
+        }
+        let mut replica = Self {
+            conn,
+            device,
+            on_local: None,
+        };
         match replica.meta("device_id")? {
             None => replica.set_meta("device_id", &device.0)?,
             Some(stored) if stored == device.0 => {}
@@ -202,7 +213,15 @@ impl Replica {
         let change = Change::yjs(self.device, held + 1, doc_id, update, unix_now());
         insert_change(&tx, &change)?;
         tx.commit()?;
+        if let Some(told) = &self.on_local {
+            told();
+        }
         Ok(change)
+    }
+
+    /// Calls `told` after every local change this connection writes.
+    pub fn on_local_change(&mut self, told: impl Fn() + Send + Sync + 'static) {
+        self.on_local = Some(Box::new(told));
     }
 
     pub fn delete_meta(&mut self, key: &str) -> Result<()> {
@@ -683,7 +702,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         assert_eq!(replica.photos().unwrap()[0].photo, photo);
         // M9's columns: the old change reads as a Yjs update, normal class,
         // made at an unknown time.

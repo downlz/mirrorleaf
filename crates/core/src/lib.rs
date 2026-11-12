@@ -14,6 +14,7 @@ mod imageio;
 mod notes;
 pub mod photos;
 mod replica;
+mod search;
 
 pub use batch::{BATCH_WINDOW, Batcher};
 pub use blobs::{BLOB_SCHEME, BlobKind, PhotoRef, PhotoStatus};
@@ -23,6 +24,7 @@ pub use notes::{
     Block, CONTENT_FRAGMENT, FolderMeta, INDEX_DOC, NoteMeta, PREVIEW_CHARS, TOUCH_INTERVAL_MS,
 };
 pub use replica::Replica;
+pub use search::{MATCH_END, MATCH_START, SearchHit};
 pub use yrs;
 
 #[derive(Debug, thiserror::Error)]

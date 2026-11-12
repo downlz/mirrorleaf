@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -27,8 +27,19 @@ use crate::{AuthError, describe};
 /// QUIC close code sent when a peer is refused, with the reason as text.
 const REFUSED: u32 = 1;
 
-/// How often `watch` checks for new local changes to push.
+/// How often `watch` looks for new changes to push, by default. The CLI keeps
+/// this: `note` and `photo` commands write from other processes. The app
+/// nudges `watch` on its own writes instead and checks less often
+/// (`set_tick`, M12).
 const TICK: Duration = Duration::from_secs(1);
+/// Meta key prefix: a device's last address on the home network, by its ID
+/// (M12): tried when dialling, so devices on one network find each other
+/// without internet even where the network drops mDNS's multicast.
+const LAN_ADDR: &str = "lan_addr:";
+/// Meta key: the UDP port this device last listened on, reused when free so
+/// the address the other devices remember stays right across restarts.
+const LOCAL_PORT: &str = "local_port";
+
 /// How long `watch` waits before dialling an unreachable device again.
 const REDIAL: Duration = Duration::from_secs(30);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
@@ -184,6 +195,12 @@ struct Inner {
     offer: OfferSlot,
     /// Wakes `watch` before its next tick, to push new changes at once.
     nudge: tokio::sync::Notify,
+    /// How often `watch` wakes when not nudged, in milliseconds.
+    tick_ms: std::sync::atomic::AtomicU64,
+    /// Whether `watch` also fetches every missing full image (M12, E5).
+    prefetch: AtomicBool,
+    /// Finding devices on the same network with no internet (M12).
+    local: crate::local::LocalDiscovery,
 }
 
 /// What `watch` last told the ledger.
@@ -235,7 +252,7 @@ impl SyncNode {
     }
 
     async fn bind_inner(
-        state: State,
+        mut state: State,
         secret: SecretKey,
         network: Network,
         blobs: Blobs,
@@ -245,19 +262,42 @@ impl SyncNode {
             DeviceId(*secret.public().as_bytes()) == state.replica.device(),
             "the device key doesn't match this database"
         );
-        let builder = match network {
-            Network::Internet => Endpoint::builder(presets::N0),
-            Network::Local => Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Disabled),
+        // The port used last time, so the other devices' remembered address
+        // for this one still works; a random one if it's taken.
+        let port = state
+            .replica
+            .meta(LOCAL_PORT)?
+            .and_then(|v| String::from_utf8(v).ok())
+            .and_then(|v| v.parse::<u16>().ok())
+            .filter(|p| *p != 0);
+        let endpoint = match bind_endpoint(network, &secret, port).await {
+            Ok(endpoint) => endpoint,
+            Err(e) if port.is_some() => {
+                tracing::info!(
+                    "port {} is taken ({}): using another",
+                    port.unwrap_or(0),
+                    describe(&e)
+                );
+                bind_endpoint(network, &secret, None).await?
+            }
+            Err(e) => return Err(e),
         };
-        let endpoint = builder
-            .secret_key(secret)
-            .alpns(vec![
-                ALPN.to_vec(),
-                PAIR_ALPN.to_vec(),
-                iroh_blobs::ALPN.to_vec(),
-            ])
-            .bind()
-            .await?;
+        if let Some(bound) = endpoint
+            .bound_sockets()
+            .into_iter()
+            .find(SocketAddr::is_ipv4)
+            .map(|s| s.port())
+            && Some(bound) != port
+        {
+            state
+                .replica
+                .set_meta(LOCAL_PORT, bound.to_string().as_bytes())?;
+        }
+        // Added once; started and stopped by `set_local_discovery`.
+        let local = crate::local::LocalDiscovery::default();
+        if let Ok(lookups) = endpoint.address_lookup() {
+            lookups.add(local.clone());
+        }
         Ok(Self {
             inner: Arc::new(Inner {
                 endpoint,
@@ -268,6 +308,9 @@ impl SyncNode {
                 ledger: Mutex::default(),
                 offer: Arc::default(),
                 nudge: tokio::sync::Notify::new(),
+                tick_ms: std::sync::atomic::AtomicU64::new(TICK.as_millis() as u64),
+                prefetch: AtomicBool::new(false),
+                local,
             }),
         })
     }
@@ -335,9 +378,68 @@ impl SyncNode {
     }
 
     /// Makes `watch` look for changes to push now rather than at its next
-    /// tick (up to a second away): for the last edits before going offline.
+    /// tick: after a local edit, after changes arrive (to pass them on), and
+    /// for the last edits before going offline.
     pub fn nudge(&self) {
         self.inner.nudge.notify_one();
+    }
+
+    /// Makes `watch` fetch every missing full image from connected devices,
+    /// not only those asked for: the app turns it on while the screen is in
+    /// use on an unmetered network (M12, E5). Push-woken jobs never do.
+    pub fn set_prefetch(&self, on: bool) {
+        if self.inner.prefetch.swap(on, Ordering::AcqRel) != on && on {
+            self.nudge();
+        }
+    }
+
+    /// Announces this device on the local network and finds the account's
+    /// devices there, with no internet needed (mDNS, M12), or stops. The app
+    /// turns it on while live sync runs, if the setting allows. Returns
+    /// whether it is running.
+    pub fn set_local_discovery(&self, on: bool) -> bool {
+        if !on {
+            if self.inner.local.stop() {
+                tracing::info!("stopped looking for devices on this network");
+            }
+            return false;
+        }
+        match self.inner.local.start(self.inner.endpoint.id()) {
+            Ok(started) => {
+                if started {
+                    tracing::info!("looking for devices on this network");
+                }
+                true
+            }
+            Err(e) => {
+                tracing::warn!("can't look for devices on this network: {}", describe(&e));
+                false
+            }
+        }
+    }
+
+    pub fn local_discovery_running(&self) -> bool {
+        self.inner.local.is_running()
+    }
+
+    /// The devices seen announcing themselves on this network (mDNS).
+    pub fn on_this_network(&self) -> Vec<DeviceId> {
+        self.inner
+            .local
+            .seen()
+            .into_iter()
+            .map(|id| DeviceId(*id.as_bytes()))
+            .collect()
+    }
+
+    /// How often `watch` wakes when nothing nudges it (1 s by default). Set
+    /// before `watch` starts. Whoever writes in this process must then
+    /// `nudge` after each write (M12, E7).
+    pub fn set_tick(&self, every: Duration) {
+        self.inner.tick_ms.store(
+            every.as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Keeps the ledger client on this device's account after the account's
@@ -395,6 +497,7 @@ impl SyncNode {
             Account::save_pending_kit(&mut state.replica, &secret, now)?;
         }
         self.follow_account();
+        self.nudge();
         tracing::info!("replaced the account key");
         Ok(secret)
     }
@@ -424,6 +527,7 @@ impl SyncNode {
             state.account.save(&mut state.replica)?;
             approval
         };
+        self.nudge();
         if let Some(ledger) = self.ledger()
             && let Err(e) = ledger.remove_device(device, approval).await
         {
@@ -630,7 +734,59 @@ impl SyncNode {
         if let Some(addr) = self.inner.hints.lock().unwrap().get(&device) {
             return Ok(addr.clone());
         }
-        endpoint_addr(device)
+        let mut addr = endpoint_addr(device)?;
+        // Tried alongside the usual lookups, not instead of them (M12).
+        if let Some(lan) = self.remembered_lan_addr(device) {
+            addr = addr.with_ip_addr(lan);
+        }
+        Ok(addr)
+    }
+
+    /// Where to dial a device: its ID, and its last address on the home
+    /// network if one is remembered (for the push-woken job's dials).
+    pub fn dial_addr(&self, device: DeviceId) -> Result<EndpointAddr> {
+        self.addr_for(device)
+    }
+
+    /// The device's last address on the home network, if one is remembered.
+    pub fn remembered_lan_addr(&self, device: DeviceId) -> Option<SocketAddr> {
+        let key = format!("{LAN_ADDR}{device}");
+        let value = self.inner.state.lock().unwrap().replica.meta(&key).ok()??;
+        String::from_utf8(value).ok()?.parse().ok()
+    }
+
+    /// Remembers a device's address on the home network (a private address)
+    /// from any of the connection's paths: the one in use is often IPv6 with
+    /// a public address, while an IPv4 path on the same network is known too.
+    /// Prefers the path in use, then IPv4. Writes only when it changed.
+    fn remember_lan_addr(&self, conn: &Connection) {
+        let mut found: Vec<(bool, bool, SocketAddr)> = conn
+            .paths()
+            .iter()
+            .filter_map(|p| match p.remote_addr() {
+                iroh::TransportAddr::Ip(addr) if on_home_network(addr.ip()) => {
+                    Some((p.is_selected(), addr.is_ipv4(), *addr))
+                }
+                _ => None,
+            })
+            .collect();
+        found.sort_by_key(|(selected, v4, _)| (!*selected, !*v4));
+        let Some(&(_, _, addr)) = found.first() else {
+            return;
+        };
+        let device = device_of(conn);
+        if self.remembered_lan_addr(device) == Some(addr) {
+            return;
+        }
+        let key = format!("{LAN_ADDR}{device}");
+        let mut state = self.inner.state.lock().unwrap();
+        if state
+            .replica
+            .set_meta(&key, addr.to_string().as_bytes())
+            .is_ok()
+        {
+            tracing::info!("{} is at {addr} on this network", device.short());
+        }
     }
 
     /// Dials a peer, authenticates it and runs a first sync round. The
@@ -660,6 +816,7 @@ impl SyncNode {
         )
         .await?;
         report.traffic += traffic;
+        self.remember_lan_addr(&conn);
         Ok((conn, report))
     }
 
@@ -737,10 +894,13 @@ impl SyncNode {
                 self.inner.state.clone(),
                 self.ledger(),
             );
+            let node = self.clone();
             tokio::spawn(async move {
                 if let Err(e) = pair::serve(conn, me, slot, state, ledger).await {
                     tracing::warn!("pairing failed: {}", describe(&e));
                 }
+                // A device may have joined: the list changed.
+                node.nudge();
             });
             return Ok(None);
         }
@@ -764,6 +924,7 @@ impl SyncNode {
         )
         .await?;
         report.traffic += traffic;
+        self.remember_lan_addr(&conn);
         Ok(Some((conn, report)))
     }
 
@@ -941,7 +1102,12 @@ impl SyncNode {
             })
         };
 
-        let mut tick = tokio::time::interval(TICK);
+        let every = Duration::from_millis(
+            self.inner
+                .tick_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        let mut tick = tokio::time::interval(every);
         let mut last_dial: HashMap<DeviceId, Instant> = HashMap::new();
         let fetching = Arc::new(AtomicBool::new(false));
         let backoff: Backoff = Arc::default();
@@ -1089,9 +1255,10 @@ impl SyncNode {
         backoff: &Backoff,
         events: &UnboundedSender<Event>,
     ) {
+        let every_full = self.inner.prefetch.load(Ordering::Acquire);
         let wanted = {
             let state = self.inner.state.lock().unwrap();
-            match state.replica.blobs_to_fetch() {
+            match state.replica.blobs_to_fetch_with(every_full) {
                 Ok(wanted) => wanted,
                 Err(_) => return,
             }
@@ -1195,6 +1362,14 @@ impl SyncNode {
                 }
             }
             drop(map);
+            if result.as_ref().is_ok_and(|r| r.received_changes > 0) {
+                // Passes what arrived on to the other devices at once.
+                node.nudge();
+            }
+            if result.is_ok() {
+                // A connection that started on the relay may have gone direct.
+                node.remember_lan_addr(&conn);
+            }
             let _ = events.send(match result {
                 Ok(report) => Event::Synced {
                     peer,
@@ -1235,6 +1410,9 @@ impl SyncNode {
                 busy: false,
             },
         );
+        if report.received_changes > 0 {
+            self.nudge();
+        }
         let _ = events.send(Event::Synced {
             peer,
             path,
@@ -1250,6 +1428,10 @@ impl SyncNode {
                         if let Some(p) = peers.lock().unwrap().get_mut(&peer) {
                             p.holds = p.holds.merged(&report.peer_holds);
                         }
+                        if report.received_changes > 0 {
+                            node.nudge();
+                        }
+                        node.remember_lan_addr(&conn);
                         let path = path_kind(&conn);
                         let _ = events.send(Event::Synced {
                             peer,
@@ -1285,6 +1467,42 @@ fn unix_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Binds the endpoint, on `port` if given (IPv4 and IPv6), else on random ports.
+async fn bind_endpoint(
+    network: Network,
+    secret: &SecretKey,
+    port: Option<u16>,
+) -> Result<Endpoint> {
+    let mut builder = match network {
+        Network::Internet => Endpoint::builder(presets::N0),
+        Network::Local => Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Disabled),
+    };
+    if let Some(port) = port {
+        builder = builder
+            .clear_ip_transports()
+            .bind_addr(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))?
+            .bind_addr(SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)))?;
+    }
+    Ok(builder
+        .secret_key(secret.clone())
+        .alpns(vec![
+            ALPN.to_vec(),
+            PAIR_ALPN.to_vec(),
+            iroh_blobs::ALPN.to_vec(),
+        ])
+        .bind()
+        .await?)
+}
+
+/// Whether an address is on a home or office network: private IPv4
+/// (10/8, 172.16/12, 192.168/16), IPv4 link-local, or IPv6 unique local.
+fn on_home_network(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => (v6.segments()[0] & 0xfe00) == 0xfc00,
+    }
 }
 
 /// The address to dial a device by its ID alone; Iroh looks up where it is.

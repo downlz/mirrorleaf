@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { listDate, noteDate } from './dates';
+import { lastSeen, listDate, noteDate } from './dates';
 
 const at = (iso: string) => new Date(iso).getTime();
 const NOW = at('2026-11-04T18:20:00');
@@ -11,6 +11,15 @@ describe('dates', () => {
     expect(listDate(at('2026-11-01T12:00:00'), NOW)).toBe('Sunday');
     expect(listDate(at('2026-10-20T12:00:00'), NOW)).toBe('20/10/2026');
     expect(listDate(0, NOW)).toBe('');
+  });
+
+  it('says when a device was last seen', () => {
+    const secs = (iso: string) => at(iso) / 1000;
+    expect(lastSeen(secs('2026-11-04T18:19:30'), NOW)).toBe('just now');
+    expect(lastSeen(secs('2026-11-04T18:08:00'), NOW)).toBe('12 minutes ago');
+    expect(lastSeen(secs('2026-11-04T09:05:00'), NOW)).toBe('today at 09:05');
+    expect(lastSeen(secs('2026-11-03T21:40:00'), NOW)).toBe('yesterday at 21:40');
+    expect(lastSeen(secs('2026-10-20T12:00:00'), NOW)).toBe('20 October');
   });
 
   it('writes the full date above a note', () => {

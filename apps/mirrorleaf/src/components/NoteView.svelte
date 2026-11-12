@@ -242,7 +242,15 @@
       {#if note.trashed}
         <p class="banner">
           This note is in Recently Deleted.
-          <button class="link" onclick={() => void app.restore(note.id)}>Restore it</button> to edit.
+          <button class="link" onclick={() => void app.restore(note.id)}>Restore it</button> to
+          edit, or
+          <button
+            class="link danger-link"
+            onclick={(e) => {
+              const r = e.currentTarget.getBoundingClientRect();
+              app.confirmDeleteForGood(note, r.left, r.bottom + 4);
+            }}>delete it for good</button
+          >.
         </p>
       {/if}
       <p class="note-date-line">{noteDate(note.updated_ms)}</p>

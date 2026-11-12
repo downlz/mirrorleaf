@@ -239,3 +239,72 @@ pub async fn authenticate<R: Runtime>(app: &AppHandle<R>) -> Result<bool, String
         .map(|u| u.unlocked)
         .map_err(|e| e.to_string())
 }
+
+/// Whether Android lets the app run in the background without battery
+/// restrictions, and the phone's maker, for the guidance in Settings (M12, E8).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Battery {
+    pub unrestricted: bool,
+    pub maker: String,
+    /// Whether "Seed while charging" is turned on.
+    pub seeding: bool,
+}
+
+pub async fn battery<R: Runtime>(app: &AppHandle<R>) -> Result<Option<Battery>, String> {
+    #[cfg(target_os = "android")]
+    {
+        use tauri::Manager;
+        app.state::<PermissionsHandle<R>>()
+            .0
+            .run_mobile_plugin_async("battery", ())
+            .await
+            .map(Some)
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        Ok(None)
+    }
+}
+
+/// Opens Android's settings page for Mirrorleaf (battery, permissions).
+pub async fn open_app_settings<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        use tauri::Manager;
+        app.state::<PermissionsHandle<R>>()
+            .0
+            .run_mobile_plugin_async::<()>("openAppSettings", ())
+            .await
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        Ok(())
+    }
+}
+
+/// Turns "Seed while charging" on or off: Android's background job that
+/// keeps syncing while the phone charges on Wi-Fi (M12, E8).
+pub async fn set_seeding<R: Runtime>(app: &AppHandle<R>, on: bool) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        use tauri::Manager;
+        #[derive(serde::Serialize)]
+        struct Args {
+            on: bool,
+        }
+        app.state::<PermissionsHandle<R>>()
+            .0
+            .run_mobile_plugin_async::<()>("setSeeding", Args { on })
+            .await
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (app, on);
+        Err("only on Android".to_owned())
+    }
+}

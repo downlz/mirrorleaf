@@ -75,7 +75,7 @@ object Notifications {
 
     private fun build(context: Context, channel: String, title: String, text: String?) =
         NotificationCompat.Builder(context, channel)
-            .setSmallIcon(android.R.drawable.stat_notify_sync)
+            .setSmallIcon(R.drawable.ic_stat_mirrorleaf)
             .setContentTitle(title)
             .apply { if (text != null) setContentText(text) }
             .setContentIntent(openApp(context))

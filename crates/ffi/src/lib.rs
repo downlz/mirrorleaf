@@ -52,7 +52,7 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 pub use engine::{
     BackupDone, BackupInfo, BackupSettings, DecodedPixels, DeviceSummary, Engine, EngineError,
     EngineStatus, FolderItem, Invitation, KitView, LockSettings, NoteItem, NoteList, PairingStatus,
-    PhotoDecoder, PhotoInfo, SyncListener, SyncSummary, UiEvent,
+    PhotoDecoder, PhotoInfo, SearchResult, SyncListener, SyncSummary, UiEvent,
 };
 /// A backup file's extension, without the dot.
 pub use mirrorleaf_net::backup::EXTENSION as BACKUP_EXTENSION;

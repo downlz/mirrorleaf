@@ -67,6 +67,8 @@ pub struct NoteItem {
 pub struct FolderItem {
     pub id: String,
     pub name: String,
+    /// The folder holding it, `None` at the top level (M12).
+    pub parent: Option<String>,
 }
 
 /// Everything the sidebar and the note list show.
@@ -147,6 +149,10 @@ impl Engine {
     // --- The note list ---
 
     pub fn note_list(&self) -> Result<NoteList, EngineError> {
+        // The screen is in use: a good moment for the trash's 30-day purge (E5).
+        if let Err(e) = self.purge_if_due() {
+            tracing::warn!("purging the trash: {e}");
+        }
         let (notes, folders) = lock(&self.replica).list_index()?;
         let notes = notes
             .into_iter()
@@ -165,6 +171,7 @@ impl Engine {
             .map(|f| FolderItem {
                 id: f.id,
                 name: f.name,
+                parent: f.parent,
             })
             .collect();
         Ok(NoteList { notes, folders })
@@ -204,8 +211,14 @@ impl Engine {
         Ok(lock(&self.replica).move_note(id, folder.as_deref())?)
     }
 
-    pub fn create_folder(&self, name: &str) -> Result<String, EngineError> {
-        Ok(lock(&self.replica).create_folder(name)?)
+    /// A new folder, inside `parent` if given (M12).
+    pub fn create_folder(&self, name: &str, parent: Option<&str>) -> Result<String, EngineError> {
+        Ok(lock(&self.replica).create_folder_in(name, parent)?)
+    }
+
+    /// Moves a folder into another, or to the top level with `None`.
+    pub fn move_folder(&self, id: &str, parent: Option<&str>) -> Result<(), EngineError> {
+        Ok(lock(&self.replica).move_folder(id, parent)?)
     }
 
     pub fn rename_folder(&self, id: &str, name: &str) -> Result<(), EngineError> {

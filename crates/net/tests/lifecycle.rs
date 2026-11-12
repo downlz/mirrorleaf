@@ -356,3 +356,125 @@ async fn a_backup_restores_notes_and_photos_with_or_without_encryption() {
         n.close().await;
     }
 }
+
+/// Two devices find each other on the local network with nothing but their
+/// IDs: no addresses given, no relay, no discovery server (M12, mDNS). Needs a
+/// network interface that carries multicast, so it runs by hand:
+/// `cargo test -p mirrorleaf-net --test lifecycle -- --ignored local_network`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs multicast on this machine's network"]
+async fn devices_find_each_other_on_the_local_network() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "mirrorleaf_net=debug".into()),
+        )
+        .try_init();
+    let a = node("laptop", |me| Account::create_with_kit(me, 1_794_200_000).0).await;
+    let b = joiner("phone", &a).await;
+    assert!(a.set_local_discovery(true));
+    assert!(b.set_local_discovery(true));
+    let accepting = {
+        let b = b.clone();
+        tokio::spawn(async move { b.accept().await })
+    };
+    let only_id = mirrorleaf_net::endpoint_addr(b.device()).unwrap();
+    let dialled =
+        tokio::time::timeout(std::time::Duration::from_secs(30), a.sync_once(only_id)).await;
+    accepting.abort();
+    assert!(
+        matches!(dialled, Ok(Ok(_))),
+        "found and synced over the local network: {dialled:?}"
+    );
+    assert!(a.on_this_network().contains(&b.device()));
+    // Stopping ends the announcements: A stops seeing B once its record
+    // expires, and B no longer answers lookups.
+    assert!(!b.set_local_discovery(false));
+    assert!(!b.local_discovery_running());
+    assert!(b.on_this_network().is_empty());
+}
+
+/// A device remembered at an address on the home network is dialled there
+/// with no lookup at all (M12: no internet, and a network that drops mDNS).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_remembered_home_address_is_dialled_without_any_lookup() {
+    let a = node("laptop", |me| Account::create_with_kit(me, 1_794_200_000).0).await;
+    let b = joiner("phone", &a).await;
+    // Network::Local has no lookups, so dialling by ID alone can't work.
+    let accepting = {
+        let b = b.clone();
+        tokio::spawn(async move { b.accept().await })
+    };
+    let alone = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        a.sync_once(a.dial_addr(b.device()).unwrap()),
+    )
+    .await;
+    assert!(!matches!(alone, Ok(Ok(_))), "nothing to dial");
+    accepting.abort();
+
+    // As if remembered from an earlier direct connection on this network.
+    let at = b.loopback_addr().ip_addrs().next().copied().unwrap();
+    a.state()
+        .lock()
+        .unwrap()
+        .replica
+        .set_meta(
+            &format!("lan_addr:{}", b.device()),
+            at.to_string().as_bytes(),
+        )
+        .unwrap();
+    assert_eq!(a.remembered_lan_addr(b.device()), Some(at));
+    let accepting = {
+        let b = b.clone();
+        tokio::spawn(async move { b.accept().await })
+    };
+    let dialled = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        a.sync_once(a.dial_addr(b.device()).unwrap()),
+    )
+    .await;
+    accepting.abort();
+    assert!(matches!(dialled, Ok(Ok(_))), "{dialled:?}");
+    // A loopback connection isn't the home network: nothing new remembered.
+    assert_eq!(b.remembered_lan_addr(a.device()), None);
+}
+
+/// A device listens on the same port after a restart, so the address the
+/// other devices remember for it stays right (M12).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_listens_on_the_same_port_again() {
+    let dir = std::env::temp_dir().join(format!("mirrorleaf-port-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("device.db");
+    let secret = SecretKey::generate();
+    let device = DeviceId(*secret.public().as_bytes());
+    let bind = |secret: SecretKey| {
+        let replica = Replica::open(&path, device).unwrap();
+        let account = Account::create_with_kit(
+            DeviceEntry {
+                id: device,
+                name: "laptop".into(),
+                platform: None,
+                added_at: 0,
+            },
+            1_794_200_000,
+        )
+        .0;
+        SyncNode::bind(
+            State { replica, account },
+            secret,
+            Network::Local,
+            BlobStorage::Memory,
+        )
+    };
+    let port = |node: &SyncNode| node.loopback_addr().ip_addrs().next().unwrap().port();
+    let first = bind(secret.clone()).await.unwrap();
+    let was = port(&first);
+    first.close().await;
+    drop(first);
+    let again = bind(secret).await.unwrap();
+    assert_eq!(port(&again), was);
+    again.close().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}

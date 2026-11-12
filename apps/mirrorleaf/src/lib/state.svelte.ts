@@ -14,11 +14,12 @@ import {
   type NoteItem,
   type PairingStatus,
 } from './api';
-import { counts, hasTitle, visibleNotes, viewTitle, type View } from './notes';
+import { counts, folderTree, hasTitle, visibleNotes, viewTitle, type View } from './notes';
 
 export type Layout = 'wide' | 'medium' | 'narrow';
-/** What Android's back gesture closes, newest first. */
-type Overlay = 'note' | 'settings' | 'welcome';
+/** What Android's back gesture closes, newest first: overlays, and each
+ *  folder stepped into (M12, option A). */
+type Overlay = 'note' | 'settings' | 'welcome' | 'folder';
 /** What a phone-sized screen shows: the stream, or a note as a sheet over it. */
 export type Pane = 'list' | 'note';
 
@@ -64,10 +65,12 @@ class AppState {
   locked = $state<boolean | null>(null);
   /** Backups (E9): the last one, and the main screen's reminder. */
   backup = $state<BackupSettings | null>(null);
+  /** The full-text search's results for `search`, note ID → snippet (M12, E5). */
+  hits = $state<Map<string, string> | null>(null);
 
   layout = $derived(layoutFor(this.width));
-  visible = $derived(visibleNotes(this.notes, this.view, this.search));
-  counts = $derived(counts(this.notes));
+  visible = $derived(visibleNotes(this.notes, this.view, this.search, this.hits, this.folders));
+  counts = $derived(counts(this.notes, this.folders));
   title = $derived(viewTitle(this.view, this.folders));
   /** Enter in the search field would create a note: no note has that title. */
   canCreate = $derived(
@@ -135,7 +138,9 @@ class AppState {
       this.folders = list.folders;
       const view = this.view;
       if (view.kind === 'folder' && !list.folders.some((f) => f.id === view.id)) {
-        this.view = { kind: 'all' };
+        // Deleted on another device: back out to the nearest folder still there.
+        const live = this.folderTrail.filter((id) => list.folders.some((f) => f.id === id));
+        this.leaveTo(live.at(-1) ?? null);
       }
     } catch (error) {
       this.fail(error);
@@ -222,9 +227,66 @@ class AppState {
   private overlays: Overlay[] = [];
 
   private pushOverlay(kind: Overlay) {
-    if (this.overlays.includes(kind)) return;
+    if (kind !== 'folder' && this.overlays.includes(kind)) return;
     this.overlays.push(kind);
-    history.pushState({ mirrorleaf: kind }, '');
+    // How many overlays are open at this entry, so a jump back several
+    // entries (a breadcrumb) closes the right number.
+    history.pushState({ mirrorleaf: kind, open: this.overlays.length }, '');
+  }
+
+  /** The folders stepped into, outermost first (M12, option A). */
+  private folderTrail: string[] = [];
+
+  /**
+   * Steps into a folder: the chips become its folders and the back gesture,
+   * Esc or the breadcrumb come back out.
+   */
+  enterFolder(id: string) {
+    if (this.view.kind !== 'folder') this.folderTrail = [];
+    this.folderTrail.push(id);
+    this.openView({ kind: 'folder', id });
+    this.pushOverlay('folder');
+  }
+
+  /** Forgets the folders stepped into, leaving their history entries behind. */
+  private dropTrail() {
+    this.folderTrail = [];
+    this.overlays = this.overlays.filter((k) => k !== 'folder');
+  }
+
+  /** Goes back out to `id`, a folder on the way in, or to All Notes with null. */
+  leaveTo(id: string | null) {
+    if (id !== null && !this.folderTrail.includes(id)) {
+      // Not on the way in (the folders were moved meanwhile): go there directly.
+      this.dropTrail();
+      this.enterFolder(id);
+      return;
+    }
+    const keep = id === null ? 0 : this.folderTrail.indexOf(id) + 1;
+    const up = this.folderTrail.length - keep;
+    let trailing = 0;
+    for (let i = this.overlays.length - 1; i >= 0 && this.overlays[i] === 'folder'; i--) trailing++;
+    if (up > 0 && trailing >= up) {
+      // Through history, so the back gesture stays in step.
+      history.go(-up);
+      return;
+    }
+    const kept = this.folderTrail.slice(0, keep);
+    this.dropTrail();
+    this.folderTrail = kept;
+    this.showTrailEnd();
+  }
+
+  /** Esc on the Mac: one folder up. */
+  folderUp() {
+    if (this.view.kind !== 'folder') return;
+    const trail = this.folderTrail;
+    this.leaveTo(trail.length > 1 ? (trail[trail.length - 2] ?? null) : null);
+  }
+
+  private showTrailEnd() {
+    const at = this.folderTrail.at(-1);
+    this.openView(at ? { kind: 'folder', id: at } : { kind: 'all' });
   }
 
   private showSheet() {
@@ -265,7 +327,10 @@ class AppState {
   }
 
   private close(kind: Overlay) {
-    if (kind === 'note') this.pane = 'list';
+    if (kind === 'folder') {
+      this.folderTrail.pop();
+      this.showTrailEnd();
+    } else if (kind === 'note') this.pane = 'list';
     else if (kind === 'settings') this.settings = false;
     else {
       this.welcomeSheet = null;
@@ -278,10 +343,14 @@ class AppState {
     }
   }
 
-  /** The back gesture, or a close that went through history. */
+  /** The back gesture, or a close that went through history (one entry or several). */
   onPopState() {
-    const kind = this.overlays.pop();
-    if (kind) this.close(kind);
+    const state = history.state as { open?: number } | null;
+    const open = state?.open ?? 0;
+    do {
+      const kind = this.overlays.pop();
+      if (kind) this.close(kind);
+    } while (this.overlays.length > open);
   }
 
   /** Opens a note that was made outside the screen (shared from another app). */
@@ -289,9 +358,36 @@ class AppState {
     const id = await this.run(api.takePendingOpen);
     if (!id) return;
     await this.refresh();
+    this.dropTrail();
     this.view = { kind: 'all' };
     this.search = '';
     this.select(id);
+  }
+
+  /**
+   * Files dropped on the window outside the editor (M12, E5; the Mac's
+   * stand-in for a share extension): photos and text files become a new
+   * note, which then opens. The editor takes its own drops.
+   */
+  async dropFiles(files: File[]) {
+    const isPhoto = (f: File) => f.type.startsWith('image/') || /\.(heic|heif|avif)$/i.test(f.name);
+    const isText = (f: File) => f.type.startsWith('text/') || /\.(txt|md|markdown)$/i.test(f.name);
+    const photos = files.filter(isPhoto);
+    const texts = files.filter((f) => !isPhoto(f) && isText(f));
+    if (photos.length + texts.length === 0) {
+      this.notify('Drop photos or text files to make a note.');
+      return;
+    }
+    await this.run(async () => {
+      const staged: string[] = [];
+      for (const photo of photos) {
+        staged.push(await api.stageDropped(new Uint8Array(await photo.arrayBuffer())));
+      }
+      // At most 1 MB of each text file, as the Dock does.
+      const text = (await Promise.all(texts.map((t) => t.slice(0, 1 << 20).text()))).join('\n');
+      await api.dropIntoNote(text || null, staged);
+    });
+    // The engine asks the screen to open the new note (`open_note`).
   }
 
   /** Opens a note and puts the cursor in it. */
@@ -342,6 +438,58 @@ class AppState {
     await this.refresh();
   }
 
+  private searchSeq = 0;
+
+  /** Runs the full-text search for what's in the search field (M12, E5). */
+  async runSearch(query: string) {
+    const seq = ++this.searchSeq;
+    if (!query.trim()) {
+      this.hits = null;
+      return;
+    }
+    const found = await api.searchNotes(query).catch(() => null);
+    // A later keystroke's search wins.
+    if (seq !== this.searchSeq) return;
+    this.hits = found ? new Map(found.map((hit) => [hit.id, hit.snippet])) : null;
+  }
+
+  /** Deletes a note for good (M12), after the person confirmed. */
+  async deleteForGood(id: string) {
+    const next = this.neighbour(id);
+    await this.run(() => api.deleteNote(id));
+    if (this.selectedId === id) this.selectedId = next;
+    await this.refresh();
+  }
+
+  /** Deletes everything in Recently Deleted for good, after the person confirmed. */
+  async emptyTrash() {
+    const count = await this.run(api.emptyTrash);
+    if (count === undefined) return;
+    if (this.selectedTrashed) this.selectedId = null;
+    this.notify(count === 1 ? 'Deleted 1 note for good.' : `Deleted ${count} notes for good.`);
+    await this.refresh();
+  }
+
+  /** The confirmation for deleting a note for good, as a menu where the last one was. */
+  confirmDeleteForGood(note: NoteItem, x = this.lastMenuAt.x, y = this.lastMenuAt.y) {
+    this.openMenu(
+      [
+        {
+          label: `Delete “${note.title || 'New Note'}” for good? It leaves all your devices and can't be brought back.`,
+          section: true,
+        },
+        {
+          label: 'Delete Permanently',
+          danger: true,
+          action: () => void this.deleteForGood(note.id),
+        },
+        { label: 'Cancel' },
+      ],
+      x,
+      y,
+    );
+  }
+
   async setPinned(id: string, pinned: boolean) {
     await this.run(() => api.setPinned(id, pinned));
     await this.refresh();
@@ -352,10 +500,11 @@ class AppState {
     await this.refresh();
   }
 
-  async createFolder(name: string) {
-    const id = await this.run(() => api.createFolder(name));
+  async createFolder(name: string, parent: string | null = null) {
+    const id = await this.run(() => api.createFolder(name, parent));
     await this.refresh();
-    if (id) this.openView({ kind: 'folder', id });
+    // Steps into the new folder, one level down from where it was made.
+    if (id) this.enterFolder(id);
   }
 
   async renameFolder(id: string, name: string) {
@@ -363,26 +512,43 @@ class AppState {
     await this.refresh();
   }
 
-  async deleteFolder(id: string) {
-    await this.run(() => api.deleteFolder(id));
-    if (this.view.kind === 'folder' && this.view.id === id) this.openView({ kind: 'all' });
+  async moveFolder(id: string, parent: string | null) {
+    await this.run(() => api.moveFolder(id, parent));
     await this.refresh();
   }
 
+  async deleteFolder(id: string) {
+    await this.run(() => api.deleteFolder(id));
+    if (this.view.kind === 'folder' && this.view.id === id) this.folderUp();
+    await this.refresh();
+  }
+
+  /** Where the last menu opened, for a confirmation that follows it. */
+  private lastMenuAt = { x: 0, y: 0 };
+
   openMenu(items: MenuItem[], x: number, y: number) {
+    this.lastMenuAt = { x, y };
     this.menu = { items, x, y };
   }
 
   /** Opens a menu under a toolbar button. */
   openMenuUnder(items: MenuItem[], button: HTMLElement) {
     const rect = button.getBoundingClientRect();
-    this.menu = { items, x: rect.left, y: rect.bottom + 4 };
+    this.openMenu(items, rect.left, rect.bottom + 4);
   }
 
   /** What can be done to a note: from its row in the list or the note's ⋯ button. */
   noteActions(note: NoteItem): MenuItem[] {
     if (note.trashed) {
-      return [{ label: 'Restore', action: () => void this.restore(note.id) }];
+      return [
+        { label: 'Restore', action: () => void this.restore(note.id) },
+        { label: '', section: true },
+        {
+          label: 'Delete Permanently…',
+          danger: true,
+          action: () => this.confirmDeleteForGood(note),
+        },
+      ];
     }
     return [
       {
@@ -395,8 +561,9 @@ class AppState {
         checked: note.folder === null,
         action: () => void this.move(note.id, null),
       },
-      ...this.folders.map((folder) => ({
+      ...folderTree(this.folders).map(({ folder, depth }) => ({
         label: folder.name,
+        depth,
         checked: note.folder === folder.id,
         action: () => void this.move(note.id, folder.id),
       })),

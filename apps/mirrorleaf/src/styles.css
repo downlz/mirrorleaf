@@ -571,6 +571,47 @@ kbd {
   margin: 0 0 12px;
 }
 
+/* Inside a folder (M12, option A): the way back out. */
+.crumbs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 6px;
+  padding: 0 12px 6px;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+
+.crumbs button.link {
+  min-height: max(24px, calc(var(--tap) - 12px));
+  padding: 0;
+  font-weight: 600;
+}
+
+.crumbs b {
+  color: var(--text);
+  font-weight: 650;
+}
+
+/* Recently Deleted (E5): the 30-day rule, and emptying it. */
+.trash-line {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0 12px 10px;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+
+.trash-line button {
+  min-height: var(--tap);
+  color: var(--danger);
+}
+
+button.link.danger-link {
+  color: var(--danger);
+}
+
 /* The backup reminder (E9): the text, then its two answers. */
 .banner.with-actions {
   display: flex;
@@ -1092,6 +1133,10 @@ button.link.muted {
 .devices small {
   display: block;
   color: var(--muted);
+}
+
+.devices small.warn {
+  color: var(--danger);
 }
 
 .toggle {

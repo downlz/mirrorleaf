@@ -7,6 +7,8 @@
     checked?: boolean;
     /** A heading above the items that follow. */
     section?: boolean;
+    /** How far in to set the label: a folder's level in "Move to" (M12). */
+    depth?: number;
   }
 </script>
 
@@ -79,7 +81,9 @@
         disabled={item.disabled}
         onclick={() => choose(item)}
       >
-        <span class="menu-check">{item.checked ? '✓' : ''}</span>{item.label}
+        <span class="menu-check">{item.checked ? '✓' : ''}</span><span
+          style:padding-left={item.depth ? `${item.depth * 14}px` : undefined}>{item.label}</span
+        >
       </button>
     {/if}
   {/each}

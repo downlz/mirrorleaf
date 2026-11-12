@@ -127,7 +127,32 @@ pub async fn request_permissions(
     app: tauri::AppHandle,
     which: Vec<String>,
 ) -> Result<crate::device::Permissions> {
-    crate::device::request_permissions(&app, which).await
+    let before = crate::device::permissions(&app).await?;
+    let after = crate::device::request_permissions(&app, which).await?;
+    // Android applies a new nearby-devices permission only to sockets opened
+    // after it (M4 finding 1): start the network again (M12, E8).
+    if after.nearby && !before.nearby {
+        engine()?.restart_network().await.map_err(text)?;
+    }
+    Ok(after)
+}
+
+/// Battery restrictions, the phone's maker and "Seed while charging", for
+/// Settings on Android (M12, E8). `None` elsewhere.
+#[tauri::command]
+pub async fn battery(app: tauri::AppHandle) -> Result<Option<crate::device::Battery>> {
+    crate::device::battery(&app).await
+}
+
+/// Opens Android's own settings page for Mirrorleaf.
+#[tauri::command]
+pub async fn open_app_settings(app: tauri::AppHandle) -> Result<()> {
+    crate::device::open_app_settings(&app).await
+}
+
+#[tauri::command]
+pub async fn set_seeding(app: tauri::AppHandle, on: bool) -> Result<()> {
+    crate::device::set_seeding(&app, on).await
 }
 
 // --- The account's lifecycle (M10: E2, E3) ---
@@ -353,8 +378,16 @@ pub fn move_note(id: String, folder: Option<String>) -> Result<()> {
 }
 
 #[tauri::command]
-pub fn create_folder(name: String) -> Result<String> {
-    engine()?.create_folder(&name).map_err(text)
+pub fn create_folder(name: String, parent: Option<String>) -> Result<String> {
+    engine()?
+        .create_folder(&name, parent.as_deref())
+        .map_err(text)
+}
+
+/// Moves a folder into another, or to the top level (M12).
+#[tauri::command]
+pub fn move_folder(id: String, parent: Option<String>) -> Result<()> {
+    engine()?.move_folder(&id, parent.as_deref()).map_err(text)
 }
 
 #[tauri::command]
@@ -437,6 +470,60 @@ pub fn flush_edits() -> Result<()> {
 pub async fn import_photo(request: Request<'_>) -> Result<PhotoInfo> {
     let photo = bytes(&request)?;
     engine()?.import_photo(photo).await.map_err(text)
+}
+
+/// Notes matching every word of `query` in their title or text (M12, E5).
+/// Runs off the main thread: the first search after an update reads every
+/// note into the index once.
+#[tauri::command]
+pub async fn search_notes(query: String) -> Result<Vec<mirrorleaf_ffi::SearchResult>> {
+    let engine = engine()?;
+    tauri::async_runtime::spawn_blocking(move || engine.search_notes(&query))
+        .await
+        .map_err(text)?
+        .map_err(text)
+}
+
+/// Whether this device finds the account's devices on the same network
+/// without internet (M12, on by default).
+#[tauri::command]
+pub fn local_discovery() -> Result<bool> {
+    Ok(engine()?.local_discovery_on())
+}
+
+#[tauri::command]
+pub fn set_local_discovery(on: bool) -> Result<()> {
+    engine()?.set_local_discovery(on).map_err(text)
+}
+
+/// Deletes a note for good, on every device.
+#[tauri::command]
+pub fn delete_note(id: String) -> Result<()> {
+    engine()?.delete_note(&id).map_err(text)
+}
+
+/// Deletes every note in the trash for good. Returns how many.
+#[tauri::command]
+pub fn empty_trash() -> Result<u32> {
+    engine()?.empty_trash().map_err(text)
+}
+
+/// A photo dropped on the window outside the editor (M12): kept in the app's
+/// folder until `drop_into_note` takes it. Returns where.
+#[tauri::command]
+pub fn stage_dropped(request: Request<'_>) -> Result<String> {
+    crate::files::stage_dropped(&bytes(&request)?)
+}
+
+/// Makes a note from what was dropped on the window outside the editor: the
+/// text of dropped text files and the photos staged for it. The screen opens
+/// it (`open_note` event).
+#[tauri::command]
+pub async fn drop_into_note(text: Option<String>, photos: Vec<String>) -> Result<String> {
+    engine()?
+        .share_into_note(None, text, photos)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// The screen has sent its last edits after `will-close`: close its window.

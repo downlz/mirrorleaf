@@ -171,10 +171,26 @@ impl Replica {
     /// What to fetch from peers: every missing thumbnail, then the full images
     /// asked for.
     pub fn blobs_to_fetch(&self) -> Result<Vec<(BlobHash, BlobKind)>> {
+        self.blobs_to_fetch_with(false)
+    }
+
+    /// As [`Replica::blobs_to_fetch`], and with `every_full` every missing full
+    /// image too, after the ones asked for: the prefetch on Wi-Fi (M12, E5).
+    pub fn blobs_to_fetch_with(&self, every_full: bool) -> Result<Vec<(BlobHash, BlobKind)>> {
+        let rest = if every_full {
+            format!(
+                "UNION ALL
+                 SELECT full, 1 FROM photo_refs
+                 WHERE full NOT IN {HELD} AND full NOT IN (SELECT hash FROM blob_wants)"
+            )
+        } else {
+            String::new()
+        };
         let mut stmt = self.conn.prepare_cached(&format!(
             "SELECT thumb, 0 FROM photo_refs WHERE thumb NOT IN {HELD}
              UNION ALL
-             SELECT hash, 1 FROM blob_wants WHERE hash NOT IN {HELD}"
+             SELECT hash, 1 FROM blob_wants WHERE hash NOT IN {HELD}
+             {rest}"
         ))?;
         let rows = stmt.query_map([], |row| {
             let kind = match row.get::<_, i64>(1)? {

@@ -2,8 +2,13 @@ package app.mirrorleaf
 
 import android.Manifest
 import android.app.Activity
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
+import android.os.PowerManager
+import android.provider.Settings
+import java.util.Locale
 import androidx.activity.result.ActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
@@ -28,6 +33,11 @@ class RequestArgs {
  * use the local network, otherwise it goes over the internet (assessment risk #9). On Android
  * versions that don't have a permission, it counts as granted.
  */
+@InvokeArg
+class SeedArgs {
+    var on: Boolean = false
+}
+
 @TauriPlugin
 class PermissionsPlugin(private val activity: Activity) : Plugin(activity) {
     private val contract = ActivityResultContracts.RequestMultiplePermissions()
@@ -54,6 +64,38 @@ class PermissionsPlugin(private val activity: Activity) : Plugin(activity) {
     private fun answered(invoke: Invoke, @Suppress("UNUSED_PARAMETER") result: ActivityResult) {
         runCatching { MirrorleafApp.engine.setNotifications(Notifications.allowed(activity)) }
         invoke.resolve(state())
+    }
+
+    /**
+     * Whether Android lets Mirrorleaf run in the background without battery restrictions, the
+     * phone's maker (Settings shows the maker's own steps, M12, E8), and "Seed while charging".
+     * Reading the exemption needs no permission; asking for it would need one Play restricts.
+     */
+    @Command
+    fun battery(invoke: Invoke) {
+        val power = activity.getSystemService(PowerManager::class.java)
+        invoke.resolve(
+            JSObject()
+                .put("unrestricted", power.isIgnoringBatteryOptimizations(activity.packageName))
+                .put("maker", Build.MANUFACTURER.lowercase(Locale.ROOT))
+                .put("seeding", SeedWorker.isOn(activity)),
+        )
+    }
+
+    /** Opens Android's settings page for Mirrorleaf, where battery use can be changed. */
+    @Command
+    fun openAppSettings(invoke: Invoke) {
+        val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+            .setData(Uri.fromParts("package", activity.packageName, null))
+        activity.startActivity(intent)
+        invoke.resolve()
+    }
+
+    @Command
+    fun setSeeding(invoke: Invoke) {
+        val args = invoke.parseArgs(SeedArgs::class.java)
+        SeedWorker.schedule(activity, args.on)
+        invoke.resolve()
     }
 
     private fun state(): JSObject = JSObject()

@@ -1,6 +1,10 @@
 package app.mirrorleaf
 
 import android.app.Application
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.util.Log
 import androidx.lifecycle.DefaultLifecycleObserver
@@ -38,12 +42,41 @@ class MirrorleafApp : Application() {
         ProcessLifecycleOwner.get().lifecycle.addObserver(Visibility())
     }
 
+    /**
+     * Whether the network is unmetered (Wi-Fi), watched while the app is visible: full images are
+     * fetched ahead only then (M12, E5), never in a push-woken job or on mobile data.
+     */
+    private val network = object : ConnectivityManager.NetworkCallback() {
+        override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+            runCatching {
+                engine.setUnmetered(caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED))
+            }
+        }
+
+        override fun onLost(network: Network) {
+            runCatching { engine.setUnmetered(false) }
+        }
+    }
+
+    /**
+     * Android drops multicast packets unless an app holds this lock: finding devices on the same
+     * Wi-Fi with no internet (mDNS, M12) needs it, only while the app is visible.
+     */
+    private val multicast by lazy {
+        getSystemService(WifiManager::class.java).createMulticastLock("mirrorleaf-local").apply {
+            setReferenceCounted(false)
+        }
+    }
+
     /** Live sync while the app is visible; going offline when it isn't. */
     private inner class Visibility : DefaultLifecycleObserver {
         private val order = Mutex()
+        private val connectivity get() = getSystemService(ConnectivityManager::class.java)
 
         override fun onStart(owner: LifecycleOwner) {
             runCatching { engine.setNotifications(Notifications.allowed(this@MirrorleafApp)) }
+            runCatching { connectivity.registerDefaultNetworkCallback(network) }
+            runCatching { multicast.acquire() }
             scope.launch {
                 order.withLock {
                     runCatching { engine.goLive() }
@@ -53,6 +86,9 @@ class MirrorleafApp : Application() {
         }
 
         override fun onStop(owner: LifecycleOwner) {
+            runCatching { connectivity.unregisterNetworkCallback(network) }
+            runCatching { if (multicast.isHeld) multicast.release() }
+            runCatching { engine.setUnmetered(false) }
             scope.launch {
                 order.withLock {
                     runCatching { engine.goOffline() }

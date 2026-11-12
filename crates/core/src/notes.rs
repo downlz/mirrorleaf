@@ -12,12 +12,17 @@ use crate::replica::decode_update;
 use crate::{CoreError, PhotoRef, Replica, Result};
 
 /// The notebook index: one Yjs document mapping note ID → {title, trashed,
-/// updated, folder, pinned, preview} and folder ID → {name, deleted, created}
-/// (plan §5.1). Trashing and deleting are flags, never deletes, so a device that
-/// was offline can't bring a note or folder back.
+/// updated, folder, pinned, preview, deleted} and folder ID → {name, deleted,
+/// created} (plan §5.1). Trashing and deleting are flags, never deletes, so a
+/// device that was offline can't bring a note or folder back. A note deleted
+/// for good (M12) keeps only its flags: its title and preview are cleared, and
+/// its history goes with compaction (E11).
 pub const INDEX_DOC: &str = "index";
 const NOTES: &str = "notes";
-/// One level of folders (M5, owner's decision 4 Nov 2026).
+/// Folders, each with an optional `parent` folder (nested since M12; M5 had
+/// one level). A folder whose parent was deleted, or that ends up in a loop
+/// after two devices moved folders into each other offline, shows at the top
+/// level rather than vanishing.
 const FOLDERS: &str = "folders";
 
 /// An edit that changes neither a note's title nor its preview moves its
@@ -69,6 +74,8 @@ pub struct FolderMeta {
     pub id: String,
     pub name: String,
     pub created_ms: i64,
+    /// The folder holding this one, `None` at the top level (M12).
+    pub parent: Option<String>,
 }
 
 impl Replica {
@@ -138,7 +145,7 @@ impl Replica {
         let mut list: Vec<NoteMeta> = notes
             .iter(&txn)
             .filter_map(|(id, value)| match value {
-                Out::YMap(entry) => {
+                Out::YMap(entry) if !bool_field(&entry, &txn, "deleted") => {
                     let folder = string_field(&entry, &txn, "folder");
                     let live = folders.iter().any(|f| f.id == folder);
                     Some(NoteMeta {
@@ -166,19 +173,50 @@ impl Replica {
     }
 
     pub fn create_folder(&mut self, name: &str) -> Result<String> {
+        self.create_folder_in(name, None)
+    }
+
+    /// Creates a folder, inside `parent` if given (M12).
+    pub fn create_folder_in(&mut self, name: &str, parent: Option<&str>) -> Result<String> {
         let name = folder_name(name)?;
         let id = Uuid::now_v7().to_string();
         let created = now_ms();
         self.edit_doc(INDEX_DOC, |txn| {
+            if let Some(parent) = parent {
+                live_folder(txn, parent)?;
+            }
             let folders = txn.get_or_insert_map(FOLDERS);
             let entry = MapPrelim::from([
                 ("name", In::Any(Any::from(name))),
                 ("deleted", In::Any(Any::from(false))),
                 ("created", In::Any(Any::from(created as f64))),
+                ("parent", In::Any(Any::from(parent.unwrap_or("")))),
             ]);
             folders.insert(txn, id.as_str(), entry);
-        })?;
+            Ok::<_, CoreError>(())
+        })?
+        .0?;
         Ok(id)
+    }
+
+    /// Moves a folder into `parent`, or to the top level with `None`. A
+    /// folder can't go inside itself or one of its own folders.
+    pub fn move_folder(&mut self, id: &str, parent: Option<&str>) -> Result<()> {
+        self.edit_doc(INDEX_DOC, |txn| {
+            let entry = live_folder(txn, id)?;
+            if let Some(parent) = parent {
+                live_folder(txn, parent)?;
+                let tree = folder_entries(txn);
+                if parent == id || descendants(&tree, id).iter().any(|d| d == parent) {
+                    return Err(CoreError::Invalid(
+                        "a folder can't go inside itself or one of its folders".into(),
+                    ));
+                }
+            }
+            entry.insert(txn, "parent", parent.unwrap_or(""));
+            Ok(())
+        })?
+        .0
     }
 
     pub fn rename_folder(&mut self, id: &str, name: &str) -> Result<()> {
@@ -190,18 +228,26 @@ impl Replica {
         .0
     }
 
-    /// Deletes a folder and moves its notes to the trash, as Apple Notes does.
-    /// A note moved into the folder on another device meanwhile shows outside
-    /// any folder once the two devices sync.
+    /// Deletes a folder and the folders inside it, and moves their notes to
+    /// the trash, as Apple Notes does. A note moved into one of them on
+    /// another device meanwhile shows outside any folder once the two devices
+    /// sync.
     pub fn delete_folder(&mut self, id: &str) -> Result<()> {
         let updated = now_ms();
         self.edit_doc(INDEX_DOC, |txn| {
-            live_folder(txn, id)?.insert(txn, "deleted", true);
+            live_folder(txn, id)?;
+            let mut gone = descendants(&folder_entries(txn), id);
+            gone.push(id.to_owned());
+            for folder in &gone {
+                live_folder(txn, folder)?.insert(txn, "deleted", true);
+            }
             let notes = txn.get_or_insert_map(NOTES);
             let inside: Vec<MapRef> = notes
                 .iter(txn)
                 .filter_map(|(_, value)| match value {
-                    Out::YMap(entry) if string_field(&entry, txn, "folder") == id => Some(entry),
+                    Out::YMap(entry) if gone.contains(&string_field(&entry, txn, "folder")) => {
+                        Some(entry)
+                    }
                     _ => None,
                 })
                 .collect();
@@ -374,6 +420,50 @@ impl Replica {
         .0
     }
 
+    /// Deletes a note for good (M12, E5), from the trash or not: it leaves
+    /// every device's list and search. Its entry keeps only its flags, so a
+    /// device that was offline can't bring it back.
+    pub fn delete_note(&mut self, id: &str) -> Result<()> {
+        self.delete_notes(&[id.to_owned()]).map(drop)
+    }
+
+    /// Deletes these notes for good, in one change. Returns how many.
+    pub fn delete_notes(&mut self, ids: &[String]) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        self.edit_doc(INDEX_DOC, |txn| {
+            let mut deleted = 0;
+            for id in ids {
+                let Ok(entry) = note_entry(txn, id) else {
+                    continue;
+                };
+                entry.insert(txn, "deleted", true);
+                entry.insert(txn, "trashed", true);
+                entry.insert(txn, "title", "");
+                entry.insert(txn, "preview", "");
+                entry.insert(txn, "folder", "");
+                entry.insert(txn, "pinned", false);
+                deleted += 1;
+            }
+            Ok(deleted)
+        })?
+        .0
+    }
+
+    /// Deletes for good every note in the trash (Empty trash), or only those
+    /// trashed before `before_ms` (the 30-day purge). A trashed note's
+    /// `updated` time is when it was trashed. Returns how many.
+    pub fn purge_trash(&mut self, before_ms: Option<i64>) -> Result<usize> {
+        let ids: Vec<String> = self
+            .list_notes()?
+            .into_iter()
+            .filter(|n| n.trashed && before_ms.is_none_or(|before| n.updated_ms < before))
+            .map(|n| n.id)
+            .collect();
+        self.delete_notes(&ids)
+    }
+
     /// Pins or unpins a note. Leaves its `updated` time alone.
     pub fn set_pinned(&mut self, id: &str, pinned: bool) -> Result<()> {
         self.edit_doc(INDEX_DOC, |txn| {
@@ -443,10 +533,29 @@ impl Replica {
     }
 }
 
+/// Every folder inside `id`, at any depth.
+fn descendants(tree: &[FolderMeta], id: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut queue = vec![id.to_owned()];
+    while let Some(at) = queue.pop() {
+        for child in tree
+            .iter()
+            .filter(|f| f.parent.as_deref() == Some(at.as_str()))
+        {
+            if !found.contains(&child.id) && child.id != id {
+                found.push(child.id.clone());
+                queue.push(child.id.clone());
+            }
+        }
+    }
+    found
+}
+
+/// A note's entry, unless it doesn't exist or was deleted for good.
 fn note_entry(txn: &mut TransactionMut, id: &str) -> Result<MapRef> {
     let notes = txn.get_or_insert_map(NOTES);
     match notes.get(txn, id) {
-        Some(Out::YMap(entry)) => Ok(entry),
+        Some(Out::YMap(entry)) if !bool_field(&entry, txn, "deleted") => Ok(entry),
         _ => Err(CoreError::NoSuchNote(id.to_owned())),
     }
 }
@@ -471,10 +580,43 @@ fn folder_entries<T: ReadTxn>(txn: &T) -> Vec<FolderMeta> {
                 id: id.to_owned(),
                 name: string_field(&entry, txn, "name"),
                 created_ms: number_field(&entry, txn, "created"),
+                parent: Some(string_field(&entry, txn, "parent")).filter(|p| !p.is_empty()),
             }),
             _ => None,
         })
         .collect();
+    // A parent that was deleted, or a loop, puts the folder at the top level.
+    let stored: std::collections::HashMap<String, Option<String>> = list
+        .iter()
+        .map(|f| (f.id.clone(), f.parent.clone()))
+        .collect();
+    for folder in &mut list {
+        let Some(parent) = folder.parent.clone() else {
+            continue;
+        };
+        let mut seen = std::collections::HashSet::from([folder.id.clone()]);
+        let mut at = Some(parent);
+        let mut keep = true;
+        while let Some(current) = at {
+            match stored.get(&current) {
+                None => {
+                    // Its parent (or an ancestor) is gone: the folder is
+                    // under a live parent only if that parent itself lives.
+                    keep = current != *folder.parent.as_ref().unwrap() && keep;
+                    break;
+                }
+                Some(_) if !seen.insert(current.clone()) => {
+                    // Back where it started: a loop.
+                    keep = current != folder.id;
+                    break;
+                }
+                Some(next) => at = next.clone(),
+            }
+        }
+        if !keep {
+            folder.parent = None;
+        }
+    }
     list.sort_by(|a, b| {
         (a.name.to_lowercase(), a.created_ms, &a.id).cmp(&(
             b.name.to_lowercase(),
@@ -785,5 +927,127 @@ mod tests {
         assert!(replica.insert_text(&id, 3, 0, "x").is_err());
         assert!(replica.trash_note("no-such-note").is_err());
         assert_eq!(replica.change_count().unwrap(), before);
+    }
+
+    #[test]
+    fn notes_deleted_for_good_leave_the_list_and_stay_gone() {
+        let mut replica = Replica::open_in_memory(DeviceId([1; 32])).unwrap();
+        let kept = replica.create_note("Kept").unwrap();
+        let old = replica.create_note("Old").unwrap();
+        let recent = replica.create_note("Recent").unwrap();
+        replica.trash_note(&old).unwrap();
+        replica.trash_note(&recent).unwrap();
+        // The purge takes only notes trashed before its time.
+        let trashed_at = replica.find_note(&old).unwrap().updated_ms;
+        assert_eq!(replica.purge_trash(Some(trashed_at)).unwrap(), 0);
+        assert_eq!(replica.purge_trash(Some(trashed_at + 1)).unwrap(), 2);
+        let left: Vec<String> = replica
+            .list_notes()
+            .unwrap()
+            .into_iter()
+            .map(|n| n.id)
+            .collect();
+        assert_eq!(left, std::slice::from_ref(&kept));
+        // Gone for good: no edit, restore or second delete reaches it.
+        assert!(replica.restore_note(&old).is_err());
+        assert!(replica.set_title(&old, "Back").is_err());
+        assert!(replica.update_note_meta(&old, "Back", "").is_err());
+        assert_eq!(replica.delete_notes(std::slice::from_ref(&old)).unwrap(), 0);
+        // Deleting a note that isn't in the trash works too; empty trash with nothing in it does nothing.
+        replica.delete_note(&kept).unwrap();
+        assert!(replica.list_notes().unwrap().is_empty());
+        assert_eq!(replica.purge_trash(None).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_deletion_for_good_wins_over_an_offline_device_s_edit() {
+        let mut a = Replica::open_in_memory(DeviceId([1; 32])).unwrap();
+        let mut b = Replica::open_in_memory(DeviceId([2; 32])).unwrap();
+        let id = a.create_note("Shared").unwrap();
+        let all = VersionVector::default();
+        b.apply_remote(&a.changes_since(&all, 0, usize::MAX).unwrap().0)
+            .unwrap();
+        // A deletes it for good while B, offline, renames and restores it.
+        a.trash_note(&id).unwrap();
+        a.delete_note(&id).unwrap();
+        b.update_note_meta(&id, "Renamed offline", "still here")
+            .unwrap();
+        b.apply_remote(&a.changes_since(&all, 0, usize::MAX).unwrap().0)
+            .unwrap();
+        a.apply_remote(&b.changes_since(&all, 0, usize::MAX).unwrap().0)
+            .unwrap();
+        assert!(a.list_notes().unwrap().is_empty());
+        assert!(b.list_notes().unwrap().is_empty());
+    }
+
+    fn parent_of(replica: &Replica, id: &str) -> Option<String> {
+        replica
+            .list_folders()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.id == id)
+            .unwrap()
+            .parent
+    }
+
+    #[test]
+    fn folders_hold_folders_and_go_together() {
+        let mut replica = Replica::open_in_memory(DeviceId([1; 32])).unwrap();
+        let work = replica.create_folder("Work").unwrap();
+        let clients = replica.create_folder_in("Clients", Some(&work)).unwrap();
+        let acme = replica.create_folder_in("Acme", Some(&clients)).unwrap();
+        assert_eq!(
+            parent_of(&replica, &clients).as_deref(),
+            Some(work.as_str())
+        );
+        assert_eq!(parent_of(&replica, &work), None);
+        // Not inside itself or its own folders.
+        assert!(replica.move_folder(&work, Some(&acme)).is_err());
+        assert!(replica.move_folder(&work, Some(&work)).is_err());
+        replica.move_folder(&acme, None).unwrap();
+        assert_eq!(parent_of(&replica, &acme), None);
+        replica.move_folder(&acme, Some(&clients)).unwrap();
+
+        // Deleting Work deletes Clients and Acme, and trashes their notes.
+        let note = replica.create_note_in("Renewal", Some(&acme)).unwrap();
+        let elsewhere = replica.create_note("Groceries").unwrap();
+        replica.delete_folder(&work).unwrap();
+        assert!(replica.list_folders().unwrap().is_empty());
+        let notes = replica.list_notes().unwrap();
+        assert!(notes.iter().find(|n| n.id == note).unwrap().trashed);
+        assert!(!notes.iter().find(|n| n.id == elsewhere).unwrap().trashed);
+    }
+
+    #[test]
+    fn crossed_moves_and_deleted_parents_leave_folders_at_the_top() {
+        let all = VersionVector::default();
+        let sync = |from: &Replica, to: &mut Replica| {
+            to.apply_remote(&from.changes_since(&all, 0, usize::MAX).unwrap().0)
+                .unwrap();
+        };
+        let mut a = Replica::open_in_memory(DeviceId([1; 32])).unwrap();
+        let mut b = Replica::open_in_memory(DeviceId([2; 32])).unwrap();
+        let x = a.create_folder("X").unwrap();
+        let y = a.create_folder("Y").unwrap();
+        sync(&a, &mut b);
+        // Offline: A puts X in Y, B puts Y in X. Merged, it would be a loop.
+        a.move_folder(&x, Some(&y)).unwrap();
+        b.move_folder(&y, Some(&x)).unwrap();
+        sync(&a, &mut b);
+        sync(&b, &mut a);
+        for replica in [&a, &b] {
+            assert_eq!(parent_of(replica, &x), None);
+            assert_eq!(parent_of(replica, &y), None);
+        }
+        // Offline: A deletes Y while B makes Z inside it. Z shows at the top.
+        let a_y = y.clone();
+        a.move_folder(&x, None).unwrap();
+        sync(&a, &mut b);
+        let z = b.create_folder_in("Z", Some(&y)).unwrap();
+        a.delete_folder(&a_y).unwrap();
+        sync(&b, &mut a);
+        sync(&a, &mut b);
+        assert_eq!(parent_of(&a, &z), None);
+        assert_eq!(parent_of(&b, &z), None);
     }
 }

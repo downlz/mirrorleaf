@@ -66,6 +66,7 @@ pub fn run() {
             commands::set_pinned,
             commands::move_note,
             commands::create_folder,
+            commands::move_folder,
             commands::rename_folder,
             commands::delete_folder,
             commands::set_note_meta,
@@ -101,6 +102,16 @@ pub fn run() {
             commands::screen_left,
             commands::screen_returned,
             commands::unlock,
+            commands::search_notes,
+            commands::battery,
+            commands::open_app_settings,
+            commands::set_seeding,
+            commands::local_discovery,
+            commands::set_local_discovery,
+            commands::delete_note,
+            commands::empty_trash,
+            commands::stage_dropped,
+            commands::drop_into_note,
         ])
         .build(tauri::generate_context!())
         .expect("error while starting the Mirrorleaf app");

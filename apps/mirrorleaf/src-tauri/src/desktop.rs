@@ -137,6 +137,20 @@ pub fn on_run_event(app: &AppHandle, event: &RunEvent) {
             has_visible_windows: false,
             ..
         } => show_window(app),
+        // Files dropped on the Dock icon (or opened with Mirrorleaf) become a
+        // note (M12, E5: instead of a share extension).
+        #[cfg(target_os = "macos")]
+        RunEvent::Opened { urls } => {
+            let paths: Vec<_> = urls.iter().filter_map(|u| u.to_file_path().ok()).collect();
+            if !paths.is_empty() {
+                show_window(app);
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) = crate::files::note_from_paths(paths).await {
+                        tracing::warn!("couldn't make a note from the files: {e}");
+                    }
+                });
+            }
+        }
         _ => {}
     }
     let _ = app;

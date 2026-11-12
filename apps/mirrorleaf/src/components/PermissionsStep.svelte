@@ -39,3 +39,7 @@
   <button disabled={busy} onclick={ondone}>Not now</button>
 </div>
 <p class="hint">Android asks for each next. You can change them later in Settings.</p>
+<p class="hint">
+  While this {app.deviceWord} is locked and asleep, notes from your other devices may wait until you open
+  Mirrorleaf.
+</p>

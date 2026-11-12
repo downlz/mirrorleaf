@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The notification icon (M12, with E14): the logo's notepad and leaf as a white silhouette,
+     from icon-source/tray.svg (its vein cut-out left out: vector drawables have no masks). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="80"
+    android:viewportHeight="80">
+    <group android:translateX="-10" android:translateY="-10">
+        <path
+            android:pathData="M33,19 H67 Q73,19 73,25 V75 Q73,81 67,81 H33 Q27,81 27,75 V25 Q27,19 33,19 Z"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeWidth="6" />
+        <path
+            android:fillColor="#FFFFFFFF"
+            android:pathData="M27,25 Q27,19 33,19 H67 Q73,19 73,25 V30 H27 Z" />
+        <path
+            android:pathData="M47,69 L40,76"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeLineCap="round"
+            android:strokeWidth="6" />
+        <path
+            android:fillColor="#FFFFFFFF"
+            android:pathData="M47,69 A40,40 0 0,1 85,31 A40,40 0 0,1 47,69 Z" />
+    </group>
+</vector>

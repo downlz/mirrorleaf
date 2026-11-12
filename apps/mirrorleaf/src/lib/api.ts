@@ -11,6 +11,20 @@ export interface DeviceSummary {
   online: boolean | null;
   behind: number | null;
   connection: string | null;
+  /** When the ledger last heard from it (Unix seconds). */
+  last_seen: number | null;
+  /** It runs a version this one can't sync with (E6). */
+  needs_update: boolean;
+  /** It announces itself on the same network as this device (M12). */
+  on_this_network: boolean;
+}
+
+/** Android only (M12, E8): battery restrictions, the maker, and seeding. */
+export interface Battery {
+  unrestricted: boolean;
+  /** Build.MANUFACTURER, lower case: "samsung", "xiaomi", "motorola"… */
+  maker: string;
+  seeding: boolean;
 }
 
 export interface EngineStatus {
@@ -32,6 +46,10 @@ export interface EngineStatus {
   kit_used: boolean;
   /** Another device removed this one from the account (E3). */
   removed: boolean;
+  /** A device that runs a version this one can't sync with, by name (E6). */
+  update_needed: string | null;
+  /** Changes no other device is known to hold yet (E6). */
+  only_here: number;
 }
 
 /** The recovery kit waiting to be saved (E2). */
@@ -56,6 +74,8 @@ export interface NoteItem {
 export interface FolderItem {
   id: string;
   name: string;
+  /** The folder holding it; null at the top level (M12). */
+  parent: string | null;
 }
 
 export interface NoteList {
@@ -160,7 +180,9 @@ export const api = {
   restoreNote: (id: string) => invoke<void>('restore_note', { id }),
   setPinned: (id: string, pinned: boolean) => invoke<void>('set_pinned', { id, pinned }),
   moveNote: (id: string, folder: string | null) => invoke<void>('move_note', { id, folder }),
-  createFolder: (name: string) => invoke<string>('create_folder', { name }),
+  createFolder: (name: string, parent: string | null = null) =>
+    invoke<string>('create_folder', { name, parent }),
+  moveFolder: (id: string, parent: string | null) => invoke<void>('move_folder', { id, parent }),
   renameFolder: (id: string, name: string) => invoke<void>('rename_folder', { id, name }),
   deleteFolder: (id: string) => invoke<void>('delete_folder', { id }),
   setNoteMeta: (id: string, title: string, preview: string) =>
@@ -203,6 +225,26 @@ export const api = {
   screenReturned: () => invoke<boolean>('screen_returned'),
   /** The device's own unlock; true once unlocked. */
   unlock: () => invoke<boolean>('unlock'),
+  // Finding devices on the same network, the phone's battery (M12).
+  localDiscovery: () => invoke<boolean>('local_discovery'),
+  setLocalDiscovery: (on: boolean) => invoke<void>('set_local_discovery', { on }),
+  /** Android's battery state; null on a desktop. */
+  battery: () => invoke<Battery | null>('battery'),
+  openAppSettings: () => invoke<void>('open_app_settings'),
+  setSeeding: (on: boolean) => invoke<void>('set_seeding', { on }),
+  // Everyday features (M12, E5).
+  /** Notes matching every word in their title or text; snippets mark matches with \u0002 and \u0003. */
+  searchNotes: (query: string) =>
+    invoke<{ id: string; snippet: string }[]>('search_notes', { query }),
+  /** Deletes a note for good, on every device. */
+  deleteNote: (id: string) => invoke<void>('delete_note', { id }),
+  /** Deletes every note in the trash for good; returns how many. */
+  emptyTrash: () => invoke<number>('empty_trash'),
+  // Files dropped on the window outside the editor (M12): photos are staged
+  // one by one (raw bytes), then the note is made.
+  stageDropped: (bytes: Uint8Array) => invoke<string>('stage_dropped', bytes),
+  dropIntoNote: (text: string | null, photos: string[]) =>
+    invoke<string>('drop_into_note', { text, photos }),
 };
 
 export function onEngineEvent(handler: (event: EngineEvent) => void): Promise<UnlistenFn> {

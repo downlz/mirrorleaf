@@ -177,6 +177,83 @@ pub fn forget_backup(path: &str) {
     let _ = path;
 }
 
+// --- Files dropped on the window or the Dock icon (M12, E5) ---
+
+/// Most of a dropped text file Mirrorleaf takes into a note.
+#[cfg(target_os = "macos")]
+const DROPPED_TEXT_LIMIT: u64 = 1 << 20;
+
+/// Whether a file is a photo Mirrorleaf can take, by its name.
+#[cfg(target_os = "macos")]
+pub fn is_photo_name(name: &str) -> bool {
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
+    matches!(
+        ext.as_deref(),
+        Some(
+            "jpg"
+                | "jpeg"
+                | "png"
+                | "heic"
+                | "heif"
+                | "gif"
+                | "webp"
+                | "tif"
+                | "tiff"
+                | "bmp"
+                | "avif"
+        )
+    )
+}
+
+/// Keeps a copy of a dropped photo in the app's own folder, for
+/// `share_into_note`, which reads and then deletes the copies it is given.
+pub fn stage_dropped(bytes: &[u8]) -> Result<String, String> {
+    let engine = engine()?;
+    let path =
+        std::path::Path::new(&engine.data_dir()).join(format!("dropped-{:016x}", rand_suffix()));
+    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+fn rand_suffix() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    nanos ^ u64::from(std::process::id()).rotate_left(32)
+}
+
+/// Makes a note from files dropped on the Dock icon: photos by copy (the
+/// originals stay where they are), text files read. The screen opens it.
+#[cfg(target_os = "macos")]
+pub async fn note_from_paths(paths: Vec<std::path::PathBuf>) -> Result<(), String> {
+    use std::io::Read;
+    let engine = engine()?;
+    let mut text = Vec::new();
+    let mut photos = Vec::new();
+    for path in paths {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+        let Some(name) = name else { continue };
+        if is_photo_name(&name) {
+            let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+            photos.push(stage_dropped(&bytes)?);
+        } else {
+            let mut read = String::new();
+            std::fs::File::open(&path)
+                .and_then(|f| f.take(DROPPED_TEXT_LIMIT).read_to_string(&mut read))
+                .map_err(|e| format!("can't read {name}: {e}"))?;
+            text.push(read);
+        }
+    }
+    let text = (!text.is_empty()).then(|| text.join("\n"));
+    engine
+        .share_into_note(None, text, photos)
+        .await
+        .map(drop)
+        .map_err(|e| e.to_string())
+}
+
 /// Starts the app again, in a new process.
 pub async fn restart<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     #[cfg(desktop)]

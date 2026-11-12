@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -10,19 +10,20 @@ use mirrorleaf_net::device::{self, DeviceDir, device_of};
 use mirrorleaf_net::ledger::{DeviceProfile, Fallback, ONLINE_FOR_SECS};
 use mirrorleaf_net::{
     Account, Event, Network, PathKind, PhotoStore, SecretKey, State, SyncNode, describe,
-    endpoint_addr,
 };
 use mirrorleaf_proto::DeviceId;
 use mirrorleaf_proto::ledger::{Platform, StatusResponse};
 use tokio::runtime::Runtime;
 use tracing::{info, warn};
 
+mod library;
 mod lifecycle;
 mod native;
 mod pairing;
 mod protection;
 mod screen;
 
+pub use library::SearchResult;
 pub use lifecycle::KitView;
 pub use native::{DecodedPixels, PhotoDecoder};
 pub use pairing::{Invitation, PairingStatus};
@@ -32,6 +33,12 @@ pub use screen::{FolderItem, NoteItem, NoteList, PhotoInfo, UiEvent};
 
 /// How long one dial may take before the device counts as unreachable.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
+/// The longest live sync waits for the network endpoint to close gracefully.
+const CLOSE_WAIT: Duration = Duration::from_secs(2);
+/// How often live sync wakes when nothing nudges it (M12, E7): to redial
+/// devices, retry photos and report to the ledger. Local edits and arriving
+/// changes nudge it at once.
+const LIVE_TICK: Duration = Duration::from_secs(10);
 /// How long a push-woken job counts as online, so the devices it dials can
 /// answer it; it reports going offline again when it finishes.
 const JOB_ONLINE_SECS: u32 = 60;
@@ -85,6 +92,13 @@ pub struct DeviceSummary {
     pub behind: Option<u64>,
     /// How live sync is connected to it right now ("direct" or "relay"), if it is.
     pub connection: Option<String>,
+    /// When the ledger last heard from it (Unix seconds, to the minute).
+    pub last_seen: Option<i64>,
+    /// It was refused for running a version with no sync protocol in common
+    /// with this one: one of the two needs updating (E6).
+    pub needs_update: bool,
+    /// It announces itself on the same network as this device (mDNS, M12).
+    pub on_this_network: bool,
 }
 
 #[derive(Clone, Debug, serde::Serialize, uniffi::Record)]
@@ -109,6 +123,10 @@ pub struct EngineStatus {
     pub kit_used: bool,
     /// Another device removed this one from the account (E3).
     pub removed: bool,
+    /// A device that runs a version this one can't sync with, by name (E6).
+    pub update_needed: Option<String>,
+    /// Changes no other device is known to hold yet (E6).
+    pub only_here: u64,
 }
 
 /// What one push-woken sync did.
@@ -147,8 +165,9 @@ pub struct Engine {
     /// the life of the process (ADR-005): reopening it for every job leaked a
     /// thread each time.
     photos: tokio::sync::OnceCell<PhotoStore>,
-    /// The bound node, for the few places that can't wait for `slot`.
-    node: Mutex<Option<SyncNode>>,
+    /// The bound node, for the few places that can't wait for `slot`, and
+    /// for the database to nudge after each local change (M12).
+    node: Arc<Mutex<Option<SyncNode>>>,
     live: AtomicBool,
     /// The ledger's last answer: who is online and how far behind.
     last_status: Mutex<Option<StatusResponse>>,
@@ -156,6 +175,9 @@ pub struct Engine {
     fallback: Mutex<Option<Fallback>>,
     /// The devices live sync is connected to, and how.
     connected: Mutex<HashMap<DeviceId, PathKind>>,
+    /// Devices last refused for running a version with no sync protocol in
+    /// common with this one, until they connect (M12, E6).
+    mismatched: Mutex<HashSet<DeviceId>>,
     /// The editor's updates, waiting to become one change per note (plan §5.2).
     batcher: Mutex<Batcher>,
     /// Whether a task is waiting to flush the batcher.
@@ -172,6 +194,15 @@ pub struct Engine {
     pairing: Mutex<pairing::Pairing>,
     /// Whether the screen is locked (M11, E4).
     lock: Mutex<protection::LockState>,
+    /// When the trash was last purged of notes over 30 days old (M12).
+    last_purge: Mutex<Option<Instant>>,
+    /// Whether full images may be fetched ahead (M12): always on a desktop;
+    /// on Android, while on an unmetered network.
+    unmetered: AtomicBool,
+    /// The app asked for live sync (in the foreground, or the Mac agent).
+    wants_live: AtomicBool,
+    /// Android's charging-and-Wi-Fi job is keeping live sync running (M12, E8).
+    seeding: AtomicBool,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -222,7 +253,12 @@ impl Engine {
                 .and_then(|s| s.devices.iter().find(|d| d.device == id).cloned())
         };
         let connected = lock(&self.connected).clone();
-        let devices = account
+        let mismatched = lock(&self.mismatched).clone();
+        let nearby: HashSet<DeviceId> = lock(&self.node)
+            .as_ref()
+            .map(|n| n.on_this_network().into_iter().collect())
+            .unwrap_or_default();
+        let devices: Vec<DeviceSummary> = account
             .as_ref()
             .map(|account| {
                 account
@@ -243,6 +279,9 @@ impl Engine {
                         online: row(d.id).map(|r| r.online),
                         behind: row(d.id).map(|r| r.behind),
                         connection: connected.get(&d.id).map(ToString::to_string),
+                        last_seen: row(d.id).map(|r| r.last_seen),
+                        needs_update: mismatched.contains(&d.id),
+                        on_this_network: nearby.contains(&d.id),
                     })
                     .collect()
             })
@@ -253,6 +292,11 @@ impl Engine {
         let kit_used = Account::kit_used(&replica)?;
         let kit_made_at = account.as_ref().and_then(|a| a.devices.kit_made_at());
         let removed = account.as_ref().is_some_and(|a| a.removed(&me));
+        let update_needed = devices
+            .iter()
+            .find(|d| d.needs_update)
+            .map(|d| d.name.clone());
+        let only_here = self.only_here_count(&replica, account.as_ref(), me);
         Ok(EngineStatus {
             device_id: me.to_string(),
             device_name: device::device_name(&replica)?,
@@ -268,6 +312,8 @@ impl Engine {
             kit_pending,
             kit_used,
             removed,
+            update_needed,
+            only_here,
         })
     }
 
@@ -308,6 +354,7 @@ impl Engine {
     /// be reached and keep syncing, and if this device is behind, ask the
     /// ledger to wake the device holding its changes (plan §5.9).
     pub async fn go_live(self: Arc<Self>) -> Result<(), EngineError> {
+        self.wants_live.store(true, Ordering::Release);
         let this = self.clone();
         self.on_runtime(async move { this.start_live().await })
             .await
@@ -316,8 +363,32 @@ impl Engine {
     /// The app went to the background: let the last edits go out, tell the
     /// ledger this device is going offline, and stop syncing.
     pub async fn go_offline(self: Arc<Self>) -> Result<(), EngineError> {
+        self.wants_live.store(false, Ordering::Release);
+        if self.seeding.load(Ordering::Acquire) {
+            // The charging job keeps syncing; it stops live sync when it ends.
+            let _ = self.flush_edits();
+            return Ok(());
+        }
         let this = self.clone();
         self.on_runtime(async move { this.stop_live().await }).await
+    }
+
+    /// Keeps live sync running while the phone charges on Wi-Fi, for Android's
+    /// background job ("Seed while charging", M12, E8), or lets it stop.
+    /// Live sync stops only when neither the app nor the job wants it.
+    pub async fn set_seeding(self: Arc<Self>, on: bool) -> Result<(), EngineError> {
+        self.seeding.store(on, Ordering::Release);
+        let this = self.clone();
+        self.on_runtime(async move {
+            if on {
+                this.start_live().await
+            } else if !this.wants_live.load(Ordering::Acquire) {
+                this.stop_live().await
+            } else {
+                Ok(())
+            }
+        })
+        .await
     }
 
     /// The name of the device to show in "Open Mirrorleaf on <name> to sync",
@@ -345,7 +416,16 @@ impl Engine {
 
 impl Engine {
     fn start(dir: DeviceDir, device_name: &str) -> anyhow::Result<Self> {
-        let (secret, replica) = dir.open_or_init(device_name)?;
+        let (secret, mut replica) = dir.open_or_init(device_name)?;
+        // Live sync wakes on the screen's own edits instead of polling the
+        // database every second (E7).
+        let node: Arc<Mutex<Option<SyncNode>>> = Arc::default();
+        let bound = node.clone();
+        replica.on_local_change(move || {
+            if let Some(node) = lock(&bound).as_ref() {
+                node.nudge();
+            }
+        });
         // Two workers are plenty for one device's sync, and keep the push-woken
         // job small (plan §7.3: Android background job ≤ 50 MB).
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -361,11 +441,12 @@ impl Engine {
             runtime,
             slot: tokio::sync::Mutex::default(),
             photos: tokio::sync::OnceCell::new(),
-            node: Mutex::default(),
+            node,
             live: AtomicBool::new(false),
             last_status: Mutex::default(),
             fallback: Mutex::default(),
             connected: Mutex::default(),
+            mismatched: Mutex::default(),
             batcher: Mutex::new(Batcher::new(BATCH_WINDOW)),
             flushing: AtomicBool::new(false),
             editor: Mutex::default(),
@@ -374,6 +455,10 @@ impl Engine {
             pending_open: Mutex::default(),
             pairing: Mutex::default(),
             lock: Mutex::default(),
+            last_purge: Mutex::default(),
+            unmetered: AtomicBool::new(!cfg!(target_os = "android")),
+            wants_live: AtomicBool::new(false),
+            seeding: AtomicBool::new(false),
         };
         engine.note_first_open()?;
         Ok(engine)
@@ -428,7 +513,19 @@ impl Engine {
         }
         if let Some(node) = slot.node.take() {
             *lock(&self.node) = None;
-            node.close().await;
+            // A graceful close waits for every connection's goodbye, which on a
+            // phone going to the background took up to 16 s (M12) and ran into
+            // Android freezing the app. Past CLOSE_WAIT, the other devices see
+            // the connection time out instead, and redial as usual.
+            if tokio::time::timeout(CLOSE_WAIT, node.close())
+                .await
+                .is_err()
+            {
+                info!(
+                    "closing the network endpoint took over {} s: left to finish",
+                    CLOSE_WAIT.as_secs()
+                );
+            }
         }
     }
 
@@ -544,7 +641,7 @@ impl Engine {
 
         let mut summary = SyncSummary::default();
         for (peer, _) in targets {
-            let dialled = tokio::time::timeout(DIAL_TIMEOUT, node.sync_once(endpoint_addr(peer)?));
+            let dialled = tokio::time::timeout(DIAL_TIMEOUT, node.sync_once(node.dial_addr(peer)?));
             match dialled.await {
                 Ok(Ok((path, report))) => {
                     summary.reached.push(format!("{} ({path})", name(&peer)));
@@ -554,9 +651,11 @@ impl Engine {
                         warn!("photos from {}: {}", name(&peer), describe(&e));
                     }
                 }
-                Ok(Err(e)) => summary
-                    .failed
-                    .push(format!("{}: {}", name(&peer), describe(&e))),
+                Ok(Err(e)) => {
+                    let error = describe(&e);
+                    self.note_failure(peer, &error);
+                    summary.failed.push(format!("{}: {error}", name(&peer)));
+                }
                 Err(_) => summary
                     .failed
                     .push(format!("{}: not reachable", name(&peer))),
@@ -572,6 +671,9 @@ impl Engine {
                 return Ok(());
             }
             let node = self.bind(&mut slot).await?;
+            node.set_tick(LIVE_TICK);
+            node.set_prefetch(self.unmetered.load(Ordering::Acquire));
+            node.set_local_discovery(self.local_discovery_on());
             let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
             let (watcher, this) = (node.clone(), self.clone());
             slot.live = Some(tokio::spawn(async move {
@@ -618,15 +720,24 @@ impl Engine {
         while started.elapsed() < FLUSH && !self.all_sent() {
             tokio::time::sleep(SENT_CHECK).await;
         }
+        let sent_at = started.elapsed();
         task.abort();
         self.live.store(false, Ordering::Release);
         lock(&self.connected).clear();
         self.notify(UiEvent::StatusChanged);
         if let Some(node) = &slot.node {
+            node.set_local_discovery(false);
             report_offline(node).await;
         }
+        let reported_at = started.elapsed();
         self.release_if_idle(&mut slot).await;
-        info!("live sync stopped in {} ms", started.elapsed().as_millis());
+        info!(
+            "live sync stopped in {} ms (sending {} ms, ledger {} ms, closing {} ms)",
+            started.elapsed().as_millis(),
+            sent_at.as_millis(),
+            (reported_at - sent_at).as_millis(),
+            (started.elapsed() - reported_at).as_millis()
+        );
         Ok(())
     }
 
@@ -684,11 +795,40 @@ impl Engine {
         }
     }
 
+    /// Changes this device holds that no other device is known to hold.
+    fn only_here_count(&self, replica: &Replica, account: Option<&Account>, me: DeviceId) -> u64 {
+        let Some(account) = account else {
+            return 0;
+        };
+        let others: Vec<DeviceId> = account
+            .devices
+            .list
+            .devices
+            .iter()
+            .map(|d| d.id)
+            .filter(|d| *d != me)
+            .collect();
+        if others.is_empty() {
+            return 0;
+        }
+        replica.only_here(&others).unwrap_or(0)
+    }
+
+    /// Remembers a device refused for a version with no protocol in common,
+    /// so the screen can say which one to update.
+    fn note_failure(&self, peer: DeviceId, error: &str) {
+        if mirrorleaf_net::version_mismatch(error) && lock(&self.mismatched).insert(peer) {
+            info!("{} runs a version this one can't sync with", peer.short());
+            self.notify(UiEvent::StatusChanged);
+        }
+    }
+
     fn on_event(&self, event: Event) {
         match event {
             Event::Connected { peer, path, .. } => {
                 info!("connected to {} via {path}", peer.short());
                 lock(&self.connected).insert(peer, path);
+                lock(&self.mismatched).remove(&peer);
                 self.notify(UiEvent::StatusChanged);
             }
             Event::Disconnected { peer } => {
@@ -715,7 +855,10 @@ impl Engine {
                 hash: report.hash.to_string(),
             }),
             Event::Failed { peer, error } => {
-                info!("{}: {error}", peer.map_or("incoming".into(), |p| p.short()))
+                info!("{}: {error}", peer.map_or("incoming".into(), |p| p.short()));
+                if let Some(peer) = peer {
+                    self.note_failure(peer, &error);
+                }
             }
             Event::LedgerReported { response } => {
                 *lock(&self.last_status) = Some(response);

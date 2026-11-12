@@ -3,6 +3,7 @@
   import {
     api,
     type DeviceSummary,
+    type Battery,
     type LockSettings,
     type Permissions,
     type PickedBackup,
@@ -11,6 +12,8 @@
   import AddDevice from './AddDevice.svelte';
   import Icon from './Icon.svelte';
   import RestoreBackup from './RestoreBackup.svelte';
+  import { lastSeen } from '../lib/dates';
+  import { batterySteps } from '../lib/battery';
   import SyncStatus from './SyncStatus.svelte';
 
   let ledgerUrl = $state('');
@@ -26,6 +29,25 @@
   let picked = $state<PickedBackup | null>(null);
   /** The app lock (E4). */
   let lockSettings = $state<LockSettings | null>(null);
+  /** Finding devices on the same network without internet (M12). */
+  let localDiscovery = $state<boolean | null>(null);
+  /** Android's battery restrictions and seeding (M12, E8). */
+  let battery = $state<Battery | null>(null);
+
+  /** A device seen on this network but reached only through the relay. */
+  const blockedNearby = $derived(
+    app.status?.devices.find((d) => d.on_this_network && d.connection === 'relay') ?? null,
+  );
+
+  async function setLocalDiscovery(on: boolean) {
+    await app.run(() => api.setLocalDiscovery(on));
+    localDiscovery = (await app.run(api.localDiscovery)) ?? localDiscovery;
+  }
+
+  async function setSeeding(on: boolean) {
+    await app.run(() => api.setSeeding(on));
+    battery = (await app.run(api.battery)) ?? battery;
+  }
 
   const LOCK_AFTER = [
     { minutes: 0, label: 'Immediately' },
@@ -140,6 +162,8 @@
     if (app.status?.account) lockSettings = (await app.run(api.lockSettings)) ?? null;
     if (app.isDesktop) autostart = (await app.run(api.autostart)) ?? null;
     if (app.platform === 'android') permissions = (await app.run(api.permissions)) ?? null;
+    if (app.status?.account) localDiscovery = (await app.run(api.localDiscovery)) ?? null;
+    if (app.platform === 'android') battery = (await app.run(api.battery)) ?? null;
   });
 
   async function act(action: () => Promise<string>) {
@@ -284,15 +308,21 @@
                 <Icon name="device" size={18} />
                 <span class="grow">
                   {device.name}{device.this_device ? ' (this device)' : ''}
-                  <small>
+                  <small class:warn={device.needs_update}>
                     {#if device.this_device}
                       {status.live ? 'syncing' : 'sync paused'}
+                    {:else if device.needs_update}
+                      a different version: update both to sync
                     {:else if device.connection}
-                      connected, {device.connection}
+                      connected{device.connection === 'relay'
+                        ? ' through the relay'
+                        : `, ${device.connection}`}
                     {:else if device.online !== null}
-                      {device.online ? 'online' : 'offline'}{device.behind
-                        ? `, ${device.behind} changes behind`
-                        : ''}
+                      {device.online
+                        ? 'online'
+                        : device.last_seen
+                          ? `offline, last seen ${lastSeen(device.last_seen)}`
+                          : 'offline'}{device.behind ? `, ${device.behind} changes behind` : ''}
                     {:else}
                       not connected
                     {/if}
@@ -304,6 +334,43 @@
               </li>
             {/each}
           </ul>
+          {#if blockedNearby}
+            <p class="error">
+              {blockedNearby.name} is on this network, but this {app.deviceWord} reaches it only through
+              the relay.
+              {app.platform === 'android'
+                ? 'In Android’s settings for Mirrorleaf, turn Nearby devices off and on again.'
+                : app.platform === 'macos'
+                  ? 'Allow Mirrorleaf in System Settings → Privacy & Security → Local Network.'
+                  : 'A firewall may be blocking the local network.'}
+            </p>
+          {:else if status.devices.some((d) => d.connection === 'relay')}
+            <p class="hint">
+              Through the relay: your devices couldn't connect directly, so sync passes through a
+              relay that can't read it. A VPN on either device often causes this.
+            </p>
+          {/if}
+          {#if localDiscovery !== null}
+            <label class="toggle">
+              <input
+                id="local-discovery"
+                type="checkbox"
+                checked={localDiscovery}
+                onchange={(e) => setLocalDiscovery(e.currentTarget.checked)}
+              />
+              <span>Find my devices on this Wi-Fi without internet</span>
+            </label>
+            <p class="hint">
+              While Mirrorleaf is open, this {app.deviceWord} tells other devices on the same network
+              that it's here, so your devices sync even when the internet is down.
+            </p>
+          {/if}
+          {#if status.only_here > 0}
+            <p class="hint">
+              {status.only_here === 1 ? '1 change is' : `${status.only_here} changes are`} only on this
+              {app.deviceWord} so far.
+            </p>
+          {/if}
         {/if}
         {#if note}<p class="result">{note}</p>{/if}
       </section>
@@ -413,10 +480,10 @@
         </section>
       {/if}
 
-      {#if permissions && (!permissions.notifications || !permissions.nearby)}
+      {#if (permissions && (!permissions.notifications || !permissions.nearby)) || battery}
         <section>
           <h2>This {app.deviceWord}</h2>
-          {#if !permissions.notifications}
+          {#if permissions && !permissions.notifications}
             <div class="permission-row">
               <span class="grow">
                 <b>Notifications are off</b>
@@ -425,7 +492,7 @@
               <button onclick={() => allow('notifications')}>Allow</button>
             </div>
           {/if}
-          {#if !permissions.nearby}
+          {#if permissions && !permissions.nearby}
             <div class="permission-row">
               <span class="grow">
                 <b>Nearby devices are off</b>
@@ -433,6 +500,37 @@
               </span>
               <button onclick={() => allow('nearby')}>Allow</button>
             </div>
+          {/if}
+          {#if battery}
+            <!-- E8: the maker's battery saver can stop background sync. -->
+            {#if battery.unrestricted}
+              <p class="hint">Android lets Mirrorleaf sync in the background without limits.</p>
+            {:else}
+              <div class="permission-row">
+                <span class="grow">
+                  <b>Background sync may be held back</b>
+                  <small>
+                    To let your other devices wake this {app.deviceWord}, usually: {batterySteps(
+                      battery.maker,
+                    )}
+                  </small>
+                </span>
+                <button onclick={() => void app.run(api.openAppSettings)}>Open</button>
+              </div>
+            {/if}
+            <label class="toggle">
+              <input
+                id="seed-while-charging"
+                type="checkbox"
+                checked={battery.seeding}
+                onchange={(e) => setSeeding(e.currentTarget.checked)}
+              />
+              <span>Keep syncing while charging on Wi-Fi</span>
+            </label>
+            <p class="hint">
+              While this {app.deviceWord} charges on Wi-Fi, it stays reachable for a few minutes at a
+              time, so your other devices can catch up from it.
+            </p>
           {/if}
         </section>
       {/if}

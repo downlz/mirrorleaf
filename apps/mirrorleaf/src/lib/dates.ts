@@ -32,3 +32,18 @@ export function noteDate(ms: number): string {
   if (!ms) return '';
   return `${short.format(ms)} · ${time.format(ms)}`;
 }
+
+const dayMonth = new Intl.DateTimeFormat('en-GB', { day: 'numeric', month: 'long' });
+
+/** When a device was last seen (E6): "just now", "12 minutes ago", "today at 09:05",
+ *  "yesterday at 21:40", else "4 November". `seconds` is Unix time. */
+export function lastSeen(seconds: number, now = Date.now()): string {
+  const ms = seconds * 1000;
+  const minutes = Math.floor((now - ms) / 60000);
+  if (minutes < 2) return 'just now';
+  if (minutes < 60) return `${minutes} minutes ago`;
+  const days = Math.round((startOfDay(now) - startOfDay(ms)) / DAY);
+  if (days <= 0) return `today at ${time.format(ms)}`;
+  if (days === 1) return `yesterday at ${time.format(ms)}`;
+  return dayMonth.format(ms);
+}
