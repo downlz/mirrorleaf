@@ -496,6 +496,36 @@ pub fn set_local_discovery(on: bool) -> Result<()> {
     engine()?.set_local_discovery(on).map_err(text)
 }
 
+/// The app's version, from `tauri.conf.json`, for Settings → About.
+#[tauri::command]
+pub fn app_version(app: tauri::AppHandle) -> String {
+    app.package_info().version.to_string()
+}
+
+/// Whether this device shares the beta's anonymous daily counts (M13, E12;
+/// on by default).
+#[tauri::command]
+pub fn share_stats() -> Result<bool> {
+    Ok(engine()?.share_stats())
+}
+
+#[tauri::command]
+pub fn set_share_stats(on: bool) -> Result<()> {
+    engine()?.set_share_stats(on).map_err(text)
+}
+
+/// Whether the account chose "Devices only" (M13): the ledger keeps only
+/// the devices' IDs, for the relay.
+#[tauri::command]
+pub fn devices_only() -> Result<bool> {
+    engine()?.devices_only().map_err(text)
+}
+
+#[tauri::command]
+pub async fn set_devices_only(on: bool) -> Result<()> {
+    engine()?.set_devices_only(on).await.map_err(text)
+}
+
 /// Deletes a note for good, on every device.
 #[tauri::command]
 pub fn delete_note(id: String) -> Result<()> {

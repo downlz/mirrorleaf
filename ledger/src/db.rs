@@ -21,6 +21,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
     (1, include_str!("../migrations/0001_init.sql")),
     (2, include_str!("../migrations/0002_pairing.sql")),
     (3, include_str!("../migrations/0003_account_moves.sql")),
+    (4, include_str!("../migrations/0004_public.sql")),
 ];
 
 /// The highest pairing number handed out. Numbers are reused once free, so
@@ -33,6 +34,9 @@ const MIGRATION_LOCK: i64 = 0x6d6c_6c65_6467;
 
 /// Days after which a device that hasn't been seen is pruned (assessment §7).
 pub const PRUNE_AFTER_SECS: i64 = 90 * 24 * 3600;
+/// Days after which an account that was created but never used is deleted
+/// (owner, 12 Nov 2026).
+pub const UNUSED_AFTER_SECS: i64 = 7 * 24 * 3600;
 
 pub async fn migrate(pool: &PgPool) -> Result<()> {
     let mut tx = pool.begin().await?;
@@ -96,7 +100,7 @@ pub async fn create_account(
     now: i64,
 ) -> Result<()> {
     query(
-        "INSERT INTO accounts (account_id, created_at) VALUES ($1, $2)
+        "INSERT INTO accounts (account_id, created_at, used) VALUES ($1, $2, FALSE)
          ON CONFLICT (account_id) DO NOTHING",
     )
     .bind(&account.0[..])
@@ -175,6 +179,8 @@ pub async fn upsert_device(
 pub struct StoredDevice {
     pub device: Device,
     pub last_seen: i64,
+    /// Since when it has been behind another device of its account (E12).
+    pub behind_since: Option<i64>,
 }
 
 /// Every device of the account, locked until the transaction ends, so that
@@ -186,7 +192,7 @@ pub async fn lock_account(
 ) -> Result<Vec<StoredDevice>> {
     let rows = query(
         "SELECT device_id, platform, push_token, notifications, seen_counters,
-                online_until, last_push_at, wake_for, wake_at, last_seen
+                online_until, last_push_at, wake_for, wake_at, last_seen, behind_since
          FROM devices WHERE account_id = $1 ORDER BY device_id FOR UPDATE",
     )
     .bind(&account.0[..])
@@ -224,6 +230,7 @@ fn device_row(row: &PgRow) -> Result<StoredDevice> {
             wake,
         },
         last_seen: row.try_get("last_seen")?,
+        behind_since: row.try_get("behind_since")?,
     })
 }
 
@@ -551,6 +558,15 @@ pub async fn prune(pool: &PgPool, now: i64) -> Result<u64> {
         .bind(now)
         .execute(&mut *tx)
         .await?;
+    query("DELETE FROM relay_passes WHERE expires_at <= $1")
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+    // Accounts nobody came back to after creating them (M13).
+    query("DELETE FROM accounts WHERE NOT used AND created_at < $1")
+        .bind(now - UNUSED_AFTER_SECS)
+        .execute(&mut *tx)
+        .await?;
     let pruned = query("DELETE FROM devices WHERE last_seen < $1")
         .bind(now - PRUNE_AFTER_SECS)
         .execute(&mut *tx)
@@ -574,4 +590,250 @@ fn key(bytes: Vec<u8>) -> Result<[u8; 32]> {
     bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("stored key isn't 32 bytes"))
+}
+
+// --- M13: the public ledger ---
+
+/// The account is in use: it reported, paired or used the relay.
+pub async fn mark_used(pool: &PgPool, account: &AccountId) -> Result<()> {
+    query("UPDATE accounts SET used = TRUE WHERE account_id = $1 AND NOT used")
+        .bind(&account.0[..])
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn set_behind_since(
+    tx: &mut Transaction<'_, Postgres>,
+    device: &DeviceId,
+    since: Option<i64>,
+) -> Result<()> {
+    query("UPDATE devices SET behind_since = $2 WHERE device_id = $1")
+        .bind(&device.0[..])
+        .bind(since)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+pub async fn is_blocked(pool: &PgPool, account: &AccountId) -> Result<bool> {
+    Ok(
+        query_scalar::<_, i32>("SELECT 1 FROM blocked WHERE account_id = $1")
+            .bind(&account.0[..])
+            .fetch_optional(pool)
+            .await?
+            .is_some(),
+    )
+}
+
+/// Blocks an account: its devices are removed and can't register again.
+pub async fn block(pool: &PgPool, account: &AccountId, now: i64) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    query("INSERT INTO blocked (account_id, blocked_at) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+        .bind(&account.0[..])
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+    query("DELETE FROM accounts WHERE account_id = $1")
+        .bind(&account.0[..])
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn unblock(pool: &PgPool, account: &AccountId) -> Result<bool> {
+    Ok(query("DELETE FROM blocked WHERE account_id = $1")
+        .bind(&account.0[..])
+        .execute(pool)
+        .await?
+        .rows_affected()
+        > 0)
+}
+
+/// Accounts whose ID, or one of whose devices' IDs, starts with `prefix`
+/// (hex), and blocked accounts starting with it.
+pub async fn find_accounts(pool: &PgPool, prefix: &str) -> Result<Vec<AccountId>> {
+    let rows: Vec<Vec<u8>> = query_scalar(
+        "SELECT a.account_id FROM accounts a
+         WHERE encode(a.account_id, 'hex') LIKE $1 || '%'
+            OR EXISTS (SELECT 1 FROM devices d WHERE d.account_id = a.account_id
+                       AND encode(d.device_id, 'hex') LIKE $1 || '%')
+         UNION
+         SELECT account_id FROM blocked WHERE encode(account_id, 'hex') LIKE $1 || '%'",
+    )
+    .bind(prefix.to_ascii_lowercase())
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(|k| Ok(AccountId(key(k)?))).collect()
+}
+
+/// A pass to the relay until `expires_at`, for a device not registered yet.
+pub async fn grant_pass(pool: &PgPool, device: &DeviceId, expires_at: i64) -> Result<()> {
+    query(
+        "INSERT INTO relay_passes (device_id, expires_at) VALUES ($1, $2)
+         ON CONFLICT (device_id) DO UPDATE
+         SET expires_at = GREATEST(relay_passes.expires_at, EXCLUDED.expires_at)",
+    )
+    .bind(&device.0[..])
+    .bind(expires_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Whether a device may use the relay: registered to an account (blocked
+/// accounts have no devices), or holding a pass. A registered device's
+/// account counts as used, and its last-seen time moves to today at least,
+/// so an account that only uses the relay ("Devices only") isn't pruned.
+pub async fn relay_allowed(pool: &PgPool, device: &DeviceId, now: i64) -> Result<bool> {
+    let today = now - now.rem_euclid(86_400);
+    let account: Option<Vec<u8>> = query_scalar(
+        "UPDATE devices SET last_seen = GREATEST(last_seen, $2)
+         WHERE device_id = $1 RETURNING account_id",
+    )
+    .bind(&device.0[..])
+    .bind(today)
+    .fetch_optional(pool)
+    .await?;
+    if let Some(account) = account {
+        mark_used(pool, &AccountId(key(account)?)).await?;
+        return Ok(true);
+    }
+    Ok(query_scalar::<_, i32>(
+        "SELECT 1 FROM relay_passes WHERE device_id = $1 AND expires_at > $2",
+    )
+    .bind(&device.0[..])
+    .bind(now)
+    .fetch_optional(pool)
+    .await?
+    .is_some())
+}
+
+/// Adds counts to a day's totals.
+pub async fn add_counts(pool: &PgPool, day: i32, counts: &[(String, i64)]) -> Result<()> {
+    if counts.is_empty() {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    for (name, value) in counts {
+        query(
+            "INSERT INTO daily_counts (day, name, value) VALUES ($1, $2, $3)
+             ON CONFLICT (day, name) DO UPDATE SET value = daily_counts.value + EXCLUDED.value",
+        )
+        .bind(day)
+        .bind(name)
+        .bind(value)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Sets a day's figure (for what is measured rather than counted).
+pub async fn set_count(pool: &PgPool, day: i32, name: &str, value: i64) -> Result<()> {
+    query(
+        "INSERT INTO daily_counts (day, name, value) VALUES ($1, $2, $3)
+         ON CONFLICT (day, name) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .bind(day)
+    .bind(name)
+    .bind(value)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Every daily total from `since_day` on, as (day, name, value).
+pub async fn daily_counts(pool: &PgPool, since_day: i32) -> Result<Vec<(i32, String, i64)>> {
+    let rows =
+        query("SELECT day, name, value FROM daily_counts WHERE day >= $1 ORDER BY day, name")
+            .bind(since_day)
+            .fetch_all(pool)
+            .await?;
+    rows.iter()
+        .map(|r| Ok((r.try_get("day")?, r.try_get("name")?, r.try_get("value")?)))
+        .collect()
+}
+
+/// The ledger as it is now, for the dashboard: totals only.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct Snapshot {
+    pub accounts: i64,
+    pub unused_accounts: i64,
+    pub devices: i64,
+    pub devices_by_platform: Vec<(String, i64)>,
+    pub active_today: i64,
+    pub active_week: i64,
+    pub with_push: i64,
+    pub behind: i64,
+    pub blocked: i64,
+}
+
+pub async fn snapshot(pool: &PgPool, now: i64) -> Result<Snapshot> {
+    async fn total(pool: &PgPool, sql: &'static str) -> Result<i64> {
+        Ok(query_scalar::<_, i64>(sql).fetch_one(pool).await?)
+    }
+    async fn seen_since(pool: &PgPool, since: i64) -> Result<i64> {
+        Ok(
+            query_scalar::<_, i64>("SELECT count(*) FROM devices WHERE last_seen >= $1")
+                .bind(since)
+                .fetch_one(pool)
+                .await?,
+        )
+    }
+    let platforms =
+        query("SELECT platform, count(*) AS n FROM devices GROUP BY platform ORDER BY platform")
+            .fetch_all(pool)
+            .await?
+            .iter()
+            .map(|r| Ok((r.try_get("platform")?, r.try_get("n")?)))
+            .collect::<Result<Vec<(String, i64)>>>()?;
+    Ok(Snapshot {
+        accounts: total(pool, "SELECT count(*) FROM accounts").await?,
+        unused_accounts: total(pool, "SELECT count(*) FROM accounts WHERE NOT used").await?,
+        devices: total(pool, "SELECT count(*) FROM devices").await?,
+        devices_by_platform: platforms,
+        active_today: seen_since(pool, now - 86_400).await?,
+        active_week: seen_since(pool, now - 7 * 86_400).await?,
+        with_push: total(
+            pool,
+            "SELECT count(*) FROM devices WHERE push_token IS NOT NULL",
+        )
+        .await?,
+        behind: total(
+            pool,
+            "SELECT count(*) FROM devices WHERE behind_since IS NOT NULL",
+        )
+        .await?,
+        blocked: total(pool, "SELECT count(*) FROM blocked").await?,
+    })
+}
+
+/// The app version a device reported (E12).
+pub async fn set_version(
+    tx: &mut Transaction<'_, Postgres>,
+    device: &DeviceId,
+    version: &str,
+) -> Result<()> {
+    query("UPDATE devices SET app_version = $2 WHERE device_id = $1")
+        .bind(&device.0[..])
+        .bind(version)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Devices by the app version they last reported.
+pub async fn versions(pool: &PgPool) -> Result<Vec<(String, i64)>> {
+    query(
+        "SELECT coalesce(app_version, 'not reported') AS v, count(*) AS n FROM devices
+         GROUP BY v ORDER BY v",
+    )
+    .fetch_all(pool)
+    .await?
+    .iter()
+    .map(|r| Ok((r.try_get("v")?, r.try_get("n")?)))
+    .collect()
 }

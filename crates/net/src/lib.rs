@@ -9,6 +9,7 @@ mod frame;
 pub mod kit;
 pub mod ledger;
 mod local;
+pub mod metrics;
 mod node;
 pub mod pair;
 pub mod recovery;
@@ -20,8 +21,8 @@ pub use blobs::{BlobStorage, PhotoStore, read_blob};
 pub use frame::Traffic;
 pub use iroh::SecretKey;
 pub use node::{
-    BlobFailure, BlobReport, Event, FetchRound, Network, PathKind, State, SyncNode, endpoint_addr,
-    path_kind,
+    BlobFailure, BlobReport, DEFAULT_RELAY, DEVICES_ONLY, Event, FetchRound, HOSTING, Network,
+    PathKind, RELAY_URL, State, SyncNode, default_relay, endpoint_addr, path_kind, relay_mode,
 };
 pub use session::RoundReport;
 pub use ticket::DevTicket;

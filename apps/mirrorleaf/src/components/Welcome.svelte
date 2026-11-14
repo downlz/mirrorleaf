@@ -89,6 +89,10 @@
     >
     <button class="link" onclick={() => app.openWelcomeSheet('recover')}>Recover my account</button>
   </div>
+  <p class="welcome-note">
+    During the beta, Mirrorleaf shares anonymous sync statistics, daily counts and never your notes.
+    You can turn them off in Settings.
+  </p>
 </main>
 
 {#if app.welcomeSheet}

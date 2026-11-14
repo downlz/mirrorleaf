@@ -19,6 +19,16 @@ use crate::{AccountId, AccountKey, DeviceId, ProtoError, VersionVector};
 pub const DEVICE_HEADER: &str = "x-mirrorleaf-device";
 pub const TIME_HEADER: &str = "x-mirrorleaf-time";
 pub const SIGNATURE_HEADER: &str = "x-mirrorleaf-signature";
+/// The ledger API version a device speaks (M13, E11). Requests without it
+/// are version 1 (builds before M13).
+pub const API_HEADER: &str = "x-mirrorleaf-api";
+/// A random value in every version-2 request, signed with it: no two
+/// requests are alike, so the ledger can refuse one sent again (M13, P4).
+pub const NONCE_HEADER: &str = "x-mirrorleaf-nonce";
+/// The API version this build speaks.
+pub const API_VERSION: u32 = 2;
+/// The oldest version a ledger still serves: one before its own (N−1).
+pub const OLDEST_API_VERSION: u32 = 1;
 
 /// Requests stamped further than this from the ledger's clock are refused (plan §5.8).
 pub const MAX_CLOCK_SKEW_SECS: i64 = 5 * 60;
@@ -36,7 +46,13 @@ const ADD_DEVICE_CONTEXT: &[u8] = b"mirrorleaf/approve-device/1";
 const REMOVE_DEVICE_CONTEXT: &[u8] = b"mirrorleaf/remove-device/1";
 
 /// What a device signs: the method, path, time and the body's BLAKE3 hash.
-fn request_message(method: &str, path: &str, time: i64, body: &[u8]) -> Vec<u8> {
+fn request_message(
+    method: &str,
+    path: &str,
+    time: i64,
+    nonce: Option<&str>,
+    body: &[u8],
+) -> Vec<u8> {
     let mut msg = REQUEST_CONTEXT.to_vec();
     for part in [method, path, &time.to_string()] {
         msg.push(b'\n');
@@ -44,6 +60,11 @@ fn request_message(method: &str, path: &str, time: i64, body: &[u8]) -> Vec<u8> 
     }
     msg.push(b'\n');
     msg.extend(blake3::hash(body).as_bytes());
+    // Version 2 (M13): the nonce follows, so version-1 signatures still check.
+    if let Some(nonce) = nonce {
+        msg.push(b'\n');
+        msg.extend(nonce.as_bytes());
+    }
     msg
 }
 
@@ -66,23 +87,39 @@ impl DeviceKey {
 
     /// The signature header's value for this request.
     pub fn sign_request(&self, method: &str, path: &str, time: i64, body: &[u8]) -> String {
-        let message = request_message(method, path, time, body);
+        let message = request_message(method, path, time, None, body);
+        HEXLOWER.encode(&self.0.sign(&message).to_bytes())
+    }
+
+    /// The signature header's value for a version-2 request, with its nonce.
+    pub fn sign_request_v2(
+        &self,
+        method: &str,
+        path: &str,
+        time: i64,
+        nonce: &str,
+        body: &[u8],
+    ) -> String {
+        let message = request_message(method, path, time, Some(nonce), body);
         HEXLOWER.encode(&self.0.sign(&message).to_bytes())
     }
 }
 
 /// Checks a request's signature against the device that claims to have sent it.
+/// Checks a request's signature against the device that claims to have sent
+/// it. `nonce` is the version-2 nonce, `None` for version 1.
 pub fn verify_request(
     device: &DeviceId,
     method: &str,
     path: &str,
     time: i64,
+    nonce: Option<&str>,
     body: &[u8],
     signature: &str,
 ) -> Result<(), ProtoError> {
     verify(
         &device.0,
-        &request_message(method, path, time, body),
+        &request_message(method, path, time, nonce, body),
         signature,
     )
 }
@@ -200,6 +237,10 @@ pub struct Register {
     /// [`Approval::AddDevice`] for this device, signed by the account key.
     pub approval: String,
     pub platform: Platform,
+    /// The sign-up puzzle, solved for this account (M13): needed only to
+    /// create an account the ledger doesn't hold yet. Absent before M13.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub puzzle: Option<crate::puzzle::Solution>,
 }
 
 /// `PUT /v1/devices/me/status`.
@@ -216,6 +257,70 @@ pub struct StatusUpdate {
     pub push_token: Option<String>,
     /// Whether the device may show notifications (Android 13+ asks the user).
     pub notifications: bool,
+    /// Counts since the last report, for the beta's daily totals (M13, E12).
+    /// Absent when the person turned them off, and before M13.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<SyncMetrics>,
+}
+
+/// What a device counted since its last report (M13, E12). Only counts: no
+/// note, title, size or time of day. The ledger adds them to the day's
+/// totals and keeps nothing per device.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncMetrics {
+    /// Changes from other devices that arrived, by how long after they were
+    /// made: under 5 s, 30 s, 5 min, 1 h, 24 h, and later.
+    #[serde(default)]
+    pub arrivals: [u32; 6],
+    /// Connections to other devices made directly, and through the relay.
+    #[serde(default)]
+    pub direct: u32,
+    #[serde(default)]
+    pub relayed: u32,
+    /// Push-woken jobs (Android) that synced, and that didn't.
+    #[serde(default)]
+    pub woken_synced: u32,
+    #[serde(default)]
+    pub woken_failed: u32,
+    /// The phone's maker, for wake-ups by maker ("motorola"); none on desktops.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maker: Option<String>,
+    /// The app's version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+impl SyncMetrics {
+    /// Upper bounds of the arrival bands, in seconds; the last band is open.
+    pub const ARRIVAL_BANDS: [u64; 5] = [5, 30, 300, 3600, 86_400];
+
+    /// Counts a change that arrived `secs` after it was made.
+    pub fn arrived_after(&mut self, secs: u64) {
+        let band = Self::ARRIVAL_BANDS
+            .iter()
+            .position(|limit| secs < *limit)
+            .unwrap_or(5);
+        self.arrivals[band] = self.arrivals[band].saturating_add(1);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.arrivals.iter().all(|n| *n == 0)
+            && self.direct == 0
+            && self.relayed == 0
+            && self.woken_synced == 0
+            && self.woken_failed == 0
+    }
+
+    /// Adds counts kept from a report that didn't go through.
+    pub fn add(&mut self, other: &SyncMetrics) {
+        for (a, b) in self.arrivals.iter_mut().zip(other.arrivals) {
+            *a = a.saturating_add(b);
+        }
+        self.direct = self.direct.saturating_add(other.direct);
+        self.relayed = self.relayed.saturating_add(other.relayed);
+        self.woken_synced = self.woken_synced.saturating_add(other.woken_synced);
+        self.woken_failed = self.woken_failed.saturating_add(other.woken_failed);
+    }
 }
 
 /// One device of the account, as the ledger sees it.
@@ -243,6 +348,33 @@ pub struct StatusResponse {
     /// this one hasn't received the new key yet. Absent from older ledgers.
     #[serde(default, with = "hex_opt_id", skip_serializing_if = "Option::is_none")]
     pub account: Option<AccountId>,
+    /// The relay this ledger's devices use (M13). Absent from older ledgers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<String>,
+}
+
+/// `GET /v1/info` (M13): what this ledger offers. Unsigned.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LedgerInfo {
+    /// The API versions it serves.
+    pub api: Vec<u32>,
+    /// The relay its devices use; none when it has no relay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<String>,
+}
+
+/// `POST /v1/relay-pass` (M13): a short pass to the ledger's relay for a
+/// device joining an account by QR code, before it is registered.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayPassRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub puzzle: Option<crate::puzzle::Solution>,
+}
+
+/// The pass's end, as Unix seconds.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayPass {
+    pub expires_at: i64,
 }
 
 /// `POST /v1/accounts/rekey` (E3): the signer's account moves to a new
@@ -347,6 +479,10 @@ pub struct PairingLookup {
 pub struct LedgerError {
     pub error: String,
     pub message: String,
+    /// With [`error_code::PUZZLE_NEEDED`]: how many leading zero bits the
+    /// puzzle's answer needs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub puzzle_bits: Option<u32>,
 }
 
 /// Error codes a device acts on.
@@ -366,6 +502,15 @@ pub mod error_code {
     /// The account's key was replaced (E3): the old key can't register, and a
     /// second replacement of the same account is refused.
     pub const ACCOUNT_MOVED: &str = "account_moved";
+    /// Solve the puzzle ([`super::LedgerError::puzzle_bits`]) and send the
+    /// request again with its answer (M13).
+    pub const PUZZLE_NEEDED: &str = "puzzle_needed";
+    /// The ledger blocked this account (M13).
+    pub const BLOCKED: &str = "blocked";
+    /// The ledger doesn't speak this API version: update the app (M13).
+    pub const UNSUPPORTED_API: &str = "unsupported_api";
+    /// The same signed request came twice (M13).
+    pub const REPLAYED: &str = "replayed";
 }
 
 /// Keys as hex strings in JSON. (Their serde form elsewhere is the raw bytes
@@ -464,17 +609,54 @@ mod tests {
         let key = DeviceKey::from_bytes([3; 32]);
         let sig = key.sign_request("PUT", "/v1/devices/me/status", 1000, b"{}");
         let device = key.id();
-        verify_request(&device, "PUT", "/v1/devices/me/status", 1000, b"{}", &sig).unwrap();
+        verify_request(
+            &device,
+            "PUT",
+            "/v1/devices/me/status",
+            1000,
+            None,
+            b"{}",
+            &sig,
+        )
+        .unwrap();
         for (method, path, time, body) in [
             ("POST", "/v1/devices/me/status", 1000, &b"{}"[..]),
             ("PUT", "/v1/wake", 1000, b"{}"),
             ("PUT", "/v1/devices/me/status", 1001, b"{}"),
             ("PUT", "/v1/devices/me/status", 1000, b"{ }"),
         ] {
-            assert!(verify_request(&device, method, path, time, body, &sig).is_err());
+            assert!(verify_request(&device, method, path, time, None, body, &sig).is_err());
         }
         let other = DeviceKey::from_bytes([4; 32]).id();
-        assert!(verify_request(&other, "PUT", "/v1/devices/me/status", 1000, b"{}", &sig).is_err());
+        assert!(
+            verify_request(
+                &other,
+                "PUT",
+                "/v1/devices/me/status",
+                1000,
+                None,
+                b"{}",
+                &sig
+            )
+            .is_err()
+        );
+
+        // Version 2 signs the nonce too, and a version-1 check refuses it.
+        let v2 = key.sign_request_v2("PUT", "/v1/devices/me/status", 1000, "ab12", b"{}");
+        let check = |nonce| {
+            verify_request(
+                &device,
+                "PUT",
+                "/v1/devices/me/status",
+                1000,
+                nonce,
+                b"{}",
+                &v2,
+            )
+        };
+        check(Some("ab12")).unwrap();
+        assert!(check(Some("ab13")).is_err());
+        assert!(check(None).is_err());
     }
 
     #[test]
@@ -505,6 +687,7 @@ mod tests {
             platform: Platform::Android,
             push_token: None,
             notifications: true,
+            metrics: None,
         };
         let json = serde_json::to_string(&update).unwrap();
         assert!(
@@ -559,6 +742,7 @@ mod tests {
         let status = StatusResponse {
             devices: Vec::new(),
             account: Some(new.id()),
+            relay: None,
         };
         let json = serde_json::to_string(&status).unwrap();
         assert_eq!(

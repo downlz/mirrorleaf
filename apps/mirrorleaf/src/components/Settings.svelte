@@ -33,6 +33,11 @@
   let localDiscovery = $state<boolean | null>(null);
   /** Android's battery restrictions and seeding (M12, E8). */
   let battery = $state<Battery | null>(null);
+  /** Who keeps the account's sync status, and the beta's counts (M13). */
+  let devicesOnly = $state<boolean | null>(null);
+  let shareStats = $state<boolean | null>(null);
+  /** The app's version, for About. */
+  let version = $state('');
 
   /** A device seen on this network but reached only through the relay. */
   const blockedNearby = $derived(
@@ -42,6 +47,16 @@
   async function setLocalDiscovery(on: boolean) {
     await app.run(() => api.setLocalDiscovery(on));
     localDiscovery = (await app.run(api.localDiscovery)) ?? localDiscovery;
+  }
+
+  async function setDevicesOnly(on: boolean) {
+    await app.run(() => api.setDevicesOnly(on));
+    devicesOnly = (await app.run(api.devicesOnly)) ?? devicesOnly;
+  }
+
+  async function setShareStats(on: boolean) {
+    await app.run(() => api.setShareStats(on));
+    shareStats = (await app.run(api.shareStats)) ?? shareStats;
   }
 
   async function setSeeding(on: boolean) {
@@ -163,6 +178,9 @@
     if (app.isDesktop) autostart = (await app.run(api.autostart)) ?? null;
     if (app.platform === 'android') permissions = (await app.run(api.permissions)) ?? null;
     if (app.status?.account) localDiscovery = (await app.run(api.localDiscovery)) ?? null;
+    if (app.status?.account) devicesOnly = (await app.run(api.devicesOnly)) ?? null;
+    if (app.status?.account) shareStats = (await app.run(api.shareStats)) ?? null;
+    version = (await app.run(api.appVersion)) ?? '';
     if (app.platform === 'android') battery = (await app.run(api.battery)) ?? null;
   });
 
@@ -369,6 +387,56 @@
             <p class="hint">
               {status.only_here === 1 ? '1 change is' : `${status.only_here} changes are`} only on this
               {app.deviceWord} so far.
+            </p>
+          {/if}
+          {#if devicesOnly !== null}
+            <fieldset class="choice">
+              <legend>Sync service, for all your devices</legend>
+              <label class="toggle">
+                <input
+                  id="hosting-mirrorleaf"
+                  type="radio"
+                  name="hosting"
+                  checked={!devicesOnly}
+                  onchange={() => setDevicesOnly(false)}
+                />
+                <span>Mirrorleaf</span>
+              </label>
+              <p class="hint">
+                Mirrorleaf's server wakes your phone when your other devices have changes for it,
+                and shows how far behind each device is. It knows which devices you have and when
+                they sync, never what's in your notes.
+              </p>
+              <label class="toggle">
+                <input
+                  id="hosting-devices"
+                  type="radio"
+                  name="hosting"
+                  checked={devicesOnly}
+                  onchange={() => setDevicesOnly(true)}
+                />
+                <span>Devices only</span>
+              </label>
+              <p class="hint">
+                The server keeps only your devices' IDs, so they can use the relay. Your phone syncs
+                when you open Mirrorleaf, and the status here comes from your devices.
+              </p>
+            </fieldset>
+          {/if}
+          {#if shareStats !== null && devicesOnly === false}
+            <label class="toggle">
+              <input
+                id="share-stats"
+                type="checkbox"
+                checked={shareStats}
+                onchange={(e) => setShareStats(e.currentTarget.checked)}
+              />
+              <span>Share anonymous sync statistics</span>
+            </label>
+            <p class="hint">
+              During the beta, this {app.deviceWord} sends counts with its status: how quickly changes
+              reached it and whether your phone woke up. Daily totals only: never your notes, titles or
+              names.
             </p>
           {/if}
         {/if}
@@ -594,7 +662,8 @@
         <p class="hint">
           {status.device_name} · device {status.device_id.slice(0, 8)} · {status.notes} notes ·
           {status.changes} changes<br />
-          Mirrorleaf Phase 0. Your notes, mirrored on your devices. Nowhere else.
+          Mirrorleaf{version ? ` ${version}` : ''}. Your notes, mirrored on your devices. Nowhere
+          else.
         </p>
       </section>
     {/if}

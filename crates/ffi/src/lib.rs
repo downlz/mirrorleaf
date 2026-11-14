@@ -18,6 +18,13 @@ pub fn set_app_version(version: String) {
     mirrorleaf_net::set_app_version(&version);
 }
 
+/// The phone's maker (Android's `Build.MANUFACTURER`), for the beta's counts
+/// of wake-ups by maker (M13, E12). Set once, at startup.
+#[uniffi::export]
+pub fn set_device_maker(maker: String) {
+    mirrorleaf_net::metrics::set_device_maker(&maker);
+}
+
 /// A new random database key (32 bytes), for the platform to keep (M11).
 #[uniffi::export]
 pub fn new_database_key() -> Vec<u8> {

@@ -242,10 +242,31 @@ pub(crate) async fn round(
     };
     let receiving = async {
         let mut count = 0;
+        // Arrival times count only for changes made after this device joined:
+        // a new device's catching up on old notes says nothing about sync
+        // speed (M13, E12).
+        let joined = {
+            let s = state.lock().unwrap();
+            s.account
+                .devices
+                .list
+                .entry(&s.replica.device())
+                .map_or(u64::MAX, |e| e.added_at)
+        };
         loop {
             match read(&mut recv, &mut received).await? {
                 Message::Changes(batch) => {
-                    count += state.lock().unwrap().replica.apply_remote(&batch)?;
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let mut s = state.lock().unwrap();
+                    let me = s.replica.device();
+                    count += s.replica.apply_remote_with(&batch, |change| {
+                        if change.origin != me && change.made_at >= joined && change.made_at > 0 {
+                            crate::metrics::arrived(change.made_at, now);
+                        }
+                    })?;
                 }
                 Message::End => break,
                 other => bail!("expected changes, got {other:?}"),

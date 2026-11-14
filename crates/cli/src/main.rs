@@ -540,6 +540,7 @@ async fn join(dir: &Path, code: &str, ledger: Option<String>) -> Result<()> {
             .map(|(url, _)| url)
     });
     let target = code.resolve(&secret, lookup.as_deref()).await?;
+    let relay = target.relay(&secret, lookup.as_deref()).await;
     let request = JoinRequest {
         name: device::device_name(&replica)?,
         platform: Platform::this(),
@@ -549,6 +550,7 @@ async fn join(dir: &Path, code: &str, ledger: Option<String>) -> Result<()> {
     let welcome = pair::join(
         secret.clone(),
         Network::Internet,
+        relay.relay.as_ref(),
         &target,
         request,
         |number| {
@@ -564,6 +566,9 @@ async fn join(dir: &Path, code: &str, ledger: Option<String>) -> Result<()> {
         &me,
     )?;
     account.save(&mut replica)?;
+    if let Some(named) = &relay.named {
+        replica.set_meta(mirrorleaf_net::RELAY_URL, named.as_bytes())?;
+    }
     println!("Joined account {}", account.id());
 
     // Use the account's ledger too, unless this device already has one.
@@ -596,7 +601,9 @@ async fn join(dir: &Path, code: &str, ledger: Option<String>) -> Result<()> {
     )
     .await?;
     let started = Instant::now();
-    match tokio::time::timeout(DIAL_TIMEOUT, node.sync_once(target.inviter)).await {
+    // Through the relay (M13): a word code names only the inviter's ID.
+    let inviter = node.dial_addr(DeviceId(*target.inviter.id.as_bytes()))?;
+    match tokio::time::timeout(DIAL_TIMEOUT, node.sync_once(inviter)).await {
         Ok(Ok((path, report))) => println!(
             "Synced with your other device via {path}: received {} changes in {:.1} s",
             report.received_changes,
@@ -1176,7 +1183,7 @@ async fn sync(dir: &Path, watch: bool, export: Option<PathBuf>) -> Result<()> {
         }
         for peer in peers {
             let started = Instant::now();
-            let addr = mirrorleaf_net::endpoint_addr(peer)?;
+            let addr = node.dial_addr(peer)?;
             match tokio::time::timeout(DIAL_TIMEOUT, node.sync_once(addr)).await {
                 Ok(Ok((path, report))) => println!(
                     "{} via {path}: sent {}, received {} changes ({} B out, {} B in) in {} ms",

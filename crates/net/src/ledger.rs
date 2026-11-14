@@ -3,10 +3,12 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use iroh::SecretKey;
 use mirrorleaf_proto::ledger::{
-    Approval, DEVICE_HEADER, DeviceKey, LedgerError, PairingLookup, PairingOffer, Platform,
-    Register, Rekey, RemoveDevice, SIGNATURE_HEADER, StatusResponse, StatusUpdate, TIME_HEADER,
-    WakeResponse, error_code,
+    API_HEADER, API_VERSION, Approval, DEVICE_HEADER, DeviceKey, LedgerError, LedgerInfo,
+    NONCE_HEADER, PairingLookup, PairingOffer, Platform, Register, Rekey, RelayPass,
+    RelayPassRequest, RemoveDevice, SIGNATURE_HEADER, StatusResponse, StatusUpdate, SyncMetrics,
+    TIME_HEADER, WakeResponse, error_code,
 };
+use mirrorleaf_proto::puzzle::{self, Solution, Subject};
 use mirrorleaf_proto::{AccountId, DeviceId, RotationLink, VersionVector};
 
 use crate::Account;
@@ -134,14 +136,32 @@ impl LedgerClient {
     /// Adds this device to its account on the ledger, creating the account if
     /// the ledger doesn't know it yet. Harmless to repeat.
     pub async fn register(&self) -> Result<()> {
-        let body = serde_json::to_vec(&Register {
-            account: self.account,
-            approval: self.approval.clone(),
-            platform: self.profile.platform,
-        })?;
+        let register = |puzzle: Option<Solution>| {
+            serde_json::to_vec(&Register {
+                account: self.account,
+                approval: self.approval.clone(),
+                platform: self.profile.platform,
+                puzzle,
+            })
+        };
+        let body = register(None)?;
         let registered = match self.send("POST", "/v1/devices", body.clone()).await {
             Err(e) if is(&e, error_code::UNKNOWN_ACCOUNT) => {
-                self.send("POST", "/v1/accounts", body).await.map(drop)
+                match self.send("POST", "/v1/accounts", body).await {
+                    // A new account: the sign-up puzzle first (M13).
+                    Err(e) if is(&e, error_code::PUZZLE_NEEDED) => {
+                        let bits = puzzle_bits(&e);
+                        let (account, device) = (self.account, self.key.id());
+                        let solution = solve(bits, move |time| {
+                            puzzle::solve(Subject::Account(&account), &device, time, bits)
+                        })
+                        .await?;
+                        self.send("POST", "/v1/accounts", register(Some(solution))?)
+                            .await
+                            .map(drop)
+                    }
+                    other => other.map(drop),
+                }
             }
             other => other.map(drop),
         };
@@ -161,6 +181,7 @@ impl LedgerClient {
             account: self.account,
             approval: self.approval.clone(),
             platform: self.profile.platform,
+            puzzle: None,
         })?;
         match self.send("POST", "/v1/devices", body).await {
             Ok(_) => Ok(()),
@@ -184,12 +205,24 @@ impl LedgerClient {
         vv: &VersionVector,
         online_for: Option<u32>,
     ) -> Result<StatusResponse> {
+        self.report_with(vv, online_for, None).await
+    }
+
+    /// [`Self::report`] with the counts gathered since the last report, for
+    /// the beta's daily totals (M13, E12).
+    pub async fn report_with(
+        &self,
+        vv: &VersionVector,
+        online_for: Option<u32>,
+        metrics: Option<SyncMetrics>,
+    ) -> Result<StatusResponse> {
         let body = serde_json::to_vec(&StatusUpdate {
             version_vector: vv.clone(),
             online_for_secs: online_for,
             platform: self.profile.platform,
             push_token: self.profile.push_token.clone(),
             notifications: self.profile.notifications,
+            metrics,
         })?;
         let response = match self
             .send("PUT", "/v1/devices/me/status", body.clone())
@@ -202,6 +235,32 @@ impl LedgerClient {
             other => other?,
         };
         Ok(serde_json::from_slice(&response)?)
+    }
+
+    /// Registers this device and clears its status on the ledger ("Devices
+    /// only", M13): no counters, no push token, offline. The ledger keeps the
+    /// device's ID, so it may use the relay.
+    pub async fn clear_status(&self) -> Result<()> {
+        let body = serde_json::to_vec(&StatusUpdate {
+            version_vector: VersionVector::default(),
+            online_for_secs: Some(0),
+            platform: self.profile.platform,
+            push_token: None,
+            notifications: false,
+            metrics: None,
+        })?;
+        match self
+            .send("PUT", "/v1/devices/me/status", body.clone())
+            .await
+        {
+            Err(e) if is(&e, error_code::UNKNOWN_DEVICE) => {
+                self.register().await?;
+                self.send("PUT", "/v1/devices/me/status", body)
+                    .await
+                    .map(drop)
+            }
+            other => other.map(drop),
+        }
     }
 
     /// Asks the ledger to wake the device holding what this one lacks (plan
@@ -255,6 +314,84 @@ pub async fn lookup_pairing(url: &str, secret: &SecretKey, nameplate: u32) -> Re
     }
 }
 
+/// What the ledger at `url` offers: its API versions and its relay (M13).
+/// Unsigned: asked before the device belongs to any account.
+pub async fn info(url: &str) -> Result<LedgerInfo> {
+    let base = url.trim_end_matches('/');
+    let response = http_client()?
+        .get(format!("{base}/v1/info"))
+        .send()
+        .await
+        .with_context(|| format!("can't reach the ledger at {base}"))?;
+    let status = response.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        // A ledger from before M13: version 1, no relay of its own.
+        return Ok(LedgerInfo {
+            api: vec![1],
+            relay: None,
+        });
+    }
+    if !status.is_success() {
+        bail!("the ledger answered {status}");
+    }
+    Ok(serde_json::from_slice(&response.bytes().await?)?)
+}
+
+/// A short pass to the ledger's relay for a device joining an account by QR
+/// code, before it is registered (M13): solves the puzzle if asked.
+pub async fn relay_pass(url: &str, secret: &SecretKey) -> Result<RelayPass> {
+    let key = DeviceKey::from_bytes(secret.to_bytes());
+    let base = url.trim_end_matches('/');
+    let http = http_client()?;
+    let request = |puzzle| serde_json::to_vec(&RelayPassRequest { puzzle });
+    let response = match send(&http, base, &key, "POST", "/v1/relay-pass", request(None)?).await {
+        Err(e) if is(&e, error_code::PUZZLE_NEEDED) => {
+            let bits = puzzle_bits(&e);
+            let device = key.id();
+            let solution = solve(bits, move |time| {
+                puzzle::solve(Subject::RelayPass, &device, time, bits)
+            })
+            .await?;
+            send(
+                &http,
+                base,
+                &key,
+                "POST",
+                "/v1/relay-pass",
+                request(Some(solution))?,
+            )
+            .await?
+        }
+        other => other?,
+    };
+    Ok(serde_json::from_slice(&response)?)
+}
+
+fn puzzle_bits(error: &anyhow::Error) -> u32 {
+    error
+        .downcast_ref::<Refused>()
+        .and_then(|r| r.0.puzzle_bits)
+        .unwrap_or(0)
+}
+
+/// Solves the sign-up puzzle off the async runtime (about a second on a
+/// phone at the usual difficulty).
+async fn solve(
+    bits: u32,
+    solve: impl FnOnce(i64) -> Solution + Send + 'static,
+) -> Result<Solution> {
+    let time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+    let started = Instant::now();
+    let solution = tokio::task::spawn_blocking(move || solve(time)).await?;
+    tracing::info!(
+        "solved the ledger's sign-up puzzle ({bits} bits) in {} ms",
+        started.elapsed().as_millis()
+    );
+    Ok(solution)
+}
+
 fn http_client() -> Result<reqwest::Client> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     Ok(reqwest::Client::builder()
@@ -271,15 +408,49 @@ async fn send(
     path: &str,
     body: Vec<u8>,
 ) -> Result<Vec<u8>> {
+    match send_as(http, base, key, method, path, body.clone(), API_VERSION).await {
+        // A ledger from before M13 checks version-1 signatures only, and so
+        // refuses version 2's: the request is sent again as version 1.
+        Err(e) if is(&e, "bad_signature") => {
+            tracing::info!("the ledger at {base} is older: using its API version 1");
+            send_as(http, base, key, method, path, body, 1).await
+        }
+        other => other,
+    }
+}
+
+/// Sends a request signed with `key`, as API version `api`.
+async fn send_as(
+    http: &reqwest::Client,
+    base: &str,
+    key: &DeviceKey,
+    method: &str,
+    path: &str,
+    body: Vec<u8>,
+    api: u32,
+) -> Result<Vec<u8>> {
     let time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs() as i64;
-    let signature = key.sign_request(method, path, time, &body);
-    let response = http
+    let mut request = http
         .request(method.parse()?, format!("{base}{path}"))
         .header(DEVICE_HEADER, key.id().to_string())
-        .header(TIME_HEADER, time.to_string())
-        .header(SIGNATURE_HEADER, signature)
+        .header(TIME_HEADER, time.to_string());
+    request = if api >= 2 {
+        // Version 2 (M13): a fresh random nonce in every request, signed with it.
+        let nonce = data_encoding::HEXLOWER.encode(&rand::random::<[u8; 16]>());
+        let signature = key.sign_request_v2(method, path, time, &nonce, &body);
+        request
+            .header(API_HEADER, api.to_string())
+            .header(NONCE_HEADER, nonce)
+            .header(SIGNATURE_HEADER, signature)
+    } else {
+        request.header(
+            SIGNATURE_HEADER,
+            key.sign_request(method, path, time, &body),
+        )
+    };
+    let response = request
         .header("content-type", "application/json")
         .body(body)
         .send()
@@ -404,6 +575,7 @@ mod tests {
                 row(2, Platform::Android, &[5, 3]),
             ],
             account: None,
+            relay: None,
         }
     }
 

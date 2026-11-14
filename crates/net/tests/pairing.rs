@@ -103,6 +103,7 @@ async fn join(
     let result = pair::join(
         secret.clone(),
         Network::Local,
+        None,
         target,
         request(),
         move |n| {

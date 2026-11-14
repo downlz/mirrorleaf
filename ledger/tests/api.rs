@@ -11,10 +11,11 @@ use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
+use mirrorleaf_ledger::guard::{Guard, IpRates};
 use mirrorleaf_ledger::limits::{Limits, Rate};
 use mirrorleaf_ledger::push::{FALLBACK_BODY_KEY, Fcm, Pusher, http_client};
 use mirrorleaf_ledger::rules::{Priority, Push, PushKind, WAKE_INTERVAL_SECS};
-use mirrorleaf_ledger::{Ledger, db};
+use mirrorleaf_ledger::{Ledger, Settings, db};
 use mirrorleaf_proto::ledger::{Approval, DeviceKey, MAX_DEVICES_PER_ACCOUNT, Platform, Rekey};
 use mirrorleaf_proto::{AccountKey, DeviceId};
 use serde_json::{Value, json};
@@ -27,6 +28,8 @@ const START: i64 = 1_800_000_000;
 
 struct TestLedger {
     url: String,
+    /// The internal port: relay checks and the dashboard (M13).
+    internal_url: String,
     pushes: Arc<Mutex<Vec<Push>>>,
     clock: Arc<AtomicI64>,
     ledger: Ledger,
@@ -42,6 +45,15 @@ impl TestLedger {
     }
 
     async fn start_with(pusher: Option<Pusher>, limits: Limits) -> Option<Self> {
+        Self::start_full(pusher, limits, Guard::off(), Settings::default()).await
+    }
+
+    async fn start_full(
+        pusher: Option<Pusher>,
+        limits: Limits,
+        guard: Guard,
+        settings: Settings,
+    ) -> Option<Self> {
         let Ok(url) = std::env::var("MIRRORLEAF_TEST_DATABASE_URL") else {
             eprintln!(
                 "skipped: set MIRRORLEAF_TEST_DATABASE_URL to run the ledger's database tests"
@@ -80,13 +92,21 @@ impl TestLedger {
                 Arc::new(move || clock.load(Ordering::SeqCst))
             },
             limits: Arc::new(limits),
+            settings: Arc::new(settings),
+            guard: Arc::new(guard),
+            counts: Arc::default(),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let app = ledger.clone().router();
         tokio::spawn(async move { axum::serve(listener, app).await });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let internal_url = format!("http://{}", listener.local_addr().unwrap());
+        let internal = ledger.clone().internal_router();
+        tokio::spawn(async move { axum::serve(listener, internal).await });
         Some(Self {
             url,
+            internal_url,
             pushes,
             clock,
             ledger,
@@ -194,14 +214,19 @@ impl Dev {
         body: Value,
     ) -> (StatusCode, Value) {
         let body = serde_json::to_vec(&body).unwrap();
+        // Version 2: a fresh nonce, so requests at the test's frozen time
+        // still differ (the ledger refuses a request sent twice).
+        let nonce = data_encoding::HEXLOWER.encode(&rand::random::<[u8; 16]>());
         let response = http_client()
             .unwrap()
             .request(method.parse().unwrap(), format!("{}{path}", t.url))
             .header("x-mirrorleaf-device", self.id().to_string())
             .header("x-mirrorleaf-time", time.to_string())
+            .header("x-mirrorleaf-api", "2")
+            .header("x-mirrorleaf-nonce", &nonce)
             .header(
                 "x-mirrorleaf-signature",
-                self.key.sign_request(method, path, time, &body),
+                self.key.sign_request_v2(method, path, time, &nonce, &body),
             )
             .body(body)
             .send()
@@ -1313,5 +1338,332 @@ async fn pairing_numbers_point_to_a_device_for_ten_minutes() {
     );
     let (_, fresh) = laptop.call(&t, "POST", "/v1/pairing", json!({})).await;
     assert_eq!(fresh["nameplate"], 1);
+    t.finish().await;
+}
+
+// --- M13: a ledger open to anyone ---
+
+/// The relay's question to the ledger: may this device use the relay?
+async fn relay_check(t: &TestLedger, device: &DeviceId) -> u16 {
+    http_client()
+        .unwrap()
+        .get(format!("{}/internal/relay/{device}", t.internal_url))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn new_accounts_need_the_puzzle_and_addresses_are_limited() {
+    use mirrorleaf_net::ledger::{DeviceProfile, LedgerClient};
+    use mirrorleaf_net::{Account, SecretKey};
+    use mirrorleaf_proto::DeviceEntry;
+    use mirrorleaf_proto::puzzle::{self, Subject};
+
+    let guard = Guard::new(
+        12,
+        IpRates {
+            sign_ups: 2,
+            ..IpRates::OFF
+        },
+    );
+    let Some(t) =
+        TestLedger::start_full(None, Limits::unlimited(), guard, Settings::default()).await
+    else {
+        return;
+    };
+    t.clock.store(wall_clock(), Ordering::SeqCst);
+    let account = Arc::new(AccountKey::generate());
+    let laptop = Dev::new(&account, Platform::Macos);
+
+    // No answer: the ledger says how hard the puzzle is.
+    let (status, body) = laptop.register(&t, "/v1/accounts").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], "puzzle_needed");
+    assert_eq!(body["puzzle_bits"], 12);
+
+    // A wrong answer (for another account) is refused; the right one creates it.
+    let solve = |account: &AccountKey, d: &Dev| {
+        puzzle::solve(Subject::Account(&account.id()), &d.id(), t.now(), 12)
+    };
+    let mut body = json!({
+        "account": account.id().to_string(),
+        "approval": Approval::AddDevice.sign(&account, &laptop.id()),
+        "platform": "macos",
+        "puzzle": solve(&AccountKey::generate(), &laptop),
+    });
+    let (status, _) = laptop.call(&t, "POST", "/v1/accounts", body.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    body["puzzle"] = json!(solve(&account, &laptop));
+    let (status, _) = laptop.call(&t, "POST", "/v1/accounts", body).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    // Joining the account needs no puzzle.
+    let desktop = Dev::new(&account, Platform::Macos);
+    assert_eq!(
+        desktop.register(&t, "/v1/devices").await.0,
+        StatusCode::NO_CONTENT
+    );
+
+    // The device's own client solves it by itself.
+    let key = SecretKey::generate();
+    let entry = DeviceEntry {
+        id: DeviceId(*key.public().as_bytes()),
+        name: "phone".into(),
+        platform: None,
+        added_at: 0,
+    };
+    let profile = DeviceProfile {
+        platform: Platform::Android,
+        push_token: None,
+        notifications: false,
+    };
+    let client = LedgerClient::new(&t.url, &key, &Account::create(entry), profile).unwrap();
+    client.register().await.unwrap();
+
+    // Two sign-ups an hour from one address here: the third, from the same
+    // address behind Caddy, is refused; another address may.
+    let url = t.url.clone();
+    let sign_up = |ip: &'static str| {
+        let url = url.clone();
+        let account = Arc::new(AccountKey::generate());
+        let d = Dev::new(&account, Platform::Macos);
+        async move {
+            let body = serde_json::to_vec(&json!({
+                "account": account.id().to_string(),
+                "approval": Approval::AddDevice.sign(&account, &d.id()),
+                "platform": "macos",
+                "puzzle": puzzle::solve(Subject::Account(&account.id()), &d.id(), wall_clock(), 12),
+            }))
+            .unwrap();
+            let (time, nonce) = (wall_clock(), "0123456789abcdef");
+            http_client()
+                .unwrap()
+                .post(format!("{url}/v1/accounts"))
+                .header("x-forwarded-for", ip)
+                .header("x-mirrorleaf-device", d.id().to_string())
+                .header("x-mirrorleaf-time", time.to_string())
+                .header("x-mirrorleaf-api", "2")
+                .header("x-mirrorleaf-nonce", nonce)
+                .header(
+                    "x-mirrorleaf-signature",
+                    d.key
+                        .sign_request_v2("POST", "/v1/accounts", time, nonce, &body),
+                )
+                .body(body)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
+    };
+    assert_eq!(sign_up("203.0.113.7").await, 204);
+    assert_eq!(sign_up("203.0.113.7").await, 204);
+    assert_eq!(sign_up("203.0.113.7").await, 429);
+    assert_eq!(sign_up("198.51.100.1").await, 204);
+    t.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_relay_lets_in_registered_devices_and_devices_with_a_pass() {
+    let Some(t) = TestLedger::start_full(
+        None,
+        Limits::unlimited(),
+        Guard::new(10, IpRates::OFF),
+        Settings {
+            relay_url: Some("https://relay.example".into()),
+            relay_metrics_url: None,
+        },
+    )
+    .await
+    else {
+        return;
+    };
+    t.clock.store(wall_clock(), Ordering::SeqCst);
+    // The ledger tells devices its relay.
+    let info: Value = http_client()
+        .unwrap()
+        .get(format!("{}/v1/info", t.url))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .map(|b| serde_json::from_slice(&b).unwrap())
+        .unwrap();
+    assert_eq!(
+        info,
+        json!({ "api": [1, 2], "relay": "https://relay.example" })
+    );
+
+    let account = Arc::new(AccountKey::generate());
+    let laptop = Dev::new(&account, Platform::Macos);
+    let body = json!({
+        "account": account.id().to_string(),
+        "approval": Approval::AddDevice.sign(&account, &laptop.id()),
+        "platform": "macos",
+        "puzzle": mirrorleaf_proto::puzzle::solve(
+            mirrorleaf_proto::puzzle::Subject::Account(&account.id()), &laptop.id(), t.now(), 10),
+    });
+    assert_eq!(
+        laptop.call(&t, "POST", "/v1/accounts", body).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(relay_check(&t, &laptop.id()).await, 204);
+    let report = laptop.report(&t, &[], Some(360)).await;
+    assert_eq!(report["relay"], "https://relay.example");
+
+    // A device that isn't registered stays out until it looks up a word code.
+    let joining = Dev::new(&Arc::new(AccountKey::generate()), Platform::Android);
+    assert_eq!(relay_check(&t, &joining.id()).await, 403);
+    let (_, offer) = laptop.call(&t, "POST", "/v1/pairing", json!({})).await;
+    let path = format!("/v1/pairing/{}", offer["nameplate"]);
+    assert_eq!(
+        joining.call(&t, "GET", &path, json!(null)).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(relay_check(&t, &joining.id()).await, 204);
+
+    // Or asks for a pass, with the puzzle (joining by QR code).
+    let scanning = mirrorleaf_net::SecretKey::generate();
+    let scanning_id = DeviceId(*scanning.public().as_bytes());
+    assert_eq!(relay_check(&t, &scanning_id).await, 403);
+    let pass = mirrorleaf_net::ledger::relay_pass(&t.url, &scanning)
+        .await
+        .unwrap();
+    assert!(pass.expires_at > t.now());
+    assert_eq!(relay_check(&t, &scanning_id).await, 204);
+    // Passes end with the code's 10 minutes.
+    t.advance(601);
+    assert_eq!(relay_check(&t, &scanning_id).await, 403);
+    assert_eq!(relay_check(&t, &joining.id()).await, 403);
+
+    // A blocked account loses its devices and can't come back.
+    db::block(&t.ledger.db, &account.id(), t.now())
+        .await
+        .unwrap();
+    assert_eq!(relay_check(&t, &laptop.id()).await, 403);
+    let (status, body) = laptop.register(&t, "/v1/devices").await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::FORBIDDEN, Some("blocked"))
+    );
+    t.finish().await;
+}
+
+#[tokio::test]
+async fn a_request_sent_twice_is_refused_and_version_1_still_works() {
+    let Some(t) = TestLedger::start().await else {
+        return;
+    };
+    let account = Arc::new(AccountKey::generate());
+    let laptop = Dev::new(&account, Platform::Macos);
+    laptop.register(&t, "/v1/accounts").await;
+    let v1 = || {
+        let (time, body) = (t.now(), b"{}".to_vec());
+        http_client()
+            .unwrap()
+            .post(format!("{}/v1/wake", t.url))
+            .header("x-mirrorleaf-device", laptop.id().to_string())
+            .header("x-mirrorleaf-time", time.to_string())
+            .header(
+                "x-mirrorleaf-signature",
+                laptop.key.sign_request("POST", "/v1/wake", time, &body),
+            )
+            .body(body)
+            .send()
+    };
+    // A build before M13 (no version header, no nonce) is served...
+    assert_eq!(v1().await.unwrap().status().as_u16(), 200);
+    // ...but the very same request again is a replay.
+    let replayed = v1().await.unwrap();
+    assert_eq!(replayed.status().as_u16(), 401);
+    let body: Value = serde_json::from_slice(&replayed.bytes().await.unwrap()).unwrap();
+    assert_eq!(body["error"], "replayed");
+
+    // A newer version than the ledger knows is refused with a reason.
+    let response = http_client()
+        .unwrap()
+        .post(format!("{}/v1/wake", t.url))
+        .header("x-mirrorleaf-api", "3")
+        .header("x-mirrorleaf-device", laptop.id().to_string())
+        .header("x-mirrorleaf-time", t.now().to_string())
+        .header("x-mirrorleaf-signature", "00")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 400);
+    let body: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+    assert_eq!(body["error"], "unsupported_api");
+    t.finish().await;
+}
+
+#[tokio::test]
+async fn unused_accounts_go_after_a_week_and_counts_reach_the_daily_totals() {
+    let Some(t) = TestLedger::start().await else {
+        return;
+    };
+    // Created and never used again; created and used.
+    let idle = Dev::new(&Arc::new(AccountKey::generate()), Platform::Macos);
+    idle.register(&t, "/v1/accounts").await;
+    let account = Arc::new(AccountKey::generate());
+    let (laptop, phone) = (
+        Dev::new(&account, Platform::Macos),
+        Dev::new(&account, Platform::Android),
+    );
+    laptop.register(&t, "/v1/accounts").await;
+    phone.register(&t, "/v1/devices").await;
+
+    // The laptop has 5 changes the phone lacks: the phone is behind...
+    let metrics = json!({ "arrivals": [3, 1, 0, 0, 0, 1], "direct": 2, "relayed": 1,
+                          "woken_synced": 1, "maker": "Motorola", "version": "0.5.0" });
+    let body = json!({
+        "version_vector": { laptop.id().to_string(): 5 },
+        "online_for_secs": 360, "platform": "macos", "push_token": null,
+        "notifications": false, "metrics": metrics,
+    });
+    let (status, _) = laptop.call(&t, "PUT", "/v1/devices/me/status", body).await;
+    assert_eq!(status, StatusCode::OK);
+    phone.report(&t, &[], Some(360)).await;
+    // ...until it reports holding them, 20 minutes later.
+    t.advance(20 * 60);
+    phone.report(&t, &[(&laptop, 5)], Some(360)).await;
+    t.ledger.flush_counts().await.unwrap();
+    let report = t.ledger.report(1).await.unwrap();
+    let (_, today) = report.days.last().unwrap();
+    assert_eq!(today["arrived_under_5s"], 3);
+    assert_eq!(today["connections_relay"], 1);
+    assert_eq!(today["woken_synced:motorola"], 1);
+    assert_eq!(today["caught_up_under_1h"], 1);
+    assert_eq!(today["sign_ups"], 2);
+    assert_eq!(
+        report
+            .versions
+            .iter()
+            .find(|(v, _)| v == "0.5.0")
+            .unwrap()
+            .1,
+        1
+    );
+    assert!(report.html().contains("Wake-ups by phone maker"));
+    assert!(report.text().contains("Sync speed"));
+
+    // After a week the idle account is gone; the used one stays.
+    t.advance(8 * 24 * 3600);
+    t.ledger.prune().await.unwrap();
+    assert!(
+        db::account_of(&t.ledger.db, &idle.id())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        db::account_of(&t.ledger.db, &laptop.id())
+            .await
+            .unwrap()
+            .is_some()
+    );
     t.finish().await;
 }

@@ -1,5 +1,6 @@
-# HTTPS in front of the ledger (E0), started with `docker compose --profile
-# https up -d`. Caddy gets and renews the certificate for LEDGER_DOMAIN.
+# HTTPS in front of the ledger (E0) and the relay (M13), started with
+# `docker compose --profile https up -d`. Caddy gets and renews the
+# certificates for LEDGER_DOMAIN and RELAY_DOMAIN.
 {
 	# Nothing reconfigures Caddy while it runs.
 	admin off
@@ -20,5 +21,13 @@
 		max_size 64KB
 	}
 	reverse_proxy ledger:8080
+	header -Server
+}
+
+# The relay (M13): its WebSocket passes through to plain HTTP. The relay reads
+# this site's certificate from Caddy's data for its QUIC address check on UDP
+# 7842. A `.localhost` name gets Caddy's own local certificate (testing).
+{$RELAY_DOMAIN} {
+	reverse_proxy relay:3340
 	header -Server
 }

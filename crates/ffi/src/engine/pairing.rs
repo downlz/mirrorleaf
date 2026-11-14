@@ -259,10 +259,12 @@ impl Engine {
         self.set_pairing(PairingStatus::Connecting);
         let code: PairingCode = code.parse()?;
         let target = code.resolve(&self.secret, lookup.as_deref()).await?;
+        let relay = target.relay(&self.secret, lookup.as_deref()).await;
         let shows = self.clone();
         let welcome = pair::join(
             self.secret.clone(),
             Network::Internet,
+            relay.relay.as_ref(),
             &target,
             request,
             move |number| shows.set_pairing(PairingStatus::Confirm { number }),
@@ -284,6 +286,9 @@ impl Engine {
         let register = {
             let mut replica = lock(&self.replica);
             account.save(&mut replica)?;
+            if let Some(named) = &relay.named {
+                replica.set_meta(mirrorleaf_net::RELAY_URL, named.as_bytes())?;
+            }
             match ledger {
                 Some(url) if device::ledger_settings(&replica)?.is_none() => {
                     let profile = profile(&replica)?;

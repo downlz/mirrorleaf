@@ -18,7 +18,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context, Result, bail};
 use data_encoding::BASE32_NOPAD;
 use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
-use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
+use iroh::{Endpoint, EndpointAddr, RelayMode, RelayUrl, SecretKey};
 use mirrorleaf_proto::ledger::{Approval, MAX_DEVICES_PER_ACCOUNT, Platform};
 use mirrorleaf_proto::pair::{
     self, CODE_LIFETIME_SECS, CodeKind, MAX_PAIR_MESSAGE, PAIR_ALPN, PairMessage, Refusal,
@@ -191,7 +191,55 @@ pub struct JoinTarget {
     pub ledger: Option<String>,
 }
 
+/// The relay a joining device uses (M13), and the ledger's name for it to
+/// save once joined (none when it is the built-in one).
+#[derive(Clone, Debug, Default)]
+pub struct JoinRelay {
+    pub relay: Option<RelayUrl>,
+    pub named: Option<String>,
+}
+
 impl JoinTarget {
+    /// Gets ready to reach the inviter through the relay before this device
+    /// is registered (M13): asks the ledger (the code's, else `lookup`) which
+    /// relay it uses and, for a QR code, for a short pass to it (a word
+    /// code's lookup already gave one). Without a ledger, the built-in relay.
+    pub async fn relay(&self, secret: &SecretKey, lookup: Option<&str>) -> JoinRelay {
+        let Some(url) = self.ledger.as_deref().or(lookup) else {
+            return JoinRelay {
+                relay: crate::node::default_relay(),
+                named: None,
+            };
+        };
+        if self.via == CodeKind::Qr
+            && let Err(e) = crate::ledger::relay_pass(url, secret).await
+        {
+            tracing::warn!("no relay pass: {}", crate::describe(&e));
+        }
+        match crate::ledger::info(url).await {
+            Ok(info) => match info.relay {
+                Some(named) => JoinRelay {
+                    relay: named.parse().ok(),
+                    named: Some(named),
+                },
+                None => JoinRelay {
+                    relay: crate::node::default_relay(),
+                    named: None,
+                },
+            },
+            Err(e) => {
+                tracing::warn!(
+                    "couldn't ask the ledger for its relay: {}",
+                    crate::describe(&e)
+                );
+                JoinRelay {
+                    relay: crate::node::default_relay(),
+                    named: None,
+                }
+            }
+        }
+    }
+
     pub fn qr(qr: &QrCode) -> Self {
         Self {
             inviter: qr.inviter.clone(),
@@ -514,23 +562,31 @@ pub struct JoinRefused(pub Refusal);
 pub async fn join(
     secret: SecretKey,
     network: Network,
+    relay: Option<&RelayUrl>,
     target: &JoinTarget,
     request: JoinRequest,
     on_number: impl FnOnce(String) + Send,
 ) -> Result<Welcome> {
     let builder = match network {
-        Network::Internet => Endpoint::builder(presets::N0),
+        Network::Internet => {
+            Endpoint::builder(presets::Minimal).relay_mode(crate::node::relay_mode(relay))
+        }
         Network::Local => Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Disabled),
     };
+    // A word code names only the inviter's ID: it is reached through the relay.
+    let mut inviter = target.inviter.clone();
+    if network == Network::Internet
+        && inviter.relay_urls().next().is_none()
+        && let Some(relay) = relay
+    {
+        inviter = inviter.with_relay_url(relay.clone());
+    }
     let joiner = crate::device::device_of(&secret);
     let endpoint = builder.secret_key(secret).bind().await?;
     let result = async {
-        let conn = tokio::time::timeout(
-            DIAL_TIMEOUT,
-            endpoint.connect(target.inviter.clone(), PAIR_ALPN),
-        )
-        .await
-        .context("your other device didn't answer: is Mirrorleaf open on it?")??;
+        let conn = tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(inviter, PAIR_ALPN))
+            .await
+            .context("your other device didn't answer: is Mirrorleaf open on it?")??;
         let welcome = run_joiner(&conn, joiner, target, request, on_number).await;
         conn.close(0u32.into(), b"done");
         welcome

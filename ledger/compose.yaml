@@ -1,7 +1,12 @@
 # The ledger and its Postgres (implementation plan §3.4, M3; HTTPS and limits
-# from E0). From this folder: `docker compose up -d --build`, which publishes
-# the ledger on this machine only (127.0.0.1:8080). Add `--profile https` to
-# put Caddy in front of it with HTTPS on ports 80 and 443.
+# from E0; the relay from M13). From this folder: `docker compose up -d
+# --build`, which publishes the ledger on this machine only (127.0.0.1:8080).
+#
+# - `--profile https`: the whole server (M13): Caddy with HTTPS on ports 80
+#   and 443 for LEDGER_DOMAIN and RELAY_DOMAIN, and the relay, with its QUIC
+#   address check on UDP 7842.
+# - `--profile relay`: the relay alone in front of this ledger, over plain
+#   HTTP on RELAY_PUBLISH, for testing on a home network.
 # Settings come from `.env` in this folder; see `env.example`.
 name: mirrorleaf-ledger
 
@@ -19,6 +24,7 @@ services:
       # `docker compose down -v`, and devices register again on their next
       # report (ADR-004).
       - db:/var/lib/postgresql
+    mem_limit: 512m
     healthcheck:
       test: ['CMD-SHELL', 'pg_isready -U postgres -d ledger']
       interval: 5s
@@ -38,6 +44,13 @@ services:
       FCM_SERVICE_ACCOUNT: ${FCM_SERVICE_ACCOUNT:-}
       LEDGER_DEVICE_REQUESTS_PER_MINUTE: ${LEDGER_DEVICE_REQUESTS_PER_MINUTE:-}
       LEDGER_NEW_ACCOUNTS_PER_MINUTE: ${LEDGER_NEW_ACCOUNTS_PER_MINUTE:-}
+      # M13: the relay devices are told to use, the puzzle, limits by address.
+      LEDGER_RELAY_URL: ${LEDGER_RELAY_URL:-}
+      LEDGER_RELAY_METRICS_URL: http://relay:9090/metrics
+      LEDGER_PUZZLE_BITS: ${LEDGER_PUZZLE_BITS:-}
+      LEDGER_SIGN_UPS_PER_HOUR_PER_IP: ${LEDGER_SIGN_UPS_PER_HOUR_PER_IP:-}
+      LEDGER_LOOKUPS_PER_HOUR_PER_IP: ${LEDGER_LOOKUPS_PER_HOUR_PER_IP:-}
+      LEDGER_PASSES_PER_HOUR_PER_IP: ${LEDGER_PASSES_PER_HOUR_PER_IP:-}
       RUST_LOG: info,sqlx=warn
     volumes:
       # The Firebase service-account key, when there is one. Never committed.
@@ -46,6 +59,14 @@ services:
       # This machine only by default. For a phone on the same Wi-Fi during
       # development, set LEDGER_PUBLISH=8080 in `.env` (every interface).
       - '${LEDGER_PUBLISH:-127.0.0.1:8080}:8080'
+      # The internal port: the dashboard (and the relay's access check, which
+      # the relay reaches over Compose's network). This machine only by
+      # default; for the dashboard over Tailscale, set DASHBOARD_PUBLISH to
+      # this server's Tailscale address and a port, e.g. 100.64.0.5:8081.
+      # Never publish it to the internet.
+      - '${DASHBOARD_PUBLISH:-127.0.0.1:8081}:8081'
+    mem_limit: 256m
+    cpus: 1.0
     logging:
       driver: local
       options:
@@ -63,6 +84,8 @@ services:
       - ledger
     environment:
       LEDGER_DOMAIN: ${LEDGER_DOMAIN:-localhost}
+      RELAY_DOMAIN: ${RELAY_DOMAIN:-relay.localhost}
+    mem_limit: 256m
     ports:
       - '80:80'
       - '443:443'
@@ -71,6 +94,51 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: '3'
+
+  # The relay (M13, E10): forwards encrypted traffic between devices that
+  # can't reach each other directly; only devices the ledger knows get in.
+  relay:
+    build:
+      context: ..
+      dockerfile: relay/Dockerfile
+    profiles: [https, relay]
+    restart: unless-stopped
+    depends_on:
+      - ledger
+    environment:
+      RELAY_ACCESS_URL: http://ledger:8081/internal/relay
+      # The certificate for the QUIC address check: Caddy's (RELAY_DOMAIN), or
+      # files named outright, such as certbot's behind nginx (RELAY_CERT_FILE
+      # and RELAY_KEY_FILE, with RELAY_CERTS=/etc/letsencrypt). Neither: no
+      # QUIC address check.
+      RELAY_DOMAIN: ${RELAY_DOMAIN:-}
+      RELAY_CERT_DIR: /certs/caddy/certificates
+      RELAY_CERT_FILE: ${RELAY_CERT_FILE:-}
+      RELAY_KEY_FILE: ${RELAY_KEY_FILE:-}
+      RELAY_CLIENT_BYTES_PER_SECOND: ${RELAY_CLIENT_BYTES_PER_SECOND:-}
+      RELAY_CLIENT_BURST_BYTES: ${RELAY_CLIENT_BURST_BYTES:-}
+      RUST_LOG: info
+    # Root inside the container only to read the certificate's key (Caddy and
+    # certbot keep it for root); no capabilities, a read-only file system and
+    # the certificates read-only.
+    user: '0:0'
+    cap_drop: [ALL]
+    read_only: true
+    security_opt: ['no-new-privileges:true']
+    volumes:
+      - ${RELAY_CERTS:-caddy-data}:/certs:ro
+    ports:
+      - '7842:7842/udp'
+      # Caddy reaches the relay over Compose's network; published here only
+      # for `--profile relay` on a home network (RELAY_PUBLISH=3340).
+      - '${RELAY_PUBLISH:-127.0.0.1:3340}:3340'
+    mem_limit: 512m
+    cpus: 1.0
     logging:
       driver: local
       options:

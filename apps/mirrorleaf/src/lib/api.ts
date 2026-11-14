@@ -228,6 +228,14 @@ export const api = {
   // Finding devices on the same network, the phone's battery (M12).
   localDiscovery: () => invoke<boolean>('local_discovery'),
   setLocalDiscovery: (on: boolean) => invoke<void>('set_local_discovery', { on }),
+  /** The app's version ("0.5.0"). */
+  appVersion: () => invoke<string>('app_version'),
+  /** The beta's anonymous daily counts (M13, E12), on by default. */
+  shareStats: () => invoke<boolean>('share_stats'),
+  setShareStats: (on: boolean) => invoke<void>('set_share_stats', { on }),
+  /** "Devices only": the ledger keeps only the devices' IDs (M13). */
+  devicesOnly: () => invoke<boolean>('devices_only'),
+  setDevicesOnly: (on: boolean) => invoke<void>('set_devices_only', { on }),
   /** Android's battery state; null on a desktop. */
   battery: () => invoke<Battery | null>('battery'),
   openAppSettings: () => invoke<void>('open_app_settings'),

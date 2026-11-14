@@ -939,8 +939,9 @@ mod tests {
         replica.trash_note(&recent).unwrap();
         // The purge takes only notes trashed before its time.
         let trashed_at = replica.find_note(&old).unwrap().updated_ms;
+        let last_trashed_at = replica.find_note(&recent).unwrap().updated_ms;
         assert_eq!(replica.purge_trash(Some(trashed_at)).unwrap(), 0);
-        assert_eq!(replica.purge_trash(Some(trashed_at + 1)).unwrap(), 2);
+        assert_eq!(replica.purge_trash(Some(last_trashed_at + 1)).unwrap(), 2);
         let left: Vec<String> = replica
             .list_notes()
             .unwrap()

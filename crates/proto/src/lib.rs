@@ -6,6 +6,7 @@ mod devices;
 mod ids;
 pub mod ledger;
 pub mod pair;
+pub mod puzzle;
 mod wire;
 
 pub use change::{Change, ContentType, SyncClass, VersionVector};

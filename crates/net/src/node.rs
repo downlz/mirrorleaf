@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use iroh::endpoint::{Connection, Incoming, presets};
-use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMode, SecretKey};
+use iroh::{
+    Endpoint, EndpointAddr, PublicKey, RelayConfig, RelayMap, RelayMode, RelayUrl, SecretKey,
+};
 use mirrorleaf_core::{BlobKind, Replica};
 use mirrorleaf_proto::ledger::Approval;
 use mirrorleaf_proto::pair::PAIR_ALPN;
@@ -39,6 +41,54 @@ const LAN_ADDR: &str = "lan_addr:";
 /// Meta key: the UDP port this device last listened on, reused when free so
 /// the address the other devices remember stays right across restarts.
 const LOCAL_PORT: &str = "local_port";
+/// Meta key: the relay this device's ledger names (M13), used instead of the
+/// built-in one.
+pub const RELAY_URL: &str = "relay_url";
+/// Account setting: who keeps the account's sync status (M13, the hosting
+/// choice; owner, 15 Nov 2026). [`DEVICES_ONLY`]: devices report nothing to
+/// the ledger, which keeps only their IDs, for the relay. Absent or
+/// "mirrorleaf": the ledger keeps status and wakes phones.
+pub const HOSTING: &str = "hosting";
+pub const DEVICES_ONLY: &str = "devices";
+/// The relay a build uses when its ledger names none: Mirrorleaf's own (M13;
+/// no fallback to n0's relays, owner 15 Nov 2026). A build can set another
+/// with `MIRRORLEAF_DEFAULT_RELAY`, or none with an empty value.
+pub const DEFAULT_RELAY: &str = match option_env!("MIRRORLEAF_DEFAULT_RELAY") {
+    Some(relay) => relay,
+    None => "https://relay.mirrorleaf.app",
+};
+
+/// The built-in relay, if the build has one.
+pub fn default_relay() -> Option<RelayUrl> {
+    DEFAULT_RELAY.parse().ok()
+}
+
+/// The relay map for one relay: with the QUIC address check on its port
+/// 7842 when it is served over HTTPS (a development relay on plain HTTP has
+/// no certificate for it). No relay means none at all.
+pub fn relay_mode(relay: Option<&RelayUrl>) -> RelayMode {
+    match relay {
+        Some(url) if url.scheme() == "http" => {
+            RelayMode::Custom(RelayMap::from(RelayConfig::new(url.clone(), None)))
+        }
+        Some(url) => RelayMode::Custom(RelayMap::from(RelayConfig::from(url.clone()))),
+        None => RelayMode::Disabled,
+    }
+}
+
+/// The relay this device uses: the one its ledger named, else the built-in one.
+fn chosen_relay(replica: &mirrorleaf_core::Replica) -> Option<RelayUrl> {
+    let named = replica
+        .meta(RELAY_URL)
+        .ok()
+        .flatten()
+        .and_then(|v| String::from_utf8(v).ok())
+        .filter(|v| !v.is_empty());
+    match named {
+        Some(url) => url.parse().ok(),
+        None => default_relay(),
+    }
+}
 
 /// How long `watch` waits before dialling an unreachable device again.
 const REDIAL: Duration = Duration::from_secs(30);
@@ -56,7 +106,9 @@ pub(crate) type Shared = Arc<Mutex<State>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Network {
-    /// n0's public relays and address lookup (Phase 0; our own from Phase 1, E10).
+    /// Mirrorleaf's relay (M13): the one the device's ledger names, else the
+    /// built-in one. No address lookup service: devices are dialled through
+    /// the relay, their remembered addresses and mDNS.
     Internet,
     /// No relays and no address lookup: peers are dialled at known addresses.
     /// For tests on one machine.
@@ -201,6 +253,11 @@ struct Inner {
     prefetch: AtomicBool,
     /// Finding devices on the same network with no internet (M12).
     local: crate::local::LocalDiscovery,
+    /// The relay this node uses (M13), none on a local network.
+    relay: Mutex<Option<RelayUrl>>,
+    /// Whether this process has cleared its status on the ledger since the
+    /// account chose "Devices only" (M13).
+    cleared: AtomicBool,
 }
 
 /// What `watch` last told the ledger.
@@ -211,6 +268,8 @@ struct Reporting {
     /// What the ledger last accepted.
     reported: Option<VersionVector>,
     last_success: Option<Instant>,
+    /// Which ledger that was: a different one gets a report at once (M13).
+    ledger: Option<String>,
 }
 
 /// A connected peer, as `watch` tracks it.
@@ -270,7 +329,11 @@ impl SyncNode {
             .and_then(|v| String::from_utf8(v).ok())
             .and_then(|v| v.parse::<u16>().ok())
             .filter(|p| *p != 0);
-        let endpoint = match bind_endpoint(network, &secret, port).await {
+        let relay = match network {
+            Network::Internet => chosen_relay(&state.replica),
+            Network::Local => None,
+        };
+        let endpoint = match bind_endpoint(network, &secret, port, relay.as_ref()).await {
             Ok(endpoint) => endpoint,
             Err(e) if port.is_some() => {
                 tracing::info!(
@@ -278,10 +341,12 @@ impl SyncNode {
                     port.unwrap_or(0),
                     describe(&e)
                 );
-                bind_endpoint(network, &secret, None).await?
+                bind_endpoint(network, &secret, None, relay.as_ref()).await?
             }
             Err(e) => return Err(e),
         };
+        // Counts an earlier process didn't send (E12).
+        crate::metrics::load(&mut state.replica);
         if let Some(bound) = endpoint
             .bound_sockets()
             .into_iter()
@@ -311,6 +376,8 @@ impl SyncNode {
                 tick_ms: std::sync::atomic::AtomicU64::new(TICK.as_millis() as u64),
                 prefetch: AtomicBool::new(false),
                 local,
+                relay: Mutex::new(relay),
+                cleared: AtomicBool::new(false),
             }),
         })
     }
@@ -332,14 +399,70 @@ impl SyncNode {
         self.inner.ledger.lock().unwrap().clone()
     }
 
+    /// Whether the account chose "Devices only" (M13): no status reports, no
+    /// wake requests; the ledger keeps only the device's ID, for the relay.
+    pub fn devices_only(&self) -> bool {
+        self.inner
+            .state
+            .lock()
+            .unwrap()
+            .account
+            .devices
+            .list
+            .settings
+            .get(HOSTING)
+            .is_some_and(|v| v == DEVICES_ONLY)
+    }
+
+    /// The ledger client for status reports and wake requests: none when the
+    /// device was removed or the account chose "Devices only".
+    pub fn status_ledger(&self) -> Option<Arc<LedgerClient>> {
+        if self.devices_only() {
+            return None;
+        }
+        self.ledger()
+    }
+
+    /// Chooses who keeps the account's sync status, for every device of the
+    /// account: the list carrying the setting reaches the others as they meet.
+    pub async fn set_devices_only(&self, on: bool) -> Result<()> {
+        {
+            let mut state = self.inner.state.lock().unwrap();
+            let key = state
+                .account
+                .key
+                .as_ref()
+                .context("this device doesn't hold the account key")?;
+            let value = if on { DEVICES_ONLY } else { "mirrorleaf" };
+            let devices = key.with_settings(&state.account.devices, &[(HOSTING, value.to_owned())]);
+            state.account.devices = devices;
+            let state = &mut *state;
+            state.account.save(&mut state.replica)?;
+        }
+        self.inner.cleared.store(false, Ordering::Release);
+        self.nudge();
+        Ok(())
+    }
+
     /// Tells the ledger this device is going offline, so it stops counting on
     /// it straight away. Best effort: gives up after a few seconds.
     pub async fn go_offline(&self) -> Result<()> {
-        let Some(ledger) = self.ledger() else {
+        let Some(ledger) = self.status_ledger() else {
             return Ok(());
         };
         let vv = self.inner.state.lock().unwrap().replica.version_vector()?;
-        tokio::time::timeout(Duration::from_secs(5), ledger.report(&vv, Some(0))).await??;
+        let metrics = crate::metrics::take();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            ledger.report_with(&vv, Some(0), metrics.clone()),
+        )
+        .await;
+        if !matches!(result, Ok(Ok(_)))
+            && let Some(m) = &metrics
+        {
+            crate::metrics::put_back(m);
+        }
+        result??;
         Ok(())
     }
 
@@ -735,11 +858,52 @@ impl SyncNode {
             return Ok(addr.clone());
         }
         let mut addr = endpoint_addr(device)?;
-        // Tried alongside the usual lookups, not instead of them (M12).
+        // Every device of an account uses its ledger's relay (M13).
+        if let Some(relay) = self.relay() {
+            addr = addr.with_relay_url(relay);
+        }
+        // Tried alongside the relay, not instead of it (M12).
         if let Some(lan) = self.remembered_lan_addr(device) {
             addr = addr.with_ip_addr(lan);
         }
         Ok(addr)
+    }
+
+    /// The relay this node uses.
+    pub fn relay(&self) -> Option<RelayUrl> {
+        self.inner.relay.lock().unwrap().clone()
+    }
+
+    /// Moves to the relay the ledger named, if it differs (M13): saved for the
+    /// next start, and switched on the running endpoint.
+    async fn adopt_relay(&self, named: &str) {
+        let Ok(url) = named.parse::<RelayUrl>() else {
+            return;
+        };
+        let old = {
+            let mut relay = self.inner.relay.lock().unwrap();
+            if relay.is_none() || relay.as_ref() == Some(&url) {
+                // None: a local network, where relays aren't used.
+                return;
+            }
+            relay.replace(url.clone())
+        };
+        let _ = self
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .replica
+            .set_meta(RELAY_URL, named.as_bytes());
+        if let RelayMode::Custom(map) = relay_mode(Some(&url))
+            && let Some(config) = map.get(&url)
+        {
+            self.inner.endpoint.insert_relay(url.clone(), config).await;
+        }
+        if let Some(old) = old {
+            self.inner.endpoint.remove_relay(&old).await;
+        }
+        tracing::info!("now using the relay {url}, as the ledger says");
     }
 
     /// Where to dial a device: its ID, and its last address on the home
@@ -1068,6 +1232,7 @@ impl SyncNode {
     }
 
     pub async fn close(&self) {
+        crate::metrics::save(&mut self.inner.state.lock().unwrap().replica);
         self.inner.endpoint.close().await;
         if self.inner.owns_store {
             self.inner.blobs.shutdown().await;
@@ -1212,6 +1377,24 @@ impl SyncNode {
         let Some(ledger) = self.ledger() else {
             return;
         };
+        if self.devices_only() {
+            // Once per process: registered (for the relay) with nothing else.
+            if !self.inner.cleared.swap(true, Ordering::AcqRel) {
+                let node = self.clone();
+                tokio::spawn(async move {
+                    match ledger.clear_status().await {
+                        Ok(()) => {
+                            tracing::info!("devices only: the ledger keeps only this device's ID")
+                        }
+                        Err(e) => {
+                            tracing::warn!("ledger: {}", describe(&e));
+                            node.inner.cleared.store(false, Ordering::Release);
+                        }
+                    }
+                });
+            }
+            return;
+        }
         {
             let mut r = reporting.lock().unwrap();
             let since = |t: Option<Instant>| t.map_or(Duration::MAX, |t| t.elapsed());
@@ -1219,8 +1402,10 @@ impl SyncNode {
             // 30 s, so an unreachable ledger isn't asked every second.
             let changed = r.reported.as_ref() != Some(ours);
             let heartbeat = since(r.last_success) >= HEARTBEAT;
+            let moved = r.ledger.as_deref() != Some(ledger.url());
             let due = r.last_attempt.is_none()
-                || (since(r.last_attempt) >= MIN_REPORT_INTERVAL && (changed || heartbeat));
+                || (since(r.last_attempt) >= MIN_REPORT_INTERVAL
+                    && (changed || heartbeat || moved));
             if r.busy || !due {
                 return;
             }
@@ -1228,14 +1413,32 @@ impl SyncNode {
             r.last_attempt = Some(Instant::now());
         }
         let (vv, reporting, events) = (ours.clone(), reporting.clone(), events.clone());
+        let url = ledger.url().to_owned();
+        let node = self.clone();
         tokio::spawn(async move {
-            let result = ledger.report(&vv, Some(ONLINE_FOR_SECS)).await;
+            let metrics = crate::metrics::take();
+            let result = ledger
+                .report_with(&vv, Some(ONLINE_FOR_SECS), metrics.clone())
+                .await;
+            match &result {
+                Ok(response) => {
+                    if let Some(relay) = &response.relay {
+                        node.adopt_relay(relay).await;
+                    }
+                }
+                Err(_) => {
+                    if let Some(m) = &metrics {
+                        crate::metrics::put_back(m);
+                    }
+                }
+            }
             let mut r = reporting.lock().unwrap();
             r.busy = false;
             let _ = events.send(match result {
                 Ok(response) => {
                     r.reported = Some(vv);
                     r.last_success = Some(Instant::now());
+                    r.ledger = Some(url);
                     Event::LedgerReported { response }
                 }
                 Err(e) => Event::LedgerFailed {
@@ -1397,6 +1600,7 @@ impl SyncNode {
     ) {
         let peer = device_of(&conn);
         let path = path_kind(&conn);
+        crate::metrics::connected(path);
         let _ = events.send(Event::Connected {
             peer,
             path,
@@ -1474,9 +1678,11 @@ async fn bind_endpoint(
     network: Network,
     secret: &SecretKey,
     port: Option<u16>,
+    relay: Option<&RelayUrl>,
 ) -> Result<Endpoint> {
+    // No address lookup service (M13): nothing about the device is published.
     let mut builder = match network {
-        Network::Internet => Endpoint::builder(presets::N0),
+        Network::Internet => Endpoint::builder(presets::Minimal).relay_mode(relay_mode(relay)),
         Network::Local => Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Disabled),
     };
     if let Some(port) = port {

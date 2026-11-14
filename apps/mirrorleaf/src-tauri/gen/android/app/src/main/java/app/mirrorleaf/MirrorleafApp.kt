@@ -12,6 +12,7 @@ import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import app.mirrorleaf.engine.Engine
 import app.mirrorleaf.engine.setAppVersion
+import app.mirrorleaf.engine.setDeviceMaker
 import com.google.firebase.messaging.FirebaseMessaging
 import java.io.File
 import kotlinx.coroutines.CoroutineScope
@@ -32,6 +33,8 @@ class MirrorleafApp : Application() {
         MirrorleafNative.init(this)
         // Devices tell each other their version when they connect and pair.
         setAppVersion(packageManager.getPackageInfo(packageName, 0).versionName ?: "unknown")
+        // For the beta's counts of wake-ups by phone maker (M13).
+        setDeviceMaker(Build.MANUFACTURER ?: "")
         // The database is encrypted; its key is wrapped by the Android Keystore (M11).
         engine = Engine.open(File(filesDir, "mirrorleaf").path, deviceName(), DatabaseKey.get(this))
         // HEIC and AVIF photos are decoded by Android (plan §5.5, M6).

@@ -417,6 +417,7 @@ impl Engine {
 impl Engine {
     fn start(dir: DeviceDir, device_name: &str) -> anyhow::Result<Self> {
         let (secret, mut replica) = dir.open_or_init(device_name)?;
+        mirrorleaf_net::metrics::set_sharing(library::share_stats_on(&replica));
         // Live sync wakes on the screen's own edits instead of polling the
         // database every second (E7).
         let node: Arc<Mutex<Option<SyncNode>>> = Arc::default();
@@ -561,6 +562,8 @@ impl Engine {
             node
         };
         let result = self.background_round(&node, listener.as_ref()).await;
+        // Wake-ups by phone maker, for the beta's totals (M13, E12).
+        mirrorleaf_net::metrics::woken(result.as_ref().is_ok_and(|s| s.failed.is_empty()));
         {
             let mut slot = self.slot.lock().await;
             slot.jobs = slot.jobs.saturating_sub(1);
@@ -606,7 +609,7 @@ impl Engine {
 
         // The ledger's answer says which devices are online and what each
         // holds, so the job dials only those it can help or learn from.
-        let status = match node.ledger() {
+        let status = match node.status_ledger() {
             Some(ledger) => match ledger.report(&ours, Some(JOB_ONLINE_SECS)).await {
                 Ok(status) => Some(status),
                 Err(e) => {
@@ -761,7 +764,7 @@ impl Engine {
     /// Opening the app while behind asks the ledger to wake the device holding
     /// the changes, and arms the fallback prompt (plan §5.9, rule 3).
     async fn check_behind(&self, node: &SyncNode) {
-        let Some(ledger) = node.ledger() else {
+        let Some(ledger) = node.status_ledger() else {
             return;
         };
         let ours = match node.state().lock().unwrap().replica.version_vector() {
@@ -891,7 +894,7 @@ fn profile(replica: &Replica) -> anyhow::Result<DeviceProfile> {
 
 /// Tells the ledger this device is going offline. Best effort.
 async fn report_offline(node: &SyncNode) {
-    if node.ledger().is_some()
+    if node.status_ledger().is_some()
         && let Err(e) = node.go_offline().await
     {
         warn!("ledger: couldn't report going offline: {}", describe(&e));

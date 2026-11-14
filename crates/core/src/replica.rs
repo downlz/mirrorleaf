@@ -357,6 +357,15 @@ impl Replica {
     /// before they are stored; other content types are stored as they come,
     /// so a newer device's changes can pass through this one.
     pub fn apply_remote(&mut self, changes: &[Change]) -> Result<usize> {
+        self.apply_remote_with(changes, |_| {})
+    }
+
+    /// [`Self::apply_remote`], calling `added` for each change that was new.
+    pub fn apply_remote_with(
+        &mut self,
+        changes: &[Change],
+        mut added_change: impl FnMut(&Change),
+    ) -> Result<usize> {
         for change in changes.iter().filter(|c| c.content == ContentType::YJS) {
             decode_update(&change.update)?;
         }
@@ -377,6 +386,7 @@ impl Replica {
                 });
             }
             insert_change(&tx, change)?;
+            added_change(change);
             added += 1;
         }
         tx.commit()?;

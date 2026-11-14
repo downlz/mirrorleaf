@@ -116,6 +116,85 @@ impl Engine {
     }
 }
 
+/// Meta key: "0" when the person turned off sharing the beta's counts.
+pub(super) const SHARE_STATS: &str = "share_stats";
+
+/// Whether this device shares the beta's anonymous daily counts (M13, E12):
+/// on unless turned off (owner, 15 Nov 2026).
+pub(super) fn share_stats_on(replica: &mirrorleaf_core::Replica) -> bool {
+    !matches!(replica.meta(SHARE_STATS), Ok(Some(v)) if v == b"0")
+}
+
+impl Engine {
+    /// Whether this device sends the beta's daily counts with its reports.
+    pub fn share_stats(&self) -> bool {
+        share_stats_on(&lock(&self.replica))
+    }
+
+    /// Turns sharing the daily counts on or off, at once.
+    pub fn set_share_stats(&self, on: bool) -> Result<(), EngineError> {
+        lock(&self.replica).set_meta(SHARE_STATS, if on { b"1" } else { b"0" })?;
+        mirrorleaf_net::metrics::set_sharing(on);
+        Ok(())
+    }
+}
+
+impl Engine {
+    /// Whether the account chose "Devices only" (M13): the ledger keeps only
+    /// the devices' IDs, for the relay; no status, no waking phones.
+    pub fn devices_only(&self) -> Result<bool, EngineError> {
+        let account = mirrorleaf_net::Account::load(&lock(&self.replica))?;
+        Ok(account.is_some_and(|a| {
+            a.devices
+                .list
+                .settings
+                .get(mirrorleaf_net::HOSTING)
+                .map(String::as_str)
+                == Some(mirrorleaf_net::DEVICES_ONLY)
+        }))
+    }
+
+    /// Chooses who keeps the account's sync status, for all its devices.
+    pub async fn set_devices_only(self: std::sync::Arc<Self>, on: bool) -> Result<(), EngineError> {
+        let this = self.clone();
+        self.on_runtime(async move {
+            let node = lock(&this.node).clone();
+            match node {
+                Some(node) => node.set_devices_only(on).await?,
+                None => {
+                    let mut replica = lock(&this.replica);
+                    let mut account = mirrorleaf_net::Account::load(&replica)?
+                        .ok_or_else(|| anyhow::anyhow!("this device has no account yet"))?;
+                    let key = account.key.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("this device doesn't hold the account key")
+                    })?;
+                    let value = if on {
+                        mirrorleaf_net::DEVICES_ONLY
+                    } else {
+                        "mirrorleaf"
+                    };
+                    account.devices = key.with_settings(
+                        &account.devices,
+                        &[(mirrorleaf_net::HOSTING, value.to_owned())],
+                    );
+                    account.save(&mut replica)?;
+                }
+            }
+            info!(
+                "sync status kept by {}",
+                if on {
+                    "the devices only"
+                } else {
+                    "Mirrorleaf's ledger"
+                }
+            );
+            this.notify(UiEvent::StatusChanged);
+            Ok(())
+        })
+        .await
+    }
+}
+
 impl Engine {
     /// Starts live sync again on a fresh network endpoint, if it is running
     /// (M12, E8): Android applies a newly granted nearby-devices permission

@@ -1152,6 +1152,19 @@ button.link.muted {
   accent-color: var(--accent);
 }
 
+/* A group of choices in Settings (M13: the sync service). */
+.choice {
+  margin: 8px 0 0;
+  padding: 0;
+  border: 0;
+}
+
+.choice legend {
+  padding: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
 /* --- First run and adding a device (E1, direction A) --- */
 
 .welcome {
@@ -1206,6 +1219,14 @@ button.link.muted {
   display: grid;
   gap: 10px;
   width: min(340px, 100%);
+}
+
+.welcome-note {
+  max-width: 340px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
 }
 
 .welcome-choices button {
