@@ -1,0 +1,28 @@
+[package]
+name = "mirrorleaf-windows"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# Windows-only code for the desktop app: empty on other platforms. It has no C
+# dependencies, so `cargo check --target x86_64-pc-windows-msvc -p
+# mirrorleaf-windows` works on a Mac.
+
+[target.'cfg(windows)'.dependencies]
+windows-future.workspace = true
+
+[target.'cfg(windows)'.dependencies.windows]
+workspace = true
+features = [
+    "Foundation",
+    "Security_Credentials_UI",
+    "Win32_Foundation",
+    "Win32_Graphics_Imaging",
+    "Win32_Security_Cryptography",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Power",
+    "Win32_System_Variant",
+    "Win32_System_WinRT",
+    "Win32_UI_WindowsAndMessaging",
+]

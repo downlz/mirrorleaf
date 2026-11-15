@@ -360,7 +360,9 @@
                 ? 'In Android’s settings for Mirrorleaf, turn Nearby devices off and on again.'
                 : app.platform === 'macos'
                   ? 'Allow Mirrorleaf in System Settings → Privacy & Security → Local Network.'
-                  : 'A firewall may be blocking the local network.'}
+                  : app.platform === 'windows'
+                    ? 'Allow Mirrorleaf on private networks in Windows Security → Firewall & network protection → Allow an app through firewall.'
+                    : 'A firewall may be blocking the local network.'}
             </p>
           {:else if status.devices.some((d) => d.connection === 'relay')}
             <p class="hint">
@@ -520,13 +522,17 @@
                 ? 'Set a screen lock on this phone first.'
                 : app.platform === 'macos'
                   ? 'Set a login password on this Mac first.'
-                  : 'The app lock isn’t available on this computer.'}
+                  : app.platform === 'windows'
+                    ? 'Set up Windows Hello (a PIN at least) in Windows Settings → Accounts → Sign-in options first.'
+                    : 'The app lock isn’t available on this computer.'}
             </p>
           {:else}
             <p class="hint">
               {app.platform === 'android'
                 ? 'Unlock with your fingerprint, face or screen lock.'
-                : 'Unlock with Touch ID or your Mac’s password.'}
+                : app.platform === 'windows'
+                  ? 'Unlock with Windows Hello: your PIN, fingerprint or face.'
+                  : 'Unlock with Touch ID or your Mac’s password.'}
               Your notes keep syncing while it’s locked.
             </p>
           {/if}

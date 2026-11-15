@@ -1,7 +1,7 @@
 <script lang="ts">
   // The app lock (E4): covers the screen until the device's own unlock passes
-  // (Touch ID or the Mac's password; the phone's fingerprint, face or screen
-  // lock). Background sync carries on behind it.
+  // (Touch ID or the Mac's password; Windows Hello; the phone's fingerprint,
+  // face or screen lock). Background sync carries on behind it.
   import { onMount } from 'svelte';
   import { api } from '../lib/api';
   import { app } from '../lib/state.svelte';
@@ -12,7 +12,9 @@
   const how = $derived(
     app.platform === 'android'
       ? 'Use your fingerprint, face or screen lock.'
-      : 'Use Touch ID or your Mac’s password.',
+      : app.platform === 'windows'
+        ? 'Use Windows Hello: your PIN, fingerprint or face.'
+        : 'Use Touch ID or your Mac’s password.',
   );
 
   async function unlock() {

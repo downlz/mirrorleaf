@@ -90,7 +90,9 @@ class AppState {
         : 'tablet'
       : this.platform === 'macos'
         ? 'Mac'
-        : 'computer',
+        : this.platform === 'windows'
+          ? 'PC'
+          : 'computer',
   );
 
   /** Set by the note view while an editor is open (not reactive). */

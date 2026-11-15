@@ -13,8 +13,9 @@ targets = [
     "armv7-linux-androideabi",
     "i686-linux-android",
     "x86_64-linux-android",
-    # The compile-only check that keeps the deferred Windows build working.
+    # The Windows app (x64 and ARM; owner, 15 Nov 2026).
     "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
 ]
 
 [advisories]

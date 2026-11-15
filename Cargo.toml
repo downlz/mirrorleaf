@@ -15,6 +15,7 @@ mirrorleaf-core = { path = "crates/core" }
 mirrorleaf-ffi = { path = "crates/ffi" }
 mirrorleaf-net = { path = "crates/net" }
 mirrorleaf-proto = { path = "crates/proto" }
+mirrorleaf-windows = { path = "crates/windows" }
 
 anyhow = "1.0.104"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
@@ -38,6 +39,9 @@ iroh = "=1.4.1"
 # Pre-1.0, so pinned exactly. 0.104.0 was under 7 days old at M2 (ADR-003).
 # n0's mDNS address lookup: finding devices on the same network with no internet (M12).
 iroh-mdns-address-lookup = "=0.6.1"
+# Windows' own APIs (the Windows app): the versions Tauri already brings in.
+windows = { version = "=0.62.2", default-features = false, features = ["std"] }
+windows-future = { version = "=0.3.2", default-features = false, features = ["std"] }
 # Our relay server (M13): the same release as iroh.
 iroh-relay = { version = "=1.4.1", default-features = false, features = ["server", "tls-ring"] }
 iroh-blobs = { version = "=0.103.1", default-features = false, features = ["fs-store"] }

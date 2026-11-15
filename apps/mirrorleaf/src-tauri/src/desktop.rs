@@ -1,9 +1,9 @@
 //! The desktop agent (plan §5.7, M5). One process owns the engine. Closing the
 //! window destroys the web view; the process stays in the menu bar (macOS) or
-//! tray (Linux) and keeps syncing. It can start at login without a window (off
-//! until the user turns it on in Settings), allows one instance, stores the last
-//! edits when the window closes or the app quits (flush-on-close), and goes
-//! offline while the Mac sleeps.
+//! the tray (Windows, Linux) and keeps syncing. It can start at login without a
+//! window (off until the user turns it on in Settings), allows one instance,
+//! stores the last edits when the window closes or the app quits
+//! (flush-on-close), and goes offline while the computer sleeps.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -45,8 +45,11 @@ struct TrayStatus(MenuItem<Wry>);
 pub fn plugins(builder: tauri::Builder<Wry>) -> tauri::Builder<Wry> {
     builder
         // Must come first: a second launch only shows the first one's window.
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             show_window(app);
+            // Windows and Linux open files ("Open with Mirrorleaf") by
+            // starting the app with their paths: a note is made from them.
+            open_files(file_args(args.into_iter().skip(1)));
         }))
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
@@ -57,8 +60,13 @@ pub fn plugins(builder: tauri::Builder<Wry>) -> tauri::Builder<Wry> {
 }
 
 pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
-    init_logging();
+    // On Windows, in the local (not roaming) application data: the database
+    // and its key belong to this PC. Elsewhere the two are the same folder.
+    #[cfg(windows)]
+    let dir = app.path().app_local_data_dir()?;
+    #[cfg(not(windows))]
     let dir = app.path().app_data_dir()?;
+    init_logging(&dir);
     mirrorleaf_ffi::set_app_version(app.package_info().version.to_string());
     let data_dir = dir.to_string_lossy().into_owned();
     let engine = Engine::open(data_dir.clone(), device_name(), database_key(&data_dir)?)?;
@@ -66,7 +74,7 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "macos")]
     app.set_menu(app_menu(app.handle())?)?;
     tray(app)?;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     crate::power::watch_sleep();
 
     if std::env::args().any(|a| a == BACKGROUND_ARG) {
@@ -82,7 +90,30 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!("live sync didn't start: {e}");
         }
     });
+    // Started by "Open with Mirrorleaf" on Windows or Linux.
+    open_files(file_args(std::env::args().skip(1)));
     Ok(())
+}
+
+/// The arguments that name existing files (not `--background`).
+fn file_args(args: impl Iterator<Item = String>) -> Vec<std::path::PathBuf> {
+    args.filter(|a| !a.starts_with("--"))
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_file())
+        .collect()
+}
+
+/// Makes a note from files opened with Mirrorleaf, as a drop on the Dock icon
+/// does on the Mac (M12).
+fn open_files(paths: Vec<std::path::PathBuf>) {
+    if paths.is_empty() {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = crate::files::note_from_paths(paths).await {
+            tracing::warn!("couldn't make a note from the files: {e}");
+        }
+    });
 }
 
 pub fn on_window_event(window: &Window, event: &WindowEvent) {
@@ -190,6 +221,11 @@ fn ask_to_close(app: &AppHandle, label: &str) {
     });
 }
 
+/// Closes a window as its close button does (Ctrl+W on Windows and Linux).
+pub fn request_close(window: &tauri::WebviewWindow) {
+    ask_to_close(window.app_handle(), window.label());
+}
+
 /// Closes a window for good, storing the editor's edits first. Called by the
 /// screen once it has sent them, or after `CLOSE_WAIT`.
 pub fn close_window(window: &tauri::WebviewWindow) {
@@ -277,13 +313,33 @@ fn tray(app: &App) -> tauri::Result<()> {
             &MenuItem::with_id(app, QUIT, "Quit Mirrorleaf", true, None::<&str>)?,
         ],
     )?;
-    TrayIconBuilder::with_id(TRAY)
+    let builder = TrayIconBuilder::with_id(TRAY)
+        .tooltip("Mirrorleaf")
+        .menu(&menu);
+    // The menu bar's icon is a black outline macOS tints; Windows' tray shows
+    // the app's colour icon, opens the window on a click and the menu on a
+    // right-click, as Windows apps do.
+    #[cfg(not(windows))]
+    let builder = builder
         .icon(tauri::include_image!("icons/tray.png"))
         .icon_as_template(true)
-        .tooltip("Mirrorleaf")
-        .menu(&menu)
-        .show_menu_on_left_click(true)
-        .build(app)?;
+        .show_menu_on_left_click(true);
+    #[cfg(windows)]
+    let builder = builder
+        .icon(tauri::include_image!("icons/32x32.png"))
+        .show_menu_on_left_click(false)
+        .on_tray_icon_event(|tray, event| {
+            use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_window(tray.app_handle());
+            }
+        });
+    builder.build(app)?;
     app.manage(TrayStatus(status));
     refresh_tray(app.handle());
     Ok(())
@@ -373,9 +429,50 @@ fn database_key(data_dir: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     }
 }
 
-/// Desktops with no keychain support yet (Linux; Windows until DPAPI): a
-/// private key file beside the database.
-#[cfg(not(target_os = "macos"))]
+/// The database's key on Windows: kept in `database.key.dpapi`, encrypted
+/// with Windows' Data Protection API for this Windows user, the Keychain's
+/// role on the Mac. Made on first use; a plain key file (the CLI's) is moved
+/// under DPAPI.
+#[cfg(windows)]
+fn database_key(data_dir: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    use mirrorleaf_windows::dpapi;
+    const PROTECTED: &str = "database.key.dpapi";
+    let dir = std::path::Path::new(data_dir);
+    let protected = dir.join(PROTECTED);
+    match std::fs::read(&protected) {
+        Ok(bytes) => {
+            let key = dpapi::unprotect(&bytes)
+                .map_err(|e| format!("Windows couldn't unlock the database key: {e}"))?;
+            return if key.len() == 32 {
+                Ok(key)
+            } else {
+                Err("the database key is damaged".into())
+            };
+        }
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        Err(_) => {}
+    }
+    let file = dir.join(mirrorleaf_ffi::DB_KEY_FILE);
+    let (key, from_file) = match std::fs::read(&file) {
+        Ok(key) if key.len() == 32 => (key, true),
+        _ => (mirrorleaf_ffi::new_database_key(), false),
+    };
+    std::fs::create_dir_all(dir)?;
+    // Written beside it, then renamed: never half a key.
+    let partial = dir.join(format!("{PROTECTED}.new"));
+    std::fs::write(&partial, dpapi::protect(&key)?)?;
+    std::fs::rename(&partial, &protected)?;
+    if from_file {
+        std::fs::remove_file(&file)?;
+        tracing::info!("moved the database key under Windows' protection");
+    } else {
+        tracing::info!("made the database key, protected for this Windows user");
+    }
+    Ok(key)
+}
+
+/// Linux (not a release target): a private key file beside the database.
+#[cfg(target_os = "linux")]
 fn database_key(data_dir: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     Ok(mirrorleaf_ffi::database_key_file(data_dir)?)
 }
@@ -398,12 +495,37 @@ fn device_name() -> String {
         .unwrap_or_else(|| "Desktop".to_owned())
 }
 
-/// Logs to standard error; `RUST_LOG` overrides the default levels.
-fn init_logging() {
+/// Logs to standard error; `RUST_LOG` overrides the default levels. Windows
+/// apps have no console, so there the log goes to `logs\mirrorleaf.log` in
+/// the app's folder, started afresh once it passes 5 MB.
+fn init_logging(dir: &std::path::Path) {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new("warn,mirrorleaf_ffi=info,mirrorleaf_net=info,mirrorleaf_app_lib=info")
     });
+    #[cfg(windows)]
+    {
+        let logs = dir.join("logs");
+        let path = logs.join("mirrorleaf.log");
+        let file = std::fs::create_dir_all(&logs).and_then(|()| {
+            let fresh = std::fs::metadata(&path).is_ok_and(|m| m.len() > 5 * 1024 * 1024);
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(!fresh)
+                .write(true)
+                .truncate(fresh)
+                .open(&path)
+        });
+        if let Ok(file) = file {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+                .try_init();
+            return;
+        }
+    }
+    let _ = dir;
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)

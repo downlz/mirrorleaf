@@ -14,7 +14,7 @@ mod device;
 mod files;
 mod photos;
 mod picker;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 mod power;
 mod startup;
 mod window;
@@ -109,6 +109,8 @@ pub fn run() {
             commands::local_discovery,
             commands::set_local_discovery,
             commands::app_version,
+            commands::quit_app,
+            commands::request_close,
             commands::share_stats,
             commands::set_share_stats,
             commands::devices_only,

@@ -101,6 +101,21 @@
     (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName));
 
   function keydown(event: KeyboardEvent) {
+    // Ctrl+Q and Ctrl+W on Windows and Linux, which have no app menu (the
+    // Mac's gives ⌘Q and ⌘W). They work whatever is open.
+    if (
+      app.isDesktop &&
+      app.platform !== 'macos' &&
+      event.ctrlKey &&
+      !event.altKey &&
+      !event.shiftKey &&
+      !event.metaKey &&
+      (event.key === 'q' || event.key === 'w')
+    ) {
+      event.preventDefault();
+      void (event.key === 'q' ? api.quitApp() : api.requestClose());
+      return;
+    }
     if (
       event.defaultPrevented ||
       app.locked !== false ||

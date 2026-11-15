@@ -3691,6 +3691,7 @@ dependencies = [
  "block2",
  "libc",
  "mirrorleaf-ffi",
+ "mirrorleaf-windows",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
@@ -3730,6 +3731,7 @@ dependencies = [
  "core-foundation",
  "image",
  "mirrorleaf-proto",
+ "mirrorleaf-windows",
  "rand",
  "rusqlite",
  "thiserror 2.0.21",
@@ -3841,6 +3843,14 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "mirrorleaf-windows"
+version = "0.0.0"
+dependencies = [
+ "windows",
+ "windows-future",
 ]
 
 [[package]]

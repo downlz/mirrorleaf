@@ -101,3 +101,22 @@ Mirrorleaf keeps notes only on the user's own devices and syncs them device to d
 - Backups are `crates/net/src/backup.rs` (format) and `SyncNode::write_backup` / `read_backup`; the engine's side and the app lock are `crates/ffi/src/engine/protection.rs`. Restoring merges like sync and replaces nothing.
 - The app lock covers the screen only; sync carries on. The engine keeps the lock state; the screen reports `screen_left` / `screen_returned` (`visibilitychange`), the Mac app reports the window closing and sleep. The device's own unlock is `auth.rs` (LocalAuthentication on the Mac, `LockPlugin.kt` on Android).
 - `deny.toml` ignores RUSTSEC-2026-0459 until a `libsqlite3-sys` release bundles `sqlcipher-src` 420 or later; then upgrade rusqlite and remove the ignore.
+
+## Everyday use (M12, ADR-012)
+
+- Live sync no longer polls the database every second in the app: `Replica::on_local_change` nudges the node after each local write, and the node wakes every 10 s (`LIVE_TICK`) otherwise. Anything that writes outside the screen's replica connection in the app process must nudge too. The CLI keeps the 1 s tick.
+- Search is FTS5 inside the encrypted database (`crates/core/src/search.rs`, schema 5), caught up from the change log by `update_search`; never build it from a push-woken job.
+- A note deleted for good keeps its index entry with `deleted: true` (title and preview cleared); `note_entry` refuses deleted notes. The trash's 30-day purge measures from `updated`, which trashing sets.
+- Folders have a `parent`; a folder with a deleted parent or in a loop shows at the top level (`folder_entries`). The screen shows one level of chips (option A); stepping into a folder is a history entry (`enterFolder` / `leaveTo` in `state.svelte.ts`), so the back gesture and Esc go up one level.
+- Remembered home-network addresses (decision 25): after a direct connection the node stores the peer's private address in meta `lan_addr:<device>` (`remember_lan_addr`), and `addr_for` / `dial_addr` add it to every dial alongside Iroh's lookups. The endpoint binds the port in meta `local_port` again when it's free (`bind_endpoint`). Dial peers through `dial_addr`, not `endpoint_addr`, so the remembered address is tried.
+- mDNS (`crates/net/src/local.rs`): a wrapper added to the endpoint once; `set_local_discovery` starts and stops the service inside it with live sync. Don't keep a clone of the `MdnsAddressLookup` anywhere else, or it keeps announcing. The by-hand test: `cargo test -p mirrorleaf-net --test lifecycle -- --ignored local_network`.
+- Android: `MirrorleafApp` holds a multicast lock and watches whether the network is metered while visible; `SeedWorker` is a periodic WorkManager job (charging and unmetered, up to 9 minutes), not a foreground service, as Android 12+ forbids starting one from the background.
+- The Mac's `Info.plist` (merged by Tauri) carries the Local Network question and the Dock's document types.
+
+## Windows (ADR-014)
+
+- Windows 11 on x64 and ARM, the same app as the Mac's (owner, 15 Nov 2026). Built only by GitHub Actions (`.github/workflows/windows.yml`); the owner pushes, and `gh run view <id> --log-failed` reads a failed run from the Mac. Never push.
+- Windows-only code goes in `crates/windows` (`mirrorleaf-windows`: DPAPI, Windows Hello, WIC, sleep and wake), which has no C code: check it from the Mac with `cargo clippy --target x86_64-pc-windows-msvc -p mirrorleaf-windows` (and `aarch64-pc-windows-msvc`). The app crate's `#[cfg(windows)]` code compiles only on Windows, so read it carefully before a round.
+- Use `windows` `=0.62.2` (Tauri's version) with more features rather than new crates.
+- The app's folder is `app_local_data_dir` on Windows; the database key is `database.key.dpapi`; logs go to `logs\mirrorleaf.log`.
+- Installer settings are in `tauri.windows.conf.json`; "Open with" is registered by `windows/installer-hooks.nsh`. Don't use Tauri's `fileAssociations`: they make Mirrorleaf the default app for those file types.

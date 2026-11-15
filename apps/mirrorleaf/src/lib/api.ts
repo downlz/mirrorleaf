@@ -228,6 +228,9 @@ export const api = {
   // Finding devices on the same network, the phone's battery (M12).
   localDiscovery: () => invoke<boolean>('local_discovery'),
   setLocalDiscovery: (on: boolean) => invoke<void>('set_local_discovery', { on }),
+  /** Ctrl+Q and Ctrl+W on Windows and Linux (the Mac's menu has ⌘Q, ⌘W). */
+  quitApp: () => invoke<void>('quit_app'),
+  requestClose: () => invoke<void>('request_close'),
   /** The app's version ("0.5.0"). */
   appVersion: () => invoke<string>('app_version'),
   /** The beta's anonymous daily counts (M13, E12), on by default. */

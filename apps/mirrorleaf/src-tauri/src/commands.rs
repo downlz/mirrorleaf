@@ -565,6 +565,26 @@ pub fn close_window(window: tauri::WebviewWindow) {
     let _ = window;
 }
 
+/// Ctrl+Q on Windows and Linux, where there is no app menu (the Mac's has
+/// ⌘Q): quits for real, as the tray's Quit does.
+#[tauri::command]
+pub fn quit_app(app: tauri::AppHandle) {
+    #[cfg(desktop)]
+    crate::desktop::quit(&app);
+    #[cfg(mobile)]
+    let _ = app;
+}
+
+/// Ctrl+W on Windows and Linux (the Mac's menu has ⌘W): closes the window as
+/// its close button does; Mirrorleaf keeps syncing from the tray.
+#[tauri::command]
+pub fn request_close(window: tauri::WebviewWindow) {
+    #[cfg(desktop)]
+    crate::desktop::request_close(&window);
+    #[cfg(mobile)]
+    let _ = window;
+}
+
 /// Whether the desktop agent starts at login. Always false on Android.
 #[tauri::command]
 pub fn autostart(app: tauri::AppHandle) -> bool {

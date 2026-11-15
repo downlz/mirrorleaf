@@ -50,8 +50,31 @@ pub trait PlatformDecoder: Send + Sync {
 pub fn system_decoder() -> Option<Box<dyn PlatformDecoder>> {
     #[cfg(target_os = "macos")]
     return Some(Box::new(crate::imageio::ImageIo));
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    return Some(Box::new(Wic));
+    #[cfg(not(any(target_os = "macos", windows)))]
     None
+}
+
+/// HEIC and AVIF with the Windows Imaging Component (the Windows app).
+#[cfg(windows)]
+struct Wic;
+
+#[cfg(windows)]
+impl PlatformDecoder for Wic {
+    fn decode(&self, bytes: &[u8], max_edge: u32) -> Result<DecodedImage, String> {
+        mirrorleaf_windows::imaging::decode(bytes, max_edge)
+            .map(|p| DecodedImage {
+                width: p.width,
+                height: p.height,
+                rgba: p.rgba,
+            })
+            .map_err(|e| {
+                format!(
+                    "Windows couldn't read this photo ({e}). HEIC photos need Microsoft's HEIF Image Extensions and HEVC Video Extensions from the Microsoft Store."
+                )
+            })
+    }
 }
 
 /// A photo ready to store: both blobs, named by their hashes.

@@ -302,13 +302,5 @@ jobs:
           path: target/release/bundle/deb/*.deb
           if-no-files-found: error
 
-  # M5: Windows is deferred (29 Oct 2026); this compile-only check keeps the
-  # code building for when it returns (plan §9).
-  windows-check:
-    name: Windows compile check (deferred platform)
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --locked -p mirrorleaf-app -p mirrorleaf-cli
+  # The Windows app has its own workflow, windows.yml (it replaced the
+  # compile-only check kept while Windows was deferred).

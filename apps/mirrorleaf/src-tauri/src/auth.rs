@@ -1,5 +1,6 @@
 //! The device's own unlock, for the app lock (M11, E4): Touch ID or the Mac's
-//! password on the Mac; the phone's passcode, fingerprint or face on Android
+//! password on the Mac; Windows Hello (the PC's PIN, fingerprint or face) on
+//! Windows; the phone's passcode, fingerprint or face on Android
 //! (`LockPlugin.kt`). There is no Mirrorleaf PIN to forget (owner, 9 Nov 2026).
 
 use tauri::{AppHandle, Runtime};
@@ -7,6 +8,9 @@ use tauri::{AppHandle, Runtime};
 /// Completes macOS's "Mirrorleaf is trying to …".
 #[cfg(target_os = "macos")]
 const REASON: &str = "unlock your notes";
+/// Windows Hello's line above the PIN or fingerprint.
+#[cfg(windows)]
+const WINDOWS_MESSAGE: &str = "Unlock your Mirrorleaf notes";
 
 /// Whether the device has an unlock the lock can use (on Android, a screen
 /// lock must be set).
@@ -20,7 +24,14 @@ pub async fn available<R: Runtime>(app: &AppHandle<R>) -> bool {
     {
         crate::device::lock_available(app).await
     }
-    #[cfg(not(any(target_os = "macos", target_os = "android")))]
+    #[cfg(windows)]
+    {
+        let _ = app;
+        tokio::task::spawn_blocking(mirrorleaf_windows::hello::available)
+            .await
+            .unwrap_or(false)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "android", windows)))]
     {
         let _ = app;
         false
@@ -43,7 +54,31 @@ pub async fn authenticate<R: Runtime>(app: &AppHandle<R>) -> Result<bool, String
     {
         crate::device::authenticate(app).await
     }
-    #[cfg(not(any(target_os = "macos", target_os = "android")))]
+    #[cfg(windows)]
+    {
+        use tauri::Manager;
+        // Windows Hello shows its prompt over the app's window.
+        let window = app
+            .get_webview_window(crate::window::MAIN)
+            .and_then(|w| w.hwnd().ok())
+            .map(|hwnd| hwnd.0 as isize)
+            .ok_or("the window isn't open")?;
+        if !tokio::task::spawn_blocking(mirrorleaf_windows::hello::available)
+            .await
+            .unwrap_or(false)
+        {
+            return Err(
+                "Set up Windows Hello (a PIN at least) in Windows Settings first.".to_owned(),
+            );
+        }
+        tokio::task::spawn_blocking(move || {
+            mirrorleaf_windows::hello::verify(window, WINDOWS_MESSAGE)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("Windows Hello didn't answer: {e}"))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "android", windows)))]
     {
         let _ = app;
         Err("the app lock isn't available on this computer".to_owned())

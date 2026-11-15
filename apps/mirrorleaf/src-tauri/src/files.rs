@@ -180,11 +180,11 @@ pub fn forget_backup(path: &str) {
 // --- Files dropped on the window or the Dock icon (M12, E5) ---
 
 /// Most of a dropped text file Mirrorleaf takes into a note.
-#[cfg(target_os = "macos")]
+#[cfg(desktop)]
 const DROPPED_TEXT_LIMIT: u64 = 1 << 20;
 
 /// Whether a file is a photo Mirrorleaf can take, by its name.
-#[cfg(target_os = "macos")]
+#[cfg(desktop)]
 pub fn is_photo_name(name: &str) -> bool {
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
     matches!(
@@ -224,9 +224,10 @@ fn rand_suffix() -> u64 {
     nanos ^ u64::from(std::process::id()).rotate_left(32)
 }
 
-/// Makes a note from files dropped on the Dock icon: photos by copy (the
-/// originals stay where they are), text files read. The screen opens it.
-#[cfg(target_os = "macos")]
+/// Makes a note from files dropped on the Dock icon, or opened with
+/// Mirrorleaf on Windows: photos by copy (the originals stay where they are),
+/// text files read. The screen opens it.
+#[cfg(desktop)]
 pub async fn note_from_paths(paths: Vec<std::path::PathBuf>) -> Result<(), String> {
     use std::io::Read;
     let engine = engine()?;
