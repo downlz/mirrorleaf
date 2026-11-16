@@ -187,6 +187,8 @@ mod tests {
         let replica = Replica::open_with_key(&path, None, Some(&key)).unwrap();
         assert_eq!(replica.device(), me);
         assert_eq!(replica.list_notes().unwrap().len(), 1);
+        // Closed first: Windows can't delete a file that is open.
+        drop(replica);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
@@ -237,6 +239,7 @@ mod tests {
         assert!(encrypt_in_place(&path, &key).unwrap());
         let replica = Replica::open_with_key(&path, Some(me), Some(&key)).unwrap();
         assert_eq!(replica.list_notes().unwrap().len(), 1);
+        drop(replica);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

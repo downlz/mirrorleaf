@@ -30,7 +30,8 @@ jobs:
       - name: Clippy (the Windows code, the engine and the app)
         run: cargo clippy --locked -p mirrorleaf-windows -p mirrorleaf-core -p mirrorleaf-net -p mirrorleaf-ffi -p mirrorleaf-app --all-targets -- -D warnings
       - name: Tests
-        run: cargo test --locked -p mirrorleaf-windows -p mirrorleaf-proto -p mirrorleaf-core -p mirrorleaf-net
+        # Every failure in one run: Windows-only problems tend to come in groups.
+        run: cargo test --locked --no-fail-fast -p mirrorleaf-windows -p mirrorleaf-proto -p mirrorleaf-core -p mirrorleaf-net
 
   app:
     name: Windows app (${{ matrix.arch }}, unsigned)

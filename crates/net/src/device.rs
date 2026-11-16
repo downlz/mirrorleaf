@@ -404,6 +404,8 @@ mod tests {
             ledger_settings(&replica).unwrap(),
             Some(("http://ledger".to_owned(), profile))
         );
+        // Closed first: Windows can't delete a file that is open.
+        drop(replica);
         std::fs::remove_dir_all(&tmp).unwrap();
     }
 }

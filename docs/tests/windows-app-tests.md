@@ -6,7 +6,7 @@
 | **Machines** | GitHub's Windows machines (build), a Windows 11 PC (owner), the Mac and the phone |
 | **Decisions** | ADR-014 |
 | **Date written** | 16 November 2026 |
-| **Status** | Built and checked on the Mac as far as possible; waiting for the first Windows build in GitHub Actions |
+| **Status** | Installers built by GitHub Actions (run 1); test fixes waiting for the next push; owner's PC tests to do |
 
 ---
 
@@ -40,7 +40,10 @@ Everything else is the same code as the Mac app: the screen, the editor, sync, s
 
 | Run | Result |
 |---|---|
-| (first run after the owner pushes) | |
+| 1 (15 Nov 2026, [43748190416](https://github.com/downlz/mirrorleaf/actions/runs/43748190416)) | ✅ **Both installers built**: `Mirrorleaf_0.5.0_x64-setup.exe` 10.0 MB, `Mirrorleaf_0.5.0_arm64-setup.exe` 8.5 MB (gate 25 MB). ✅ **Clippy on Windows clean**: all the Windows-only app code compiled first time. ❌ Tests: two encryption tests deleted their folder while the database was still open, which Windows refuses (the app's own conversion worked); `cargo test` then stopped before the network tests. |
+| Main CI, same push ([43748190413](https://github.com/downlz/mirrorleaf/actions/runs/43748190413)) | ❌ Linux: the remembered-address test (M12) assumed a loopback connection leaves nothing to remember; GitHub's machine also has a private address (10.1.0.141), which was rightly remembered. Everything else passed. |
+
+Fixed after run 1 (tests only; the app is unchanged): the two encryption tests, and two more with the same pattern found by reading (`device.rs`, the port test in `lifecycle.rs`), close their database before deleting it; the remembered-address test now requires only that loopback is never remembered; the Windows job runs the tests with `--no-fail-fast`, so one run shows every failure.
 
 ---
 
@@ -87,5 +90,5 @@ Put the PC to sleep for a minute and wake it: Mirrorleaf reconnects to your othe
 | Test | Result |
 |---|---|
 | Automated checks on the Mac | ✅ Claude, 16 Nov 2026 |
-| GitHub Actions | |
+| GitHub Actions | Run 1: installers ✅, clippy ✅, tests ❌ (test clean-up on Windows; fixed, to rerun) |
 | 1–8 | Owner |

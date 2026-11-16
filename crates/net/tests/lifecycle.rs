@@ -435,8 +435,12 @@ async fn a_remembered_home_address_is_dialled_without_any_lookup() {
     .await;
     accepting.abort();
     assert!(matches!(dialled, Ok(Ok(_))), "{dialled:?}");
-    // A loopback connection isn't the home network: nothing new remembered.
-    assert_eq!(b.remembered_lan_addr(a.device()), None);
+    // Loopback isn't the home network: never remembered. (A machine with a
+    // private network address may find a path through it too, which is
+    // remembered: GitHub's runners do.)
+    if let Some(remembered) = b.remembered_lan_addr(a.device()) {
+        assert!(!remembered.ip().is_loopback(), "{remembered}");
+    }
 }
 
 /// A device listens on the same port after a restart, so the address the
@@ -476,5 +480,7 @@ async fn a_device_listens_on_the_same_port_again() {
     let again = bind(secret).await.unwrap();
     assert_eq!(port(&again), was);
     again.close().await;
+    // Its database closes with it: Windows can't delete a file that is open.
+    drop(again);
     std::fs::remove_dir_all(&dir).unwrap();
 }
