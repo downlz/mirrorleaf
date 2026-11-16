@@ -86,6 +86,11 @@ jobs:
       - run: cargo install tauri-cli --version 2.12.4 --locked
       - name: Build
         working-directory: apps/mirrorleaf/src-tauri
+        # "-" signs ad hoc (no certificate). Without it the app has only the
+        # linker's signature, with nothing sealing the bundle, and macOS calls
+        # a downloaded copy "damaged" instead of offering Open Anyway.
+        env:
+          APPLE_SIGNING_IDENTITY: "-"
         run: cargo tauri build --bundles dmg --ci
       - name: Name the file
         run: |
@@ -257,7 +262,9 @@ jobs:
           tools=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
           echo "$KEYSTORE" | base64 -d > "$RUNNER_TEMP/release.jks"
           mkdir out
-          "$tools/apksigner" sign --ks "$RUNNER_TEMP/release.jks" \
+          # No v4 signature: it only speeds up `adb install` and comes as a
+          # separate .idsig file that would end up on the release page.
+          "$tools/apksigner" sign --v4-signing-enabled false --ks "$RUNNER_TEMP/release.jks" \
             --ks-pass env:KEYSTORE_PASSWORD --ks-key-alias "$KEY_ALIAS" --key-pass env:KEY_PASSWORD \
             --out "out/Mirrorleaf-${{ needs.prepare.outputs.version }}-android.apk" "$apk"
           rm -f "$RUNNER_TEMP/release.jks"

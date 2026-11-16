@@ -252,6 +252,9 @@ jobs:
       - run: cargo clippy --locked -p mirrorleaf-app -- -D warnings
       - name: Build the app and installer
         working-directory: apps/mirrorleaf/src-tauri
+        # Ad hoc signature over the whole bundle; see release.yml.
+        env:
+          APPLE_SIGNING_IDENTITY: "-"
         run: cargo tauri build --bundles app,dmg --ci
       - name: Installer size (gate ≤ 25 MB)
         run: |
