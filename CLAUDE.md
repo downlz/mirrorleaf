@@ -120,3 +120,8 @@ Mirrorleaf keeps notes only on the user's own devices and syncs them device to d
 - Use `windows` `=0.62.2` (Tauri's version) with more features rather than new crates.
 - The app's folder is `app_local_data_dir` on Windows; the database key is `database.key.dpapi`; logs go to `logs\mirrorleaf.log`.
 - Installer settings are in `tauri.windows.conf.json`; "Open with" is registered by `windows/installer-hooks.nsh`. Don't use Tauri's `fileAssociations`: they make Mirrorleaf the default app for those file types.
+
+## Android tablets (ADR-015)
+
+- Phones and tablets run the same APK; the screen picks wide, medium or narrow by width. Say "phone or tablet" where either is meant, and use `app.deviceWord` ("phone", "tablet") for the device itself; never "this phone" in shared text.
+- Check tablet sizes without a tablet: build the screen (`pnpm build` in `apps/mirrorleaf`), add a stand-in for `window.__TAURI_INTERNALS__` that answers the commands with sample data, and screenshot with headless Firefox at 1280×800 and 800×1280. Firefox takes the screenshot at the page's load event: to open Settings first, hold the load back with a slow image.

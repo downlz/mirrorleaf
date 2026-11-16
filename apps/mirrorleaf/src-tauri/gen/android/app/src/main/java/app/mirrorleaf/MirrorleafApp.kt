@@ -118,8 +118,26 @@ class MirrorleafApp : Application() {
         }
     }
 
-    private fun deviceName(): String =
-        Build.MODEL?.takeIf { it.isNotBlank() } ?: "Android phone"
+    /**
+     * What the other devices show for this one: the name in Android's settings
+     * (About → Device name, such as "Galaxy Tab S9"), else the model (some
+     * makers' models are codes, such as "SM-X710"). Fixed once it joins.
+     */
+    private fun deviceName(): String {
+        val named = if (Build.VERSION.SDK_INT >= 25) {
+            runCatching {
+                android.provider.Settings.Global.getString(
+                    contentResolver,
+                    android.provider.Settings.Global.DEVICE_NAME,
+                )
+            }.getOrNull()
+        } else {
+            null
+        }
+        return named?.takeIf { it.isNotBlank() }
+            ?: Build.MODEL?.takeIf { it.isNotBlank() }
+            ?: "Android device"
+    }
 
     companion object {
         const val TAG = "mirrorleaf"

@@ -405,9 +405,9 @@
                 <span>Mirrorleaf</span>
               </label>
               <p class="hint">
-                Mirrorleaf's server wakes your phone when your other devices have changes for it,
-                and shows how far behind each device is. It knows which devices you have and when
-                they sync, never what's in your notes.
+                Mirrorleaf's server wakes your phone or tablet when your other devices have changes
+                for it, and shows how far behind each device is. It knows which devices you have and
+                when they sync, never what's in your notes.
               </p>
               <label class="toggle">
                 <input
@@ -420,8 +420,8 @@
                 <span>Devices only</span>
               </label>
               <p class="hint">
-                The server keeps only your devices' IDs, so they can use the relay. Your phone syncs
-                when you open Mirrorleaf, and the status here comes from your devices.
+                The server keeps only your devices' IDs, so they can use the relay. Your phone or
+                tablet syncs when you open Mirrorleaf, and the status here comes from your devices.
               </p>
             </fieldset>
           {/if}
@@ -437,8 +437,8 @@
             </label>
             <p class="hint">
               During the beta, this {app.deviceWord} sends counts with its status: how quickly changes
-              reached it and whether your phone woke up. Daily totals only: never your notes, titles or
-              names.
+              reached it and whether your phone or tablet woke up. Daily totals only: never your notes,
+              titles or names.
             </p>
           {/if}
         {/if}
@@ -519,7 +519,7 @@
           {#if !lockSettings.available}
             <p class="error">
               {app.platform === 'android'
-                ? 'Set a screen lock on this phone first.'
+                ? `Set a screen lock on this ${app.deviceWord} first.`
                 : app.platform === 'macos'
                   ? 'Set a login password on this Mac first.'
                   : app.platform === 'windows'
@@ -613,8 +613,8 @@
         <section>
           <h2>Ledger</h2>
           <p class="hint">
-            Tells your devices which of them is behind, and wakes your phone. It never sees your
-            notes.
+            Tells your devices which of them is behind, and wakes your phone or tablet. It never
+            sees your notes.
           </p>
           <label class="field">
             <span>Address</span>

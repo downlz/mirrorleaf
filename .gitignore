@@ -34,6 +34,7 @@ docs/adr/ADR-011-protection-decisions.md
 docs/adr/ADR-012-everyday-use-decisions.md
 docs/adr/ADR-013-public-server-decisions.md
 docs/adr/ADR-014-windows-app-decisions.md
+docs/adr/ADR-015-android-tablet-decisions.md
 docs/phase1-implementation-plan.md
 
 # Push-to-wake matrix results (tools/push-matrix.py); summaries go in docs/tests.

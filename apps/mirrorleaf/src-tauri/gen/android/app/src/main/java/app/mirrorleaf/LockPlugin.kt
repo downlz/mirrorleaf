@@ -32,7 +32,7 @@ class LockPlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun authenticate(invoke: Invoke) {
         if (!keyguard.isDeviceSecure) {
-            invoke.reject("Set a screen lock on this phone first.")
+            invoke.reject("Set a screen lock on this device first.")
             return
         }
         if (Build.VERSION.SDK_INT >= 29) {
