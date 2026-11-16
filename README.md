@@ -4,7 +4,7 @@
 
 Mirrorleaf is a private notes app for rich text and photos. Notes live only on your own devices and sync directly between them, over your local network or the internet. A small service tracks sync status, never content.
 
-> **Status:** Phase 0 technical prototype. Nothing here is usable yet.
+> **Status:** Phase 1 technical beta released.
 
 ## Repository layout
 
