@@ -125,3 +125,8 @@ Mirrorleaf keeps notes only on the user's own devices and syncs them device to d
 
 - Phones and tablets run the same APK; the screen picks wide, medium or narrow by width. Say "phone or tablet" where either is meant, and use `app.deviceWord` ("phone", "tablet") for the device itself; never "this phone" in shared text.
 - Check tablet sizes without a tablet: build the screen (`pnpm build` in `apps/mirrorleaf`), add a stand-in for `window.__TAURI_INTERNALS__` that answers the commands with sample data, and screenshot with headless Firefox at 1280×800 and 800×1280. Firefox takes the screenshot at the page's load event: to open Settings first, hold the load back with a slow image.
+
+## Releases
+
+- `.github/workflows/release.yml` runs on a pushed `v*` tag: it checks the tag against `tauri.conf.json` and needs a `## <version>` section in `CHANGELOG.md`, builds every platform and makes a draft release. Only the owner tags, pushes and publishes.
+- Write changelog entries the way a person would: short plain lines about what changed for the user, no marketing words, no dashes as punctuation.

@@ -83,6 +83,29 @@ Sign every build with the same certificate: the database key is in the Keychain,
 
 CI builds an unsigned Apple silicon `.dmg` (checked against the 25 MB limit) and a Linux `.deb` for the second desktop peer. On Ubuntu, install the `.deb` with `sudo apt install ./Mirrorleaf_*.deb`; the menu-bar icon needs `libayatana-appindicator3-1`. The M5 test steps are in [docs/tests/m5-desktop-tests.md](docs/tests/m5-desktop-tests.md).
 
+## Releases
+
+Releases are drafted by the `Release` workflow. Add the new version's notes to `CHANGELOG.md` (a few plain lines), set the same version in `apps/mirrorleaf/src-tauri/tauri.conf.json`, commit, then push a tag:
+
+```bash
+git tag v0.5.0
+git push origin v0.5.0
+```
+
+GitHub builds the Mac, Windows (x64 and ARM), Linux and Android apps from that tag and makes a **draft** release with the files, a "Which file do I need?" table and the changelog. Check it under Releases, then click Publish. To fix something before publishing, delete the draft (or leave it: a rebuild replaces it), fix and commit, then move the tag with `git tag -f v0.5.0 && git push -f origin v0.5.0`. Once a release is published, a fix gets a new version. The Android APK is added only when the release key is in the repository's secrets (`ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`); push wake-ups need `GOOGLE_SERVICES_JSON` too.
+
+## Android tablets
+
+The Android app is the same on phones and tablets: the screen adapts to the width, so a tablet in landscape shows the notes beside the open note as on the Mac, in portrait the same with a narrower list, and in split screen the phone layout. Install the arm64 APK (almost every current tablet); CI also builds armv7 and x86_64 release APKs (unsigned until a release key exists). A device takes its name from Android's settings (About → Device name).
+
+## The Windows app
+
+The same desktop app as on the Mac, for Windows 11 on x64 and on ARM. GitHub Actions builds the installers (the `Windows` workflow: pushes to `main` or to `windows/...` branches, pull requests, or Actions → Windows → Run workflow); each run's artifacts hold `mirrorleaf-windows-x64-unsigned` and `mirrorleaf-windows-arm64-unsigned`. They aren't code-signed yet: SmartScreen asks once (**More info → Run anyway**). The installer needs no administrator rights.
+
+On Windows the database key is protected by Windows (DPAPI) for the signed-in user, the app lock uses Windows Hello, HEIC photos need Microsoft's HEIF Image Extensions, and Mirrorleaf lives in the tray when its window is closed. Photos and text files can be opened with Mirrorleaf from File Explorer (Open with), which makes a new note; Mirrorleaf never becomes their default app. Its folder is `%LOCALAPPDATA%\app.mirrorleaf`, with a log in `logs\mirrorleaf.log`.
+
+The Windows-only code is in `crates/windows`, which can be checked from a Mac: `rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc`, then `cargo clippy --target x86_64-pc-windows-msvc -p mirrorleaf-windows`.
+
 ## Try the headless peer
 
 `mirrorleaf-cli` is a device without a screen, used for testing sync. Each data folder is one device (`--dir`, default `~/.mirrorleaf-dev`). Build it with `cargo build -p mirrorleaf-cli`, or download a release build from a CI run's **Artifacts** (macOS on Apple silicon, and Linux for Ubuntu 24.04 or newer).
@@ -204,6 +227,61 @@ mirrorleaf-cli ledger status
 From then on, `sync` and `sync --watch` report to it: when changes are made (at most every 30 seconds), every 5 minutes while online, and when going offline. `ledger wake` asks it to wake the device holding what this one lacks. With `--wait`, it then waits as the app does: if that device's changes haven't arrived within 90 seconds, or no push can reach it, it prints "Open Mirrorleaf on <name> to sync". A CLI device can stand in for a phone with `ledger register <url> --platform android --push-token <any text> --notifications`, so the ledger makes push decisions for it.
 
 The step-by-step test is in [docs/tests/m3-ledger-tests.md](docs/tests/m3-ledger-tests.md).
+
+## The server: ledger and relay on one machine (M13)
+
+Mirrorleaf's own server runs the ledger, its Postgres, Caddy for HTTPS and the relay, all from `ledger/compose.yaml`. The relay forwards encrypted traffic between devices that can't reach each other directly and stores nothing. It lets in only devices the ledger knows: registered devices, and devices joining an account with a 10-minute pass. Devices learn the relay's address from their ledger. Builds without one use `https://relay.mirrorleaf.app` (set another at build time with `MIRRORLEAF_DEFAULT_RELAY`). There is no address lookup service: devices reach each other through the relay, remembered home-network addresses and mDNS.
+
+Anyone may create an account: no sign-up, email or invitation. Instead:
+
+- creating an account, or asking for a relay pass, needs a small puzzle that the app solves in about a second, which gets harder while sign-ups spike;
+- requests from one network address are limited per hour, kept in memory only;
+- a request sent twice is refused;
+- accounts never used after being created are deleted after 7 days;
+- each device's traffic through the relay is capped.
+
+### Deploying on a server
+
+1. **DNS:** point `ledger.mirrorleaf.app` and `relay.mirrorleaf.app` (A, and AAAA if the server has IPv6) at the server.
+2. **Firewall** (the hosting provider's own, such as Hetzner's Cloud Firewall: Docker bypasses `ufw`): allow TCP 80 and 443 and UDP 7842 from anywhere; SSH only from your own address or over Tailscale.
+3. **Docker** with Compose v2. The images are built on the server: allow about 3 GB of memory for the build.
+4. Copy the repository, then in `ledger/`:
+
+   ```bash
+   cp env.example .env   # then set POSTGRES_PASSWORD, and:
+   # LEDGER_DOMAIN=ledger.mirrorleaf.app
+   # RELAY_DOMAIN=relay.mirrorleaf.app
+   # LEDGER_RELAY_URL=https://relay.mirrorleaf.app
+   # FCM_SERVICE_ACCOUNT=/secrets/fcm-service-account.json
+   mkdir -p secrets && cp <your key> secrets/fcm-service-account.json
+   # The ledger runs as `nobody` in its container: on Linux, the key must be
+   # that user's (and no one else's) or the ledger can't read it.
+   chown -R 65534:65534 secrets && chmod 700 secrets && chmod 400 secrets/*.json
+   docker compose --profile https up -d --build
+   ```
+
+5. **Check:** `curl https://ledger.mirrorleaf.app/health` answers `ok`, `curl https://ledger.mirrorleaf.app/v1/info` names the relay, `curl https://relay.mirrorleaf.app/healthz` answers, and `docker compose logs relay` says the QUIC address check is on UDP 7842. The relay waits for Caddy's certificate on first start.
+6. **Uptime monitor:** check `https://ledger.mirrorleaf.app/health` and `https://relay.mirrorleaf.app/healthz`.
+
+### Behind nginx instead of Caddy (Mirrorleaf's own server)
+
+Mirrorleaf's server already runs nginx for other sites, so nginx serves HTTPS and Caddy isn't used:
+
+1. An nginx site for `ledger.mirrorleaf.app` (proxied to `127.0.0.1:8080`, with `proxy_set_header X-Forwarded-For $remote_addr`, `client_max_body_size 64k`) and `relay.mirrorleaf.app` (proxied to `127.0.0.1:3340` with the WebSocket upgrade and 1-hour timeouts), both with `access_log off`.
+2. One certbot certificate for both names (`certbot certonly --webroot … --cert-name mirrorleaf --deploy-hook "systemctl reload nginx"`).
+3. In `.env`: `RELAY_CERTS=/etc/letsencrypt`, `RELAY_CERT_FILE=/certs/live/mirrorleaf/fullchain.pem`, `RELAY_KEY_FILE=/certs/live/mirrorleaf/privkey.pem`, `LEDGER_RELAY_URL=https://relay.mirrorleaf.app`; then `docker compose --profile relay up -d --build` (the ledger, Postgres and the relay; no Caddy). The relay rereads the certificate every hour, so certbot's renewals need nothing else.
+
+To update the server, copy the code again (leaving out `target/`, `node_modules/`, `.git/`, `docs/`, `ledger/secrets/` and `ledger/.env`, which stay as they are on the server) and run the same `docker compose` command: the containers restart on the new images, and the database and settings are kept.
+
+### The dashboard and the server's switches
+
+The beta's daily totals (no data about any one person) are on the ledger's internal port, which is never published to the internet. Reach it with `ssh -L 8081:127.0.0.1:8081 <server>` and `http://localhost:8081`, or set `DASHBOARD_PUBLISH` to the server's Tailscale address. The same figures as text: `docker compose exec ledger mirrorleaf-ledger stats 7`.
+
+Change these in `.env` and run `docker compose up -d`: the puzzle's difficulty (`LEDGER_PUZZLE_BITS`), the limits per address, and the relay's cap per device. An account that abuses the server: `docker compose exec ledger mirrorleaf-ledger block <account or device ID prefix>` removes its devices and refuses them for good (`unblock` undoes it).
+
+### Load test
+
+`cargo run --release -p mirrorleaf-ledger --example load_test -- --url <ledger> --devices 30000 --rate 65 --secs 120` registers 30,000 devices, then sends status reports at the launch scale's rate and prints their latency. Run it only against a ledger started for testing, with the puzzle and sign-up limits off (see the example's notes).
 
 ## Licence
 
