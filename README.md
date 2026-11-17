@@ -285,4 +285,6 @@ Change these in `.env` and run `docker compose up -d`: the puzzle's difficulty (
 
 ## Licence
 
-There's no licence yet. Mirrorleaf will be open source; until a licence is chosen, all rights are reserved.
+Mirrorleaf is licensed under the [Apache License 2.0](LICENSE). Contributions are accepted under the same licence.
+
+The licence covers the code, not the Mirrorleaf name or logo: a modified version shared with others needs its own name and icon. `vendor/ndk-context` is a changed copy of ndk-context 0.1.1 (MIT OR Apache-2.0), used under Apache 2.0.
