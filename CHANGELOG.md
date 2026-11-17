@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.1 (17 November 2026)
+
+- The Mac download no longer opens as "damaged". You still need Open Anyway the first time.
+
+### Known issues
+
+- The apps aren't signed yet, so you'll see a warning the first time you open one.
+- On a Mac you may be asked for your password after each update.
+- Updates aren't automatic yet. Get new versions from this page.
+- On Linux there's no app lock, and HEIC photos can't be added.
+
 ## 0.5.0 (16 November 2026)
 
 First beta.

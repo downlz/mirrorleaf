@@ -90,7 +90,7 @@ jobs:
         # linker's signature, with nothing sealing the bundle, and macOS calls
         # a downloaded copy "damaged" instead of offering Open Anyway.
         env:
-          APPLE_SIGNING_IDENTITY: "-"
+          APPLE_SIGNING_IDENTITY: '-'
         run: cargo tauri build --bundles dmg --ci
       - name: Name the file
         run: |
